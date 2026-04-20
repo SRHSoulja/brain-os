@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# gemini wrapper: in gmgn-brain, launch with bypass mode + gemini seat claim
+set -euo pipefail
+
+# Resolve the real gemini binary dynamically via PATH.
+# Resolve the real gemini binary dynamically via PATH.
+REAL_GEMINI="$(PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$HOME/bin\$" | paste -sd:)" command -v gemini || true)"
+if [[ -z "$REAL_GEMINI" ]]; then
+  echo "gemini binary not found" >&2
+  exit 127
+fi
+
+if [[ "${GEMINI_NO_WRAP:-0}" == "1" ]]; then
+  exec "$REAL_GEMINI" "$@"
+fi
+
+# Pass-through for non-interactive flags
+case "${1:-}" in
+  --version|--help|-h|update)
+    exec "$REAL_GEMINI" "$@"
+    ;;
+esac
+
+if [[ "$PWD" == ${BRAIN_DIR:-$HOME/brain}* ]]; then
+  # Skip bootstrap if called via brain-subagent-dispatch
+  if [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]]; then
+    exec "$REAL_GEMINI" "$@"
+  fi
+
+  # Optional: call bootstrap if not already handled by parent
+  if [[ -z "${BRAIN_SESSION_PID:-}" ]]; then
+    if command -v brain-agent-bootstrap >/dev/null 2>&1; then
+      brain-agent-bootstrap --agent gemini
+    fi
+  fi
+  exec "$REAL_GEMINI" --approval-mode=yolo "$@"
+fi
+
+exec "$REAL_GEMINI" "$@"
+

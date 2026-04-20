@@ -1,0 +1,2851 @@
+#!/bin/bash
+# brain-resume — generate session continuity briefing for Claude Code
+# Usage: brain-resume [--new-session] [--quiet] [--ve-sync] [--close-refresh]
+#
+# Reads brain state and writes brain/index/session-resume.md
+# Run before starting a Claude Code session in ~/gmgn-brain
+#
+# --new-session  Reset the session timer. Use only for true session starts
+#                (SessionStart hook). Mid-session callers (brain-task-complete,
+#                brain-meditate) omit this flag to preserve session timing.
+# --ve-sync      Run brain-ve-run brain-sync before generating state, so the
+#                local repo has VE's latest agent outputs and health data.
+#                Opt-in only. 30s timeout. Graceful fallback on failure.
+# --close-refresh  Regenerate only post-close consumer artifacts
+#                  (session-resume + derived/system-state). Skips startup-facing
+#                  derivatives (active-context.compact, digest-preamble,
+#                  session-start-contract, session-brief).
+
+set -euo pipefail
+
+NEW_SESSION=false
+VE_SYNC=false
+CLOSE_REFRESH=false
+for arg in "$@"; do
+  case "$arg" in
+    --new-session) NEW_SESSION=true ;;
+    --ve-sync) VE_SYNC=true ;;
+    --close-refresh) CLOSE_REFRESH=true ;;
+  esac
+done
+
+BRAIN="$HOME/gmgn-brain"
+# Resolve through symlinks so ~/bin wrappers can source libs reliably.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+. "$_SELF_DIR/../lib/brain-paths.sh"
+TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+. "$_SELF_DIR/../lib/frontmatter.sh"
+RESUME="$_SESSION_RESUME"
+NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW_DISPLAY=$(date +"%Y-%m-%d at %I:%M %p %Z")
+
+# Record session start for brain-timer — only on true new sessions.
+# Mid-session callers (task-complete, meditate) must not reset this.
+if $NEW_SESSION || [[ ! -f "$HOME/.brain-session-start" ]]; then
+  date +%s > "$HOME/.brain-session-start"
+fi
+
+# Reset chain depth (escalation policy — new session = fresh chain)
+# Skip reset when called from brain-task-complete (preserves mid-chain count)
+if [[ -z "${BRAIN_SKIP_CHAIN_RESET:-}" ]]; then
+  echo "0" > "$BRAIN/brain/ops/.chain-depth"
+fi
+
+# ── Verify brain exists ────────────────────────────────────────────
+if [[ ! -d "$BRAIN" ]]; then
+  echo "Error: Brain repo not found at $BRAIN"
+  exit 1
+fi
+
+# ── VE sync (opt-in: --ve-sync) ──────────────────────────────────
+# Pulls VE's latest agent outputs and health data before generating state.
+# 30s timeout. If VE is unreachable or sync fails, continue with local data.
+VE_SYNC_STATUS="skipped"
+if $VE_SYNC; then
+  VE_SYNC_STATUS="failed"
+  if timeout 30 "$TOOLS/bin/brain-ve-run" brain-sync >/dev/null 2>&1; then
+    # Pull the freshly-pushed data from remote
+    cd "$BRAIN"
+    if git pull --ff-only origin main >/dev/null 2>&1; then
+      VE_SYNC_STATUS="fresh"
+    else
+      VE_SYNC_STATUS="synced-no-pull"
+    fi
+  fi
+fi
+
+# ── 000a. Pick up VE memory staging (if VE saved memories during its session)
+VE_MEMORY_STAGING="$BRAIN/brain/ops/ve-memory-staging"
+LOCAL_MEMORY="$BRAIN/brain/memory"
+if [[ -d "$VE_MEMORY_STAGING" ]] && ls "$VE_MEMORY_STAGING"/*.md >/dev/null 2>&1; then
+  VE_MEM_COUNT=$(ls "$VE_MEMORY_STAGING"/*.md 2>/dev/null | wc -l)
+  mkdir -p "$LOCAL_MEMORY"
+  rsync -a "$VE_MEMORY_STAGING/" "$LOCAL_MEMORY/" 2>/dev/null
+  # Clean staging area after pickup
+  rm -f "$VE_MEMORY_STAGING"/*.md 2>/dev/null
+  cd "$BRAIN" && git add "$VE_MEMORY_STAGING/" 2>/dev/null && git commit -m "brain-resume: picked up $VE_MEM_COUNT VE memory files" --no-gpg-sign -q 2>/dev/null || true
+fi
+
+# ── 000. Latest session handoff ───────────────────────────────────
+HANDOFF_DIR="$BRAIN/work/session-handoffs"
+LATEST_HANDOFF=""
+HANDOFF_CONTENT=""
+if [[ -d "$HANDOFF_DIR" ]]; then
+  latest_hf=$(ls -t "$HANDOFF_DIR"/*-handoff.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_hf" && -f "$latest_hf" ]]; then
+    LATEST_HANDOFF=$(basename "$latest_hf")
+    # Extract sections (skip frontmatter)
+    HANDOFF_CONTENT=$(sed '1,/^---$/{ /^---$/!d; /^---$/d; }' "$latest_hf" | sed '1,/^---$/d')
+  fi
+fi
+
+# ── 001. Latest spotcheck score ──────────────────────────────────
+SPOTCHECK_DIR="$BRAIN/work/logs/clip-health"
+SPOTCHECK_SCORE=""
+SPOTCHECK_FAILS=0
+SPOTCHECK_DATE=""
+if [[ -d "$SPOTCHECK_DIR" ]]; then
+  latest_sc=$(ls -t "$SPOTCHECK_DIR"/*-spotcheck.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_sc" && -f "$latest_sc" ]]; then
+    SPOTCHECK_DATE=$(grep '^generated:' "$latest_sc" | sed 's/.*"\(.*\)"/\1/' | head -1)
+    SPOTCHECK_SCORE=$(grep '^\*\*Score:' "$latest_sc" | head -1)
+    SPOTCHECK_FAILS=$(grep -c '^| \*\*FAIL\*\*' "$latest_sc" 2>/dev/null || echo "0")
+  fi
+fi
+
+# ── 002. Latest ingest digest ────────────────────────────────────
+INGEST_DIR="$BRAIN/work/inbox/clip-learnings"
+INGEST_COUNT=0
+LATEST_INGEST=""
+if [[ -d "$INGEST_DIR" ]]; then
+  INGEST_COUNT=$(ls "$INGEST_DIR"/*-digest.md 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+  latest_ig=$(ls -t "$INGEST_DIR"/*-digest.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_ig" ]]; then
+    LATEST_INGEST=$(basename "$latest_ig")
+  fi
+fi
+
+# ── 002b. Latest deploy timestamp ──────────────────────────────────
+DEPLOY_AGE_LABEL=""
+EXPORT_LOG="$BRAIN/work/logs/brain-export.log"
+if [[ -f "$EXPORT_LOG" ]]; then
+  deploy_line=$(grep '\[DEPLOY\].*deploy=success' "$EXPORT_LOG" | tail -1 || true)
+  if [[ -n "$deploy_line" ]]; then
+    # Try deploy_ts= field first, fall back to timestamp after [DEPLOY]
+    deploy_ts=$(echo "$deploy_line" | sed -n 's/.*deploy_ts=\([^ ]*\).*/\1/p')
+    [[ -z "$deploy_ts" ]] && deploy_ts=$(echo "$deploy_line" | sed 's/\[DEPLOY\] \([^ ]*\).*/\1/')
+    if [[ -n "$deploy_ts" ]]; then
+      deploy_epoch=$(date -d "$deploy_ts" +%s 2>/dev/null || echo "")
+      if [[ -n "$deploy_epoch" ]]; then
+        now_epoch=$(date +%s)
+        age_hours=$(( (now_epoch - deploy_epoch) / 3600 ))
+        if [[ $age_hours -lt 24 ]]; then
+          DEPLOY_AGE_LABEL="Last deploy: ${age_hours}h ago"
+        else
+          age_days=$(( age_hours / 24 ))
+          DEPLOY_AGE_LABEL="⚠ Last deploy: ${age_days}d ago — Clip may be serving stale knowledge"
+        fi
+      fi
+    fi
+  fi
+fi
+[[ -z "$DEPLOY_AGE_LABEL" ]] && DEPLOY_AGE_LABEL="⚠ No deploy timestamp found"
+
+# ── 002c. Social signal ingest (runs inline, ~2s) ─────────────────
+SIGNAL_DIR="$BRAIN/work/inbox/social-signals"
+SIGNAL_SUMMARY=""
+SIGNAL_VERDICT=""
+"$TOOLS/bin/brain-ingest-signals" > /dev/null 2>&1 || true
+if [[ -d "$SIGNAL_DIR" ]]; then
+  latest_sig=$(ls -t "$SIGNAL_DIR"/*-blog-traffic.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_sig" ]]; then
+    sig_date=$(basename "$latest_sig" | sed 's/-blog-traffic.md//')
+    sig_visits=$(grep 'Blog post views' "$latest_sig" 2>/dev/null | grep -oP '\d+' | tail -1 || echo "0")
+    sig_guide=$(grep 'Guide clicks |' "$latest_sig" 2>/dev/null | grep -oP '\d+' | tail -1 || echo "0")
+    sig_product=$(grep 'Product clicks |' "$latest_sig" 2>/dev/null | grep -oP '\d+' | tail -1 || echo "0")
+    sig_x=$(grep 't.co.*referrals' "$latest_sig" 2>/dev/null | grep -oP '\d+' | tail -1 || echo "0")
+    SIGNAL_VERDICT=$(grep '^\*\*Verdict:' "$latest_sig" 2>/dev/null | sed 's/\*\*Verdict: //' | sed 's/\*\*//' || echo "")
+    # Extract first interpretation bullet if verdict is action or watch
+    SIGNAL_REASON=$(grep '^\- ' "$latest_sig" 2>/dev/null | head -1 | sed 's/^- //' || echo "")
+    # Build funnel suffix (only show non-zero product metrics)
+    _funnel=""
+    [[ "$sig_product" -gt 0 ]] && _funnel=", ${sig_product} product clicks"
+    case "$SIGNAL_VERDICT" in
+      action)
+        SIGNAL_SUMMARY="Blog: ${sig_visits} views, ${sig_guide} guide clicks${_funnel}, ${sig_x} from X -- ACTION: ${SIGNAL_REASON} ($sig_date)"
+        ;;
+      watch)
+        SIGNAL_SUMMARY="Blog: ${sig_visits} views, ${sig_guide} guide clicks${_funnel}, ${sig_x} from X -- watch ($sig_date)"
+        ;;
+      *)
+        SIGNAL_SUMMARY="Blog: ${sig_visits} views, ${sig_guide} guide clicks${_funnel}, ${sig_x} from X ($sig_date)"
+        ;;
+    esac
+  fi
+fi
+
+# ── 00. Latest checkpoint from today ─────────────────────────────
+CHECKPOINT_DIR="$BRAIN/work/inbox/checkpoints"
+LATEST_CHECKPOINT=""
+CHECKPOINT_NOTE=""
+if [[ -d "$CHECKPOINT_DIR" ]]; then
+  today=$(date +%Y-%m-%d)
+  latest=$(ls -t "$CHECKPOINT_DIR"/${today}*.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest" && -f "$latest" ]]; then
+    LATEST_CHECKPOINT=$(basename "$latest")
+    CHECKPOINT_NOTE=$(grep '^\*\*Reason:\*\*' "$latest" 2>/dev/null | sed 's/\*\*Reason:\*\* //' || true)
+    # Extract key state: repos with changes and ahead counts
+    CHECKPOINT_CHANGES=$(grep -c '^\- \*\*Changed:\*\* [^n]' "$latest" 2>/dev/null || echo "0")
+    CHECKPOINT_AHEAD=$(grep -c 'ahead of remote' "$latest" 2>/dev/null || echo "0")
+  fi
+fi
+
+# ── 0. Priority queue (P1/P2 items) ──────────────────────────────
+P1_ITEMS=$(pq_items P1)
+P2_ITEMS=$(pq_items P2)
+P1_COUNT=0
+P2_COUNT=0
+[[ -n "$P1_ITEMS" ]] && P1_COUNT=$(echo "$P1_ITEMS" | grep -c '^\- ' || true)
+[[ -n "$P2_ITEMS" ]] && P2_COUNT=$(echo "$P2_ITEMS" | grep -c '^\- ' || true)
+
+# ── 0a. Queued messages (HIGHEST PRIORITY) ─────────────────────────
+QUEUED_MESSAGES=""
+QUEUED_COUNT=0
+QUEUE_FILE="$BRAIN/work/inbox/messages/queue.md"
+if [[ -f "$QUEUE_FILE" ]]; then
+  QUEUED_MESSAGES=$(grep '^\- ' "$QUEUE_FILE" 2>/dev/null || true)
+  if [[ -n "$QUEUED_MESSAGES" ]]; then
+    QUEUED_COUNT=$(echo "$QUEUED_MESSAGES" | wc -l | tr -d ' ')
+  fi
+fi
+
+CORRECTIONS=""
+CORRECTIONS_COUNT=0
+if [[ -n "${BRAIN_CORRECTIONS_HOST:-}" ]]; then
+  CORRECTIONS=$(ssh -4 "$BRAIN_CORRECTIONS_HOST" "python3 -c \"
+import json
+with open('${BRAIN_CORRECTIONS_PATH:-/brain/corrections.json}') as f:
+    data = json.load(f)
+new_ones = [c for c in data if c.get('status') == 'new']
+for c in new_ones[-10:]:
+    print('- [' + c.get('timestamp','')[:16] + '] said: ' + c.get('clip_said','')[:80] + ' ... correction: ' + c.get('correction','')[:120])
+\"" 2>/dev/null)
+  if [[ -n "$CORRECTIONS" ]]; then
+    CORRECTIONS_COUNT=$(echo "$CORRECTIONS" | wc -l | tr -d ' ')
+  fi
+fi
+
+# ── 0c. Pending reminders ─────────────────────────────────────────
+REMINDERS_DIR="$BRAIN/work/inbox/reminders"
+FIRED_REMINDERS=""
+PENDING_REMINDERS=""
+FIRED_COUNT=0
+PENDING_REMINDER_COUNT=0
+if [[ -d "$REMINDERS_DIR" ]]; then
+  now_ts=$(date +%s)
+  if compgen -G "$REMINDERS_DIR/*.md" > /dev/null 2>&1; then
+  for f in "$REMINDERS_DIR"/*.md; do
+    [[ -f "$f" ]] || continue
+    fire_ts=$(grep '^fire_at:' "$f" | sed 's/fire_at: *//' | head -1)
+    msg=$(grep '^message:' "$f" | sed 's/message: *//' | head -1)
+    set_at=$(grep '^set_at:' "$f" | sed 's/set_at: *//' | head -1)
+    [[ -z "$fire_ts" || -z "$msg" ]] && continue
+    if (( now_ts >= fire_ts )); then
+      FIRED_REMINDERS="${FIRED_REMINDERS}\n- **FIRED:** $msg _(set $set_at)_"
+      FIRED_COUNT=$((FIRED_COUNT + 1))
+    else
+      fire_display=$(grep '^fire_display:' "$f" | sed 's/fire_display: *//' | head -1)
+      PENDING_REMINDERS="${PENDING_REMINDERS}\n- **Pending:** $msg _(fires $fire_display)_"
+      PENDING_REMINDER_COUNT=$((PENDING_REMINDER_COUNT + 1))
+    fi
+  done
+  fi
+fi
+
+# ── 0d. Recent activity log (last 5 entries) ──────────────────────
+ACTIVITY_LOG="$BRAIN/nodes/coaching/docs/activity-log.md"
+RECENT_ACTIVITY=""
+if [[ -f "$ACTIVITY_LOG" ]]; then
+  # Last 3 entries, notes truncated to 60 chars
+  RECENT_ACTIVITY=$(grep '^|' "$ACTIVITY_LOG" | grep -v '^| Date' | grep -v '^|---' | tail -3 | awk -F'|' '{
+    date=$2; type=$3; notes=$4;
+    gsub(/^ +| +$/, "", notes);
+    if (length(notes) > 60) notes = substr(notes, 1, 57) "...";
+    printf "| %s | %s | %s |\n", date, type, notes
+  }')
+fi
+
+# ── 1. Last session activity (git log) ─────────────────────────────
+COMMITS=$(cd "$BRAIN" && git log --oneline -5 2>/dev/null || echo "(no git history)")
+
+# ── 2. Current focus areas ─────────────────────────────────────────
+# Prefer compact file for console output; fall back to full file
+FOCUS=""
+_AC_COMPACT="$BRAIN/brain/index/active-context.compact.md"
+if [[ -f "$_AC_COMPACT" ]]; then
+  FOCUS=$(sed -n '/^## Current Focus$/,/^## /{/^## Current Focus$/d;/^## /d;p;}' \
+    "$_AC_COMPACT" | sed '/^$/d')
+fi
+if [[ -z "$FOCUS" && -f "$BRAIN/brain/index/active-context.md" ]]; then
+  FOCUS=$(sed -n '/^## Current Focus Areas/,/^## /{/^## Current Focus/d;/^## /d;p;}' \
+    "$BRAIN/brain/index/active-context.md" | sed '/^$/d')
+fi
+[[ -z "$FOCUS" ]] && FOCUS="_Could not read active-context.md._"
+
+# ── 3. System health ──────────────────────────────────────────────
+HEALTH_SUMMARY="_System status not available._"
+DOWN_SERVICES=""
+if [[ -f "$BRAIN/work/logs/system-status.md" ]]; then
+  SUMMARY_LINE=$(grep -E '^[0-9]+/[0-9]+ .* services' "$BRAIN/work/logs/system-status.md" 2>/dev/null || true)
+  if [[ -n "$SUMMARY_LINE" ]]; then
+    HEALTH_SUMMARY="$SUMMARY_LINE"
+  fi
+  # Only surface down-unexpected alerts, not inactive services
+  DOWN_SERVICES=$(sed -n '/^## Alerts/,/^## /{/^- \*\*/p;}' "$BRAIN/work/logs/system-status.md" 2>/dev/null | grep -v "inactive-until-stream" | grep -v "inactive-on-demand" || true)
+
+  # Cross-reference operator-notes: suppress services whose operator
+  # classification is inactive-on-demand or decommissioned (live probe
+  # sees "down" but the operator decided it's intentionally off or retired).
+  if [[ -n "$DOWN_SERVICES" && -f "$BRAIN/brain/ops/operator-notes.jsonl" ]]; then
+    _inactive_subjects=$(python3 -c "
+import json, sys
+suppress_prefixes = ('inactive-on-demand', 'decommissioned')
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line: continue
+    try:
+        e = json.loads(line)
+    except: continue
+    if e.get('type') == 'service-note' and e.get('note','').lower().startswith(suppress_prefixes):
+        print(e.get('subject',''))
+" "$BRAIN/brain/ops/operator-notes.jsonl" 2>/dev/null || true)
+    if [[ -n "$_inactive_subjects" ]]; then
+      while IFS= read -r _isub; do
+        [[ -z "$_isub" ]] && continue
+        # Map subject keys to display names for grep filtering
+        _iname="$_isub"
+        case "$_isub" in
+          strikes-engine) _iname="Strikes Engine" ;;
+          strikes-observe) _iname="Strikes Observe" ;;
+          brain-export-webhook) _iname="Brain Export Hook" ;;
+        esac
+        DOWN_SERVICES=$(echo "$DOWN_SERVICES" | grep -iv "$_iname" || true)
+      done <<< "$_inactive_subjects"
+    fi
+  fi
+fi
+
+# ── 3b. Cron daemon health ────────────────────────────────────────
+CRON_HEALTHY=true
+if ! pgrep -x cron > /dev/null 2>&1; then
+  CRON_HEALTHY=false
+  DOWN_SERVICES="${DOWN_SERVICES}\n- **WSL cron daemon** — NOT RUNNING. All scheduled Brain jobs are dead. Run: \`sudo service cron start\`"
+fi
+
+# ── 3b-ii. SO-005: Check expected WSL PM2 services ───────────────
+# Laptop WSL PM2 has no expected always-on services.
+# Remote-seat services: brain-agent, brain-monitor, brain-dashboard, reverse-tunnel
+
+# ── 3b-iii. Surface recent health sweep incidents ─────────────────
+SWEEP_LOG="$BRAIN/work/logs/health-sweep.log"
+SWEEP_INCIDENTS=""
+if [[ -f "$SWEEP_LOG" ]]; then
+  # Show non-HEALTHY entries from the last 24 hours
+  _cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)
+  SWEEP_INCIDENTS=$(awk -v cutoff="$_cutoff" '$1 >= cutoff && $3 != "HEALTHY" { print }' "$SWEEP_LOG" 2>/dev/null || true)
+  if [[ -n "$SWEEP_INCIDENTS" ]]; then
+    _incident_count=$(echo "$SWEEP_INCIDENTS" | wc -l | tr -d ' ')
+    # Surface as a separate section, not as a down service (avoids SO-004 false match)
+    SWEEP_SUMMARY="$_incident_count health-sweep incident(s) in last 24h — check \`work/logs/health-sweep.log\`"
+  fi
+fi
+
+# ── 3b-iv. VE overnight summary (Body-to-Brain handoff) ──────────
+# Parse health-sweep.log for the last 24h to build a concise overnight report.
+# This gives the human a one-glance view of what VE did between sessions.
+VE_SUMMARY=""
+if [[ -f "$SWEEP_LOG" ]]; then
+  VE_SUMMARY=$(python3 - "$SWEEP_LOG" "$BRAIN" <<'PYEOF'
+import sys, os, glob
+from datetime import datetime, timezone, timedelta
+
+sweep_log = sys.argv[1]
+brain = sys.argv[2]
+cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+# Parse sweep log
+total_sweeps = 0
+healthy = 0
+degraded = 0
+unhealthy = 0
+remedies = []
+failures = []
+
+try:
+    with open(sweep_log) as f:
+        for line in f:
+            if not line.startswith("2") or "HEALTH_SWEEP" not in line:
+                continue
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            ts = parts[0]
+            if ts < cutoff_str:
+                continue
+            total_sweeps += 1
+            verdict = parts[2]
+            if verdict == "HEALTHY":
+                healthy += 1
+            elif verdict == "DEGRADED":
+                degraded += 1
+            elif verdict == "UNHEALTHY":
+                unhealthy += 1
+            # Extract remedies
+            if "remedies=" in line:
+                r = line.split("remedies=")[1].split(" ")[0].strip()
+                if r:
+                    remedies.append(r)
+            # Extract failures (excluding stale verdict which is noise)
+            if "failures=" in line:
+                f_text = line.split("failures=")[1].split("warnings=")[0].strip()
+                if f_text and "State verdict: STALE" not in f_text:
+                    failures.append(f_text)
+except:
+    pass
+
+# Count suggestion files (unarchived)
+suggestions_dir = os.path.join(brain, "work/inbox/ollama-suggestions")
+suggestion_count = 0
+if os.path.isdir(suggestions_dir):
+    suggestion_count = len(glob.glob(os.path.join(suggestions_dir, "*.md")))
+
+# Rate file for SO-006 restarts
+rate_file = os.path.join(brain, "work/logs/.ve-restart-timestamps")
+restarts_24h = 0
+if os.path.isfile(rate_file):
+    cutoff_epoch = cutoff.timestamp()
+    try:
+        with open(rate_file) as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts and float(parts[0]) > cutoff_epoch:
+                    restarts_24h += 1
+    except:
+        pass
+
+# Build summary
+if total_sweeps == 0:
+    print("_No health-sweep data in last 24h._")
+    sys.exit(0)
+
+parts = []
+parts.append(f"{total_sweeps} sweeps")
+if unhealthy:
+    parts.append(f"**{unhealthy} UNHEALTHY**")
+if degraded:
+    parts.append(f"{degraded} degraded")
+if healthy:
+    parts.append(f"{healthy} healthy")
+
+line1 = "Health: " + ", ".join(parts)
+
+extras = []
+if remedies:
+    extras.append(f"Remedies applied: {', '.join(remedies)}")
+if restarts_24h:
+    extras.append(f"SO-006 restarts: {restarts_24h}")
+if failures:
+    # Deduplicate and show unique failure types
+    unique_failures = list(dict.fromkeys(failures))[:3]
+    for uf in unique_failures:
+        extras.append(f"Failure: {uf.rstrip('; ')}")
+if suggestion_count:
+    extras.append(f"Agent suggestions: {suggestion_count} pending")
+
+print(line1)
+for e in extras:
+    print(e)
+PYEOF
+  )
+fi
+
+# ── 3c. Match down services against known diagnostic patterns ─────
+PATTERNS_FILE="$_DIAGNOSTICS_PATTERNS"
+if [[ -n "$DOWN_SERVICES" && -f "$PATTERNS_FILE" ]]; then
+  DOWN_SERVICES=$(echo -e "$DOWN_SERVICES" | python3 -c "
+import json, sys
+
+try:
+    patterns = json.load(open('$PATTERNS_FILE')).get('patterns', [])
+except:
+    patterns = []
+
+ds_patterns = [p for p in patterns if p.get('match_surface') == 'down_services']
+output_lines = []
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    output_lines.append(line)
+    for p in ds_patterns:
+        if p.get('match_type') == 'contains' and p['signature'] in line:
+            output_lines.append('  → **Known pattern** — ' + p['summary'] + ' (brief: \`' + p['brief'] + '\`)')
+            break
+print('\n'.join(output_lines))
+" 2>/dev/null || echo -e "$DOWN_SERVICES")
+fi
+
+# ── 3e. SO-004: Create diagnostic briefs for unmatched service failures ──
+# If a down service has no matching pattern, write a low-confidence brief.
+# Stop condition: max 3 new briefs per resume run to prevent cascade-spam.
+if [[ -n "$DOWN_SERVICES" && -f "$PATTERNS_FILE" ]]; then
+  python3 -c "
+import json, os, sys, re
+from datetime import datetime, timezone
+
+brain = sys.argv[1]
+patterns_file = sys.argv[2]
+down_text = sys.argv[3]
+diag_dir = sys.argv[4]
+
+try:
+    patterns = json.load(open(patterns_file)).get('patterns', [])
+except:
+    patterns = []
+
+sigs = [p['signature'] for p in patterns if p.get('match_surface') == 'down_services' and p.get('signature')]
+now = datetime.now(timezone.utc)
+created = 0
+
+for line in down_text.split('\n'):
+    if not line.strip().startswith('- **'):
+        continue
+    # Check if any pattern matches this line
+    matched = any(sig in line for sig in sigs)
+    if matched:
+        continue
+
+    # Extract service name from '- **Service Name** — detail'
+    m = re.match(r'- \*\*(.+?)\*\*', line)
+    if not m:
+        continue
+    svc_name = m.group(1)
+
+    # Skip if we already have a brief for this subject
+    slug = svc_name.lower().replace(' ', '-').replace(':', '')
+    brief_path = os.path.join(diag_dir, f'{slug}-auto.md')
+    if os.path.exists(brief_path):
+        continue
+
+    # Stop condition: max 3 per run
+    if created >= 3:
+        print(f'[SO-004] WARNING: >3 unmatched failures — stopping brief creation (escalate)', file=sys.stderr)
+        break
+
+    # Extract detail
+    detail = line.split('—', 1)[1].strip() if '—' in line else 'unknown'
+
+    # Write brief
+    os.makedirs(diag_dir, exist_ok=True)
+    with open(brief_path, 'w') as f:
+        f.write(f'''---
+type: \"diagnostic\"
+event: \"service-down\"
+subject: \"{svc_name}\"
+pattern: \"\"
+confidence: \"low\"
+recommended_action: \"Investigate — no known pattern. Check logs and service health.\"
+resolved: false
+resolved_on: \"\"
+validated: false
+validated_on: \"\"
+validation_outcome: \"\"
+---
+
+# {svc_name} — Unmatched Service Failure
+
+## What happened
+
+{svc_name} detected as down-unexpected. Detail: {detail}
+
+## Diagnosis
+
+No known pattern matched this failure. This brief was auto-created by Standing Order SO-004. Investigation required.
+
+## Recommended action
+
+Check service logs, PM2 status, and health endpoints. Once resolved, update this brief and consider adding a pattern to patterns.json if the issue is likely to recur.
+''')
+    created += 1
+    print(f'  SO-004: Created brief for {svc_name} ({brief_path})')
+" "$BRAIN" "$PATTERNS_FILE" "$(echo -e "$DOWN_SERVICES")" "$_DIAGNOSTICS_DIR" 2>&1 || true
+fi
+
+# ── 3d. Match verdict issues against known diagnostic patterns ─────
+# (Applied later when verdict is read — store patterns for use in the output section)
+VERDICT_PATTERNS=""
+if [[ -f "$PATTERNS_FILE" ]]; then
+  VERDICT_PATTERNS=$(python3 -c "
+import json
+try:
+    patterns = json.load(open('$PATTERNS_FILE')).get('patterns', [])
+    vp = [p for p in patterns if p.get('match_surface') == 'verdict_issues']
+    for p in vp:
+        print(p['signature'] + '|' + p['summary'] + '|' + p['brief'])
+except:
+    pass
+" 2>/dev/null || true)
+fi
+
+# ── 4. Inbox items ─────────────────────────────────────────────────
+INBOX_COUNT=0
+INBOX_FILES=""
+if [[ -d "$BRAIN/work/inbox" ]]; then
+  while IFS= read -r f; do
+    name=$(basename "$f")
+    [[ "$name" == "README.md" || "$name" == ".gitkeep" ]] && continue
+    INBOX_COUNT=$((INBOX_COUNT + 1))
+    INBOX_FILES="$INBOX_FILES\n- \`$name\`"
+  done < <(find "$BRAIN/work/inbox" -maxdepth 1 -type f 2>/dev/null)
+fi
+
+# ── 5. Pending deletions ──────────────────────────────────────────
+PENDING_COUNT=0
+PENDING_FILES=""
+if [[ -d "$BRAIN/work/inbox/pending-deletions" ]]; then
+  while IFS= read -r f; do
+    name=$(basename "$f")
+    [[ "$name" == ".gitkeep" ]] && continue
+    if grep -q 'status: pending' "$f" 2>/dev/null; then
+      PENDING_COUNT=$((PENDING_COUNT + 1))
+      PENDING_FILES="$PENDING_FILES\n- \`$name\` — awaiting confirmation"
+    fi
+  done < <(find "$BRAIN/work/inbox/pending-deletions" -maxdepth 1 -type f 2>/dev/null)
+fi
+
+# ── 6. Ollama suggestions ─────────────────────────────────────────
+SUGGESTION_COUNT=0
+if [[ -d "$BRAIN/work/inbox/ollama-suggestions" ]]; then
+  SUGGESTION_COUNT=$(find "$BRAIN/work/inbox/ollama-suggestions" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l)
+fi
+
+# ── 6b. Ollama triage status ──────────────────────────────────────
+TRIAGE_LAST="never"
+TRIAGE_ACTIONABLE=0
+TRIAGE_STATS="$BRAIN/work/inbox/ollama-reviewed/.last-triage-stats.json"
+if [[ -f "$TRIAGE_STATS" ]]; then
+  TRIAGE_LAST=$(python3 -c "import json; print(json.load(open('$TRIAGE_STATS')).get('date','?'))" 2>/dev/null || echo "?")
+  TRIAGE_ACTIONABLE=$(python3 -c "import json; print(json.load(open('$TRIAGE_STATS')).get('actionable',0))" 2>/dev/null || echo 0)
+fi
+
+# ── 7. Open questions ─────────────────────────────────────────────
+OPEN_Q_COUNT=0
+if [[ -f "$BRAIN/work/open-questions.md" ]]; then
+  OPEN_Q_COUNT=$(sed '/^```/,/^```/d' "$BRAIN/work/open-questions.md" | grep -c '^\- \[ \]' 2>/dev/null || echo 0)
+fi
+
+# ── 8a. Active tasks (brain-task CLI) ─────────────────────────────
+TASKS_DIR="$BRAIN/work/tasks"
+ACTIVE_TASKS=""
+ACTIVE_TASK_COUNT=0
+BLOCKED_TASK_COUNT=0
+if [[ -d "$TASKS_DIR" ]]; then
+  for tf in "$TASKS_DIR"/task-*.md; do
+    [[ -f "$tf" ]] || continue
+    t_status=$(fm_get "$tf" "status")
+    t_title=$(fm_get "$tf" "title")
+    t_priority=$(fm_get "$tf" "priority")
+    if [[ "$t_status" == "active" ]]; then
+      ACTIVE_TASKS="${ACTIVE_TASKS}\n- **[$t_priority] $t_title** (\`$(basename "$tf")\`)"
+      ACTIVE_TASK_COUNT=$((ACTIVE_TASK_COUNT + 1))
+    elif [[ "$t_status" == "blocked" ]]; then
+      ACTIVE_TASKS="${ACTIVE_TASKS}\n- **[$t_priority] $t_title** (\`$(basename "$tf")\`) — BLOCKED"
+      BLOCKED_TASK_COUNT=$((BLOCKED_TASK_COUNT + 1))
+    fi
+  done
+fi
+
+# ── 8a2. Task queue (brain/ops/tasks/) ───────────────────────────
+OPS_TASKS_DIR="$BRAIN/brain/ops/tasks"
+OPS_QUEUED_COUNT=0
+OPS_ACTIVE_COUNT=0
+OPS_ACTIVE_LIST=""
+OPS_COMPLETED_COUNT=0
+if [[ -d "$OPS_TASKS_DIR" ]]; then
+  for tf in "$OPS_TASKS_DIR"/queue/TASK-*.md; do
+    [[ -f "$tf" ]] || continue
+    # Skip parked tasks — they live in queue/ but are not actionable
+    grep -q '^status:[[:space:]]*parked' "$tf" && continue
+    OPS_QUEUED_COUNT=$((OPS_QUEUED_COUNT + 1))
+  done
+  OPS_ORPHAN_LIST=""
+  OPS_ORPHAN_COUNT=0
+  for tf in "$OPS_TASKS_DIR"/active/TASK-*.md; do
+    [[ -f "$tf" ]] || continue
+    OPS_ACTIVE_COUNT=$((OPS_ACTIVE_COUNT + 1))
+    t_id=$(fm_get "$tf" "task_id")
+    t_priority=$(fm_get "$tf" "priority")
+    t_owner=$(fm_get "$tf" "owner")
+    t_title=$(head -30 "$tf" | grep '^# ' | head -1 | sed 's/^# //' || true)
+    # Orphan detection: task is orphaned if it's been in active/ for >2h
+    # Primary signal: claimed_at from frontmatter, fallback: launched_at from run record
+    _is_orphan=false
+    _age_hours=0
+    _claimed_at=$(fm_get "$tf" "claimed_at")
+    _run_record="$OPS_TASKS_DIR/active/${t_id}.run.json"
+    _timestamp=""
+    if [[ -n "$_claimed_at" ]]; then
+      _timestamp="$_claimed_at"
+    elif [[ -f "$_run_record" ]]; then
+      _timestamp=$(python3 -c "import json; print(json.load(open('$_run_record')).get('launched_at',''))" 2>/dev/null) || true
+    fi
+    if [[ -n "$_timestamp" ]]; then
+      _claim_epoch=$(date -d "$_timestamp" +%s 2>/dev/null || echo 0)
+      _now_epoch=$(date +%s)
+      _age_hours=$(( (_now_epoch - _claim_epoch) / 3600 ))
+      # Orphan if >2h old -- the agent session that claimed it is almost certainly gone
+      if [[ $_age_hours -ge 2 ]]; then
+        _is_orphan=true
+      fi
+    fi
+    if $_is_orphan; then
+      OPS_ORPHAN_COUNT=$((OPS_ORPHAN_COUNT + 1))
+      OPS_ORPHAN_LIST="${OPS_ORPHAN_LIST}\n- **ORPHAN [$t_priority] $t_title** (\`$t_id\`, owner: $t_owner, claimed ${_age_hours}h ago) → release: \`brain-task-release $t_id --reason \"session ended without completion\"\`"
+      OPS_ACTIVE_LIST="${OPS_ACTIVE_LIST}\n- **ORPHAN [$t_priority] $t_title** (\`$t_id\`, owner: $t_owner) — claimed ${_age_hours}h ago, process dead"
+    else
+      OPS_ACTIVE_LIST="${OPS_ACTIVE_LIST}\n- **[$t_priority] $t_title** (\`$t_id\`, owner: $t_owner)"
+    fi
+  done
+  for tf in "$OPS_TASKS_DIR"/completed/TASK-*.md; do
+    [[ -f "$tf" ]] || continue
+    OPS_COMPLETED_COUNT=$((OPS_COMPLETED_COUNT + 1))
+  done
+fi
+
+# ── 8b. Latest brain snapshot tag ─────────────────────────────────
+LATEST_SNAPSHOT=""
+if cd "$BRAIN" 2>/dev/null; then
+  LATEST_SNAPSHOT=$(git tag -l 'brain-snapshot-*' --sort=-creatordate 2>/dev/null | head -1)
+  cd - > /dev/null
+fi
+
+# ── 8c. Content seeds count ───────────────────────────────────────
+SEEDS_DIR="$BRAIN/work/inbox/content-seeds"
+SEEDS_COUNT=0
+LATEST_SEEDS=""
+if [[ -d "$SEEDS_DIR" ]]; then
+  SEEDS_COUNT=$(ls "$SEEDS_DIR"/*-discord-seeds.md 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+  latest_seed=$(ls -t "$SEEDS_DIR"/*-discord-seeds.md 2>/dev/null | head -1 || true)
+  [[ -n "$latest_seed" ]] && LATEST_SEEDS=$(basename "$latest_seed")
+fi
+
+# ── 8d. Clip drift score ─────────────────────────────────────────
+DRIFT_SCORE=""
+DRIFT_VERDICT=""
+DRIFT_DATE=""
+DRIFT_FILE="$BRAIN/work/logs/clip-health/personality-drift.md"
+if [[ -f "$DRIFT_FILE" ]]; then
+  DRIFT_SCORE=$(grep '^drift_score:' "$DRIFT_FILE" | head -1 | sed 's/drift_score: *//')
+  DRIFT_VERDICT=$(grep '^verdict:' "$DRIFT_FILE" | head -1 | sed 's/verdict: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  DRIFT_DATE=$(fm_get "$DRIFT_FILE" "date")
+fi
+
+# ── 8e2. Brain verdict ─────────────────────────────────────────────
+VERDICT_JSON="$_VERDICT_JSON"
+VERDICT_READER="$_VERDICT_READER"
+VERDICT_STATUS=""
+VERDICT_ISSUE_COUNT=0
+VERDICT_SUMMARY=""
+
+# Auto-refresh if verdict missing or older than 1 hour
+if [[ ! -f "$VERDICT_JSON" ]]; then
+  "$_STATE_CHECK" --quiet > /dev/null 2>&1 || true
+elif [[ -f "$VERDICT_JSON" ]]; then
+  verdict_age=$(( $(date +%s) - $(stat -c %Y "$VERDICT_JSON") ))
+  if [[ $verdict_age -gt 3600 ]]; then
+    "$_STATE_CHECK" --quiet > /dev/null 2>&1 || true
+  fi
+fi
+
+if [[ -f "$VERDICT_JSON" ]]; then
+  _vr_output=$(python3 "$VERDICT_READER" "$VERDICT_JSON" 2>/dev/null) || true
+  if [[ -n "$_vr_output" ]]; then
+    IFS=$'\t' read -r VERDICT_STATUS VERDICT_SUMMARY VERDICT_ISSUE_COUNT _vr_rest <<< "$_vr_output"
+  fi
+fi
+
+# ── 8e1. Review state ─────────────────────────────────────────────
+REVIEW_STATE_FILE="$BRAIN/brain/ops/review-state.md"
+REVIEW_JSON_FILE="$BRAIN/brain/ops/review-state.json"
+REVIEW_TRIAGE_DATE=""
+REVIEW_TRIAGE_AGE=""
+REVIEW_WEEKLY_DATE=""
+REVIEW_WEEKLY_AGE=""
+REVIEW_NEXT_DUE=""
+_review_output=""
+# Prefer JSON sidecar (reliable), fall back to markdown regex
+if [[ -f "$REVIEW_JSON_FILE" ]]; then
+  _review_output=$(python3 - "$REVIEW_JSON_FILE" <<'PYEOF'
+import json, sys
+from datetime import datetime
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except:
+    sys.exit(1)
+
+def age_label(date_str):
+    if not date_str or date_str.startswith('_') or date_str == 'never':
+        return 'NEVER'
+    try:
+        dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
+        age = (datetime.now() - dt).days
+        if age == 0: return 'today'
+        elif age == 1: return '1d ago'
+        elif age <= 7: return f'{age}d ago'
+        else: return f'{age}d ago — OVERDUE'
+    except:
+        return '?'
+
+triage_date = data.get('triage', {}).get('date', '')
+weekly_date = data.get('weekly', {}).get('date', '')
+next_due = data.get('weekly', {}).get('next_due', '')
+
+print(f'{triage_date}\t{age_label(triage_date)}\t{weekly_date}\t{age_label(weekly_date)}\t{next_due}')
+PYEOF
+  ) || true
+fi
+# Fallback: parse markdown if JSON missing or failed
+if [[ -z "$_review_output" && -f "$REVIEW_STATE_FILE" ]]; then
+  _review_output=$(python3 - "$REVIEW_STATE_FILE" <<'PYEOF'
+import sys, re
+from datetime import datetime
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+def extract(section, field):
+    pattern = rf'## {section}\n\n(?:.*\n)*?- \*\*{field}:\*\* (.*)'
+    m = re.search(pattern, content)
+    return m.group(1).strip() if m else ''
+
+def age_label(date_str):
+    if not date_str or date_str.startswith('_') or date_str == 'never':
+        return 'NEVER'
+    try:
+        dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
+        age = (datetime.now() - dt).days
+        if age == 0: return 'today'
+        elif age == 1: return '1d ago'
+        elif age <= 7: return f'{age}d ago'
+        else: return f'{age}d ago — OVERDUE'
+    except:
+        return '?'
+
+triage_date = extract('Last Inbox Triage', 'date')
+weekly_date = extract('Last Weekly Review', 'date')
+next_due = extract('Last Weekly Review', 'next_due')
+
+print(f'{triage_date}\t{age_label(triage_date)}\t{weekly_date}\t{age_label(weekly_date)}\t{next_due}')
+PYEOF
+  ) || true
+fi
+if [[ -n "$_review_output" ]]; then
+  IFS=$'\t' read -r REVIEW_TRIAGE_DATE REVIEW_TRIAGE_AGE REVIEW_WEEKLY_DATE REVIEW_WEEKLY_AGE REVIEW_NEXT_DUE <<< "$_review_output"
+elif [[ ! -f "$REVIEW_STATE_FILE" && ! -f "$REVIEW_JSON_FILE" ]]; then
+  REVIEW_TRIAGE_AGE="NO FILE"
+  REVIEW_WEEKLY_AGE="NO FILE"
+fi
+
+# ── 8e. Curate report ─────────────────────────────────────────────
+CURATE_DIR="$BRAIN/work/inbox/curate-reports"
+LATEST_CURATE=""
+CURATE_PROMOTIONS=0
+CURATE_ARCHIVES=0
+if [[ -d "$CURATE_DIR" ]]; then
+  latest_curate=$(ls -t "$CURATE_DIR"/*-curate.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_curate" ]]; then
+    LATEST_CURATE=$(basename "$latest_curate")
+    CURATE_PROMOTIONS=$(grep '^promotions:' "$latest_curate" | head -1 | sed 's/promotions: *//')
+    CURATE_ARCHIVES=$(grep '^archives:' "$latest_curate" | head -1 | sed 's/archives: *//')
+  fi
+fi
+
+# ── Build session arc narrative ────────────────────────────────────
+SESSION_ARC=""
+SESSION_ARC=$(python3 -c "
+import os, re, sys
+from datetime import datetime, timezone
+
+brain = sys.argv[1]
+lines = []
+
+# 1. Recent devlog titles (last 3, newest by frontmatter date then mtime tiebreaker)
+devlog_dir = os.path.join(brain, 'work/logs/devlog')
+devlogs = []
+if os.path.isdir(devlog_dir):
+    candidates = []
+    for f in os.listdir(devlog_dir):
+        if f.startswith('2026-') and f.endswith('.md') and f != 'README.md':
+            path = os.path.join(devlog_dir, f)
+            with open(path) as fh:
+                content = fh.read()
+            dm = re.search(r'^date:\s*\"(.+?)\"', content, re.MULTILINE)
+            fm_date = dm.group(1) if dm else f[:10]
+            # Sort key: frontmatter date (primary), mtime (tiebreaker within same date)
+            candidates.append((fm_date, os.path.getmtime(path), f, path, content))
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    for fm_date, _, f, path, content in candidates[:3]:
+        m = re.search(r'^title:\s*\"(.+?)\"', content, re.MULTILINE)
+        title = m.group(1) if m else f.replace('.md', '')
+        devlogs.append((fm_date, title))
+
+if devlogs:
+    latest_date, latest_title = devlogs[0]
+    lines.append(f'Last session shipped **{latest_title}** ({latest_date}).')
+
+# 2. Waiting-on-human items (from queue: human-owned tasks, or known pending actions)
+queue_dir = os.path.join(brain, 'brain/ops/tasks/queue')
+human_waiting = []
+if os.path.isdir(queue_dir):
+    for f in sorted(os.listdir(queue_dir)):
+        if not f.startswith('TASK-') or not f.endswith('.md'):
+            continue
+        path = os.path.join(queue_dir, f)
+        with open(path) as fh:
+            content = fh.read()
+        am = re.search(r'\*\*authority_owner:\*\*\s*(\S+)', content)
+        if am and am.group(1) == 'human':
+            tm = re.search(r'^# (.+)$', content, re.MULTILINE)
+            title = tm.group(1) if tm else f
+            human_waiting.append(title)
+
+# 3. Latest handoff note (if exists and recent)
+handoff_dir = os.path.join(brain, 'work/session-handoffs')
+if os.path.isdir(handoff_dir):
+    handoffs = sorted([f for f in os.listdir(handoff_dir) if f.endswith('.md')], reverse=True)
+    if handoffs:
+        hf_path = os.path.join(handoff_dir, handoffs[0])
+        # Only include if less than 3 days old
+        mtime = os.path.getmtime(hf_path)
+        age_hours = (datetime.now(timezone.utc).timestamp() - mtime) / 3600
+        if age_hours < 72:
+            with open(hf_path) as fh:
+                hc = fh.read()
+            # Extract first non-empty, non-frontmatter line as the handoff note
+            in_frontmatter = False
+            for line in hc.split('\n'):
+                if line.strip() == '---':
+                    in_frontmatter = not in_frontmatter
+                    continue
+                if in_frontmatter:
+                    continue
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    lines.append(f'Handoff note: {stripped}')
+                    break
+
+# 4. Execution notes removed from resume (available in devlog)
+
+if human_waiting:
+    lines.append('Waiting on you: ' + '; '.join(human_waiting[:3]) + '.')
+
+if lines:
+    print('\n'.join(lines))
+else:
+    print('')
+" "$BRAIN" 2>/dev/null || true)
+
+# ── Read recent healing events ─────────────────────────────────────
+HEALING_LOG="$BRAIN/work/logs/healing-events.log"
+HEALING_SECTION=""
+HEALING_PRIORITY=""
+HEALING_ACTIVE=false
+if [[ -f "$HEALING_LOG" ]]; then
+  # Only show entries from last 48h (prevents stale resolved signals from lingering)
+  _HEAL_CUTOFF=$(date -u -d '48 hours ago' +%Y-%m-%dT%H:%M 2>/dev/null || date -u -v-48H +%Y-%m-%dT%H:%M 2>/dev/null || echo "2000-01-01T00:00")
+  RECENT_HEALING=$(awk -F'|' -v cutoff="$_HEAL_CUTOFF" '$1 >= cutoff' "$HEALING_LOG" 2>/dev/null | tail -3 || true)
+  if [[ -n "$RECENT_HEALING" ]]; then
+    # Detect active signals: DRIFT, CONFLICT, DEGRADED, or repeated remedies
+    if echo "$RECENT_HEALING" | grep -qiE 'DRIFT|CONFLICT|DEGRADED'; then
+      HEALING_ACTIVE=true
+    fi
+    # Check for repeated remedies (same remedy_id appearing 2+ times in last 5 entries)
+    if [[ -f "$HEALING_LOG" ]]; then
+      _REMEDY_DUPES=$(tail -5 "$HEALING_LOG" | grep '| remedy |' | awk -F'|' '{gsub(/^ +| +$/,"",$4); print $4}' | sort | uniq -d || true)
+      [[ -n "$_REMEDY_DUPES" ]] && HEALING_ACTIVE=true
+    fi
+
+    # Compress to summary line: count total, count resolved
+    _HEAL_TOTAL=$(echo "$RECENT_HEALING" | wc -l | tr -d ' ')
+    _HEAL_RESOLVED=$(echo "$RECENT_HEALING" | grep -ci 'resolved' || true)
+    HEALING_SECTION="### Healing Signals
+
+${_HEAL_TOTAL} healing signal(s) in last 48h (${_HEAL_RESOLVED} resolved). See \`work/logs/healing-events.log\`.
+"
+  fi
+fi
+
+HEALING_CANDIDATES=""
+if [[ "$HEALING_ACTIVE" == "true" ]]; then
+  HEALING_PRIORITY=""
+
+  # Generate healing candidates from detected patterns (max 2, template only)
+  _HC_LINES=""
+  _HC_COUNT=0
+
+  # Repeated DRIFT/CONFLICT in recent events
+  _DRIFT_COUNT=$(tail -10 "$HEALING_LOG" 2>/dev/null | grep -ciE 'DRIFT|CONFLICT' || true)
+  if [[ $_DRIFT_COUNT -ge 2 && $_HC_COUNT -lt 2 ]]; then
+    _DRIFT_SOURCE=$(tail -10 "$HEALING_LOG" | grep -iE 'DRIFT|CONFLICT' | tail -1 | awk -F'|' '{gsub(/^ +| +$/,"",$4); print $4}' || true)
+    _HC_LINES="${_HC_LINES}- Investigate recurring drift: ${_DRIFT_SOURCE}
+"
+    _HC_COUNT=$((_HC_COUNT + 1))
+  fi
+
+  # Repeated remedies
+  if [[ -n "${_REMEDY_DUPES:-}" && $_HC_COUNT -lt 2 ]]; then
+    _HC_LINES="${_HC_LINES}- Review recurring remedy: ${_REMEDY_DUPES}
+"
+    _HC_COUNT=$((_HC_COUNT + 1))
+  fi
+
+  # DEGRADED state
+  _DEG_COUNT=$(tail -10 "$HEALING_LOG" 2>/dev/null | grep -ciE 'DEGRADED' || true)
+  if [[ $_DEG_COUNT -ge 1 && $_HC_COUNT -lt 2 ]]; then
+    _DEG_SOURCE=$(tail -10 "$HEALING_LOG" | grep -iE 'DEGRADED' | tail -1 | awk -F'|' '{gsub(/^ +| +$/,"",$4); print $4}' || true)
+    _HC_LINES="${_HC_LINES}- Stabilize: ${_DEG_SOURCE}
+"
+    _HC_COUNT=$((_HC_COUNT + 1))
+  fi
+
+  if [[ -n "$_HC_LINES" ]]; then
+    HEALING_CANDIDATES="### Healing Candidates
+
+${_HC_LINES}"
+  fi
+fi
+
+# ── Read recent reflection status ──────────────────────────────────
+REFLECT_DIR="$BRAIN/work/logs/reflections"
+REFLECT_STATUS=""
+if [[ -d "$REFLECT_DIR" ]]; then
+  LATEST_REFLECT=$(ls -t "$REFLECT_DIR"/*-reflect.md 2>/dev/null | head -1 || true)
+  LATEST_SKIP=$(ls -t "$REFLECT_DIR"/*-skipped.md 2>/dev/null | head -1 || true)
+  if [[ -n "$LATEST_REFLECT" ]]; then
+    REFLECT_DATE=$(basename "$LATEST_REFLECT" | sed 's/-reflect\.md//')
+    REFLECT_AGE_DAYS=$(( ($(date +%s) - $(date -d "$REFLECT_DATE" +%s 2>/dev/null || echo $(date +%s))) / 86400 ))
+    if [[ $REFLECT_AGE_DAYS -eq 0 ]]; then
+      REFLECT_STATUS="- **Reflection:** Current session (\`$REFLECT_DATE\`)"
+    elif [[ $REFLECT_AGE_DAYS -le 3 ]]; then
+      REFLECT_STATUS="- **Reflection:** ${REFLECT_AGE_DAYS}d ago (\`$REFLECT_DATE\`)"
+    else
+      REFLECT_STATUS="- **Reflection:** ${REFLECT_AGE_DAYS}d ago (\`$REFLECT_DATE\`) — consider reflecting this session"
+    fi
+  elif [[ -n "$LATEST_SKIP" ]]; then
+    SKIP_DATE=$(basename "$LATEST_SKIP" | sed 's/-skipped\.md//')
+    REFLECT_STATUS="- **Reflection:** Last session skipped (\`$SKIP_DATE\`)"
+  else
+    REFLECT_STATUS="- **Reflection:** _never recorded_ — run \`brain-reflect\` to start"
+  fi
+else
+  REFLECT_STATUS="- **Reflection:** _not yet initialized_"
+fi
+
+# Extract first meaningful line from latest reflection for carry-forward
+REFLECT_ECHO=""
+if [[ -n "${LATEST_REFLECT:-}" && -f "${LATEST_REFLECT:-}" ]]; then
+  # Find first filled-in bullet from the "Reflect" section (after "## Reflect")
+  REFLECT_ECHO=$(awk '
+    /^## Reflect/ { in_reflect=1; next }
+    !in_reflect { next }
+    /^---$/ { exit }
+    /^#/ { next }
+    /^$/ { next }
+    /^-$/ { next }
+    /^\*Generated/ { next }
+    /^- .+/ { print; exit }
+  ' "$LATEST_REFLECT" 2>/dev/null || true)
+  if [[ -n "$REFLECT_ECHO" ]]; then
+    REFLECT_STATUS="${REFLECT_STATUS}
+- **Last reflection insight:** ${REFLECT_ECHO}"
+  fi
+
+  # Parse "What should happen next" bullets as candidate tasks (raw pass-through)
+  REFLECT_CANDIDATES=$(awk '
+    /^### What should happen next/ { in_next=1; next }
+    !in_next { next }
+    /^#/ { exit }
+    /^$/ { next }
+    /^-$/ { next }
+    /^- .+/ { print }
+  ' "$LATEST_REFLECT" 2>/dev/null || true)
+  if [[ -n "$REFLECT_CANDIDATES" ]]; then
+    # Duplicate detection: grep candidate keywords against queue/active task titles
+    TAGGED_CANDIDATES=""
+    while IFS= read -r cand_line; do
+      # Extract keywords (strip leading "- ", take first 4 words)
+      cand_words=$(echo "$cand_line" | sed 's/^- //' | awk '{for(i=1;i<=4&&i<=NF;i++) printf "%s ", $i}' | xargs)
+      match=""
+      for task_dir in "$BRAIN/brain/ops/tasks/queue" "$BRAIN/brain/ops/tasks/active"; do
+        [[ -d "$task_dir" ]] || continue
+        for tf in "$task_dir"/TASK-*.md; do
+          [[ -f "$tf" ]] || continue
+          task_title=$(grep -m1 '^title:' "$tf" 2>/dev/null | sed 's/^title:\s*//;s/^"//;s/"$//' || true)
+          task_id=$(grep -m1 '^task_id:' "$tf" 2>/dev/null | sed 's/^task_id:\s*//;s/^"//;s/"$//' || true)
+          # Check if any keyword appears in the task title (case-insensitive)
+          for w in $cand_words; do
+            [[ ${#w} -lt 4 ]] && continue  # skip short words
+            if echo "$task_title" | grep -qi "$w" 2>/dev/null; then
+              match="$task_id"
+              break 2
+            fi
+          done
+        done
+      done
+      if [[ -n "$match" ]]; then
+        TAGGED_CANDIDATES="${TAGGED_CANDIDATES}${cand_line} _(similar: ${match})_
+"
+      else
+        TAGGED_CANDIDATES="${TAGGED_CANDIDATES}${cand_line}
+"
+      fi
+    done <<< "$REFLECT_CANDIDATES"
+
+    REFLECT_STATUS="${REFLECT_STATUS}
+
+### Reflection Candidates
+
+${TAGGED_CANDIDATES}"
+  fi
+fi
+
+# ── Read persisted next-focus recommendation ──────────────────────
+NEXT_FOCUS_FILE="$BRAIN/work/logs/next-focus-latest.json"
+NEXT_FOCUS_SECTION=""
+NEXT_FOCUS_STALE=false
+if [[ -f "$NEXT_FOCUS_FILE" ]]; then
+  # Read recommendation fields
+  NF_SUMMARY=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('summary',''))" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+  NF_GENERATED=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('generated_at','')[:19])" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+  NF_FOCUS_TYPE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('focus_type',''))" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+  NF_FINGERPRINT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('queue_fingerprint',''))" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+  NF_TOP_TASKS=$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+recs=d.get('recommendations',[])
+if recs and 'tasks' in recs[0]:
+    print(', '.join(recs[0]['tasks'][:3]))
+else:
+    print('')
+" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+
+  if [[ -n "$NF_SUMMARY" ]]; then
+    # Check staleness: recompute current queue fingerprint and compare
+    CURRENT_FP=$(python3 -c "
+import os, re, sys
+queue_dir = os.path.join(sys.argv[1], 'brain/ops/tasks/queue')
+tasks = []
+if os.path.isdir(queue_dir):
+    for f in sorted(os.listdir(queue_dir)):
+        if f.startswith('TASK-') and f.endswith('.md'):
+            path = os.path.join(queue_dir, f)
+            with open(path) as fh:
+                c = fh.read()
+            # Skip parked tasks — not actionable
+            if re.search(r'^status:\s*parked', c, re.MULTILINE):
+                continue
+            m = re.search(r'^priority:\s*\"?([^\"\n]+)\"?', c, re.MULTILINE)
+            p = m.group(1).strip() if m else ''
+            tasks.append(f'{f[:-3]}:{p}')
+print(','.join(sorted(tasks)))
+" "$BRAIN" 2>/dev/null || true)
+
+    if [[ "$NF_FINGERPRINT" != "$CURRENT_FP" ]]; then
+      NEXT_FOCUS_STALE=true
+    fi
+
+    # Check age (>24h = stale regardless)
+    if [[ -n "$NF_GENERATED" ]]; then
+      NF_AGE_HOURS=$(python3 -c "
+from datetime import datetime, timezone
+import sys
+try:
+    gen = datetime.fromisoformat(sys.argv[1])
+    if gen.tzinfo is None:
+        gen = gen.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - gen).total_seconds() / 3600
+    print(f'{age:.0f}')
+except:
+    print('0')
+" "$NF_GENERATED" 2>/dev/null || echo "0")
+      [[ "${NF_AGE_HOURS:-0}" -gt 24 ]] && NEXT_FOCUS_STALE=true
+    fi
+
+    # Extract readiness for the top recommended task
+    NF_READINESS=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    recs = d.get('recommendations', [])
+    if not recs or 'readiness' not in recs[0] or 'tasks' not in recs[0]:
+        print('')
+        sys.exit()
+    top_task = recs[0]['tasks'][0]
+    r = recs[0]['readiness'].get(top_task, {})
+    if r.get('executable'):
+        print('ready')
+    else:
+        reason = r.get('block_reason', 'unknown')
+        print(f'blocked:{reason}')
+except:
+    print('')
+" "$NEXT_FOCUS_FILE" 2>/dev/null || true)
+
+    # Build section
+    if [[ "$NEXT_FOCUS_STALE" == "true" ]]; then
+      NEXT_FOCUS_SECTION="- **Prepared Focus:** ~~${NF_SUMMARY}~~ — **stale** (queue changed or >24h). Run \`brain-next-focus --persist\` to refresh."
+    else
+      NF_TASKS_LINE=""
+      [[ -n "$NF_TOP_TASKS" ]] && NF_TASKS_LINE=" Tasks: ${NF_TOP_TASKS}."
+      NF_READY_TAG=""
+      if [[ "$NF_READINESS" == "ready" ]]; then
+        NF_READY_TAG=" **Ready ✓**"
+      elif [[ "$NF_READINESS" == blocked:* ]]; then
+        NF_BLOCK_REASON="${NF_READINESS#blocked:}"
+        NF_READY_TAG=" **Blocked:** ${NF_BLOCK_REASON}"
+      fi
+      NEXT_FOCUS_SECTION="- **Prepared Focus:** ${NF_SUMMARY} [${NF_FOCUS_TYPE}].${NF_TASKS_LINE}${NF_READY_TAG} _(generated ${NF_GENERATED}Z)_"
+    fi
+  fi
+fi
+
+# ── Collect active incidents (ADR-0004 Phase 0d) ─────────────────
+_INC_DIR="$BRAIN/brain/ops/incidents"
+INC_SECTION=""
+if [[ -d "$_INC_DIR" ]]; then
+  INC_SECTION=$(python3 -c "
+import json, os, sys
+inc_dir = sys.argv[1]
+active_phases = {'detected', 'diagnosed'}
+lines = []
+for fname in sorted(os.listdir(inc_dir)):
+    if not fname.endswith('.jsonl'):
+        continue
+    fpath = os.path.join(inc_dir, fname)
+    records = []
+    with open(fpath) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if not records:
+        continue
+    last = records[-1]
+    first = records[0]
+    if last.get('phase', '') not in active_phases:
+        continue
+    inc_id = fname.replace('.jsonl', '')
+    subject = first.get('subject', '')
+    detail = first.get('detail', '')[:120]
+    confidence = first.get('confidence', '')
+    phase = last.get('phase', '')
+    lines.append(f'- **{subject}** ({phase}, {confidence}) — {detail}. Incident: \`{inc_id}\`')
+if lines:
+    print('## Active Incidents')
+    print('')
+    for l in lines:
+        print(l)
+    print('')
+" "$_INC_DIR" 2>/dev/null || echo "")
+fi
+
+# ── Collect diagnostic briefs ──────────────────────────────────────
+DIAG_DIR="$_DIAGNOSTICS_DIR"
+DIAG_SECTION=""
+DIAG_UNRESOLVED=""
+DIAG_RESOLVED_COUNT=0
+if [[ -d "$DIAG_DIR" ]]; then
+  for dfile in "$DIAG_DIR"/*.md; do
+    [[ -f "$dfile" ]] || continue
+    dname=$(basename "$dfile")
+    # Parse frontmatter fields
+    d_subject=$(fm_get "$dfile" "subject")
+    d_confidence=$(fm_get "$dfile" "confidence")
+    d_action=$(fm_get "$dfile" "recommended_action")
+    d_resolved=$(fm_get "$dfile" "resolved")
+    d_event=$(fm_get "$dfile" "event")
+    [[ -z "$d_subject" ]] && continue
+    if [[ "$d_resolved" == "true" ]]; then
+      DIAG_RESOLVED_COUNT=$((DIAG_RESOLVED_COUNT + 1))
+    else
+      DIAG_UNRESOLVED="${DIAG_UNRESOLVED}\n- ⚠ **${d_subject}** (${d_event}, ${d_confidence}) — ${d_action}. Brief: \`${dname}\`"
+    fi
+  done
+  # Only show diagnostics section if there are unresolved items.
+  # Resolved briefs are silent — archive them when ready.
+  if [[ -n "$DIAG_UNRESOLVED" ]]; then
+    DIAG_SECTION="## Diagnostics (pre-analyzed)\n${DIAG_UNRESOLVED}\n"
+    if [[ $DIAG_RESOLVED_COUNT -gt 0 ]]; then
+      DIAG_SECTION="${DIAG_SECTION}\n_${DIAG_RESOLVED_COUNT} resolved diagnostic(s) pending archival in \`work/inbox/diagnostics/\`._\n"
+    fi
+  fi
+fi
+
+# ── 8. Suggested first action ─────────────────────────────────────
+SUGGESTED_ACTION=""
+if [[ $P1_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$P1_COUNT P1 item(s) are blocking — check \`work/logs/priority-queue.md\` immediately."
+elif [[ -n "$DIAG_UNRESOLVED" ]]; then
+  SUGGESTED_ACTION="Unresolved diagnostic(s) with pre-analyzed recommendations — review \`work/inbox/diagnostics/\`"
+elif [[ $ACTIVE_TASK_COUNT -gt 0 || $BLOCKED_TASK_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$ACTIVE_TASK_COUNT active task(s), $BLOCKED_TASK_COUNT blocked — run \`brain-task list\` to review."
+elif [[ $OPS_ORPHAN_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$OPS_ORPHAN_COUNT orphaned task(s) in \`brain/ops/tasks/active/\` — process dead, release or reclaim before other work."
+elif [[ $OPS_ACTIVE_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$OPS_ACTIVE_COUNT task(s) claimed in \`brain/ops/tasks/active/\` — resume work on active tasks."
+elif [[ $OPS_QUEUED_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$OPS_QUEUED_COUNT task(s) waiting in \`brain/ops/tasks/queue/\` — review and claim one."
+elif [[ $QUEUED_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="Read $QUEUED_COUNT queued message(s) — these are urgent. Run \`brain-message list\` then \`brain-message clear\`."
+elif [[ $CORRECTIONS_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$CORRECTIONS_COUNT Clip correction(s) from Arson — review and update brain knowledge if needed."
+elif [[ $FIRED_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="$FIRED_COUNT reminder(s) have fired — check them below."
+elif [[ $PENDING_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="Review $PENDING_COUNT pending deletion manifest(s) in \`work/inbox/pending-deletions/\`"
+elif [[ -n "$DOWN_SERVICES" ]]; then
+  SUGGESTED_ACTION="Investigate down services — check \`work/logs/system-status.md\`"
+elif [[ $INBOX_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="Triage $INBOX_COUNT inbox item(s) in \`work/inbox/\`"
+elif [[ $SUGGESTION_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="Run \`brain-ollama-triage\` to review $SUGGESTION_COUNT raw suggestion file(s)"
+elif [[ $OPEN_Q_COUNT -gt 0 ]]; then
+  SUGGESTED_ACTION="Address $OPEN_Q_COUNT open question(s) in \`work/open-questions.md\`"
+else
+  # Check active-context freshness sidecar for remediation
+  _ac_stale=$(python3 -c "
+import json, os, sys
+p = os.path.join(sys.argv[1], 'brain/ops/derived/freshness.json')
+if os.path.isfile(p):
+    d = json.load(open(p))
+    if d.get('ac_stale'):
+        print(f\"active-context is {d.get('ac_age_days',0)}d behind ({d.get('ac_sessions_behind',0)} sessions)\")
+" "$BRAIN" 2>/dev/null || true)
+  if [[ -n "$_ac_stale" ]]; then
+    SUGGESTED_ACTION="Refresh active-context.md — $_ac_stale. Review and update \`brain/index/active-context.md\`."
+  else
+    SUGGESTED_ACTION="All clear — check active-context.md for current focus areas."
+  fi
+fi
+
+# ── Build pending actions list ─────────────────────────────────────
+PENDING_ACTIONS=""
+[[ $PENDING_COUNT -gt 0 ]] && PENDING_ACTIONS="${PENDING_ACTIONS}\n### Pending Deletions\n$(echo -e "$PENDING_FILES")\n"
+[[ -n "$DOWN_SERVICES" ]] && PENDING_ACTIONS="${PENDING_ACTIONS}\n### Down Services\n${DOWN_SERVICES}\n"
+[[ $INBOX_COUNT -gt 0 ]] && PENDING_ACTIONS="${PENDING_ACTIONS}\n### Inbox Items\n$(echo -e "$INBOX_FILES")\n"
+
+# ── Seal warnings carry-forward ───────────────────────────────────
+# Read actionable WARNs written by brain-meditate at the previous seal.
+# Only surface open items with should_resume_surface=true.
+# Display: single compact line per warn code, not full message.
+_SEAL_WARN_FILE="$BRAIN/brain/ops/derived/seal-warnings.json"
+if [[ -f "$_SEAL_WARN_FILE" ]]; then
+  _seal_carry=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    items = [w for w in d.get('warnings', [])
+             if w.get('should_resume_surface') and w.get('status') == 'open']
+    if not items:
+        sys.exit(0)
+    sealed = d.get('sealed_at', '')[:10]
+    codes  = ', '.join(w['warning_code'] for w in items)
+    print(f'- **Seal carry-forward ({sealed}):** {codes} — run \`brain-closeout-gate\` for details')
+except Exception:
+    pass
+" "$_SEAL_WARN_FILE" 2>/dev/null)
+  [[ -n "$_seal_carry" ]] && PENDING_ACTIONS="${PENDING_ACTIONS}\n${_seal_carry}\n"
+fi
+
+[[ -z "$PENDING_ACTIONS" ]] && PENDING_ACTIONS="_No pending actions._"
+
+# ── Run signal assessment ─────────────────────────────────────────
+ASSESS_LINE=""
+OUTCOMES_LINE=""
+_assess_bin="$(dirname "$(readlink -f "$0")")/brain-assess"
+if [[ -x "$_assess_bin" ]]; then
+  _assess_output=$("$_assess_bin" 2>/dev/null || echo "")
+  ASSESS_LINE=$(echo "$_assess_output" | head -1)
+  _outcomes_raw=$(echo "$_assess_output" | grep '^OUTCOMES:' || true)
+  if [[ -n "$_outcomes_raw" ]]; then
+    OUTCOMES_LINE="${_outcomes_raw#OUTCOMES:}"
+  fi
+fi
+
+# ── Run freshness check ───────────────────────────────────────────
+FRESHNESS_LINE=""
+_freshness_bin="$(dirname "$(readlink -f "$0")")/brain-freshness"
+if [[ -x "$_freshness_bin" ]]; then
+  FRESHNESS_LINE=$("$_freshness_bin" 2>/dev/null || echo "")
+  [[ "$FRESHNESS_LINE" == "ALL_CURRENT" ]] && FRESHNESS_LINE=""
+fi
+
+# ── Advisory: advisor context export freshness ───────────────────
+ADVISOR_EXPORT_WARN=""
+_advisor_ctx="$BRAIN/work/exports/advisor_context.md"
+if [[ -f "$_advisor_ctx" ]]; then
+  _adv_mtime=$(stat -c %Y "$_advisor_ctx" 2>/dev/null || echo 0)
+  _adv_age_days=$(( ($(date +%s) - _adv_mtime) / 86400 ))
+  if [[ "$_adv_age_days" -ge 7 ]]; then
+    _arch_newer=0
+    for _adir in "$BRAIN/brain/wiki/principles" "$BRAIN/brain/wiki/systems"; do
+      if [[ -d "$_adir" ]]; then
+        _arch_newer=$(( _arch_newer + $(find "$_adir" -type f -newer "$_advisor_ctx" 2>/dev/null | wc -l) ))
+      fi
+    done
+    if [[ "$_arch_newer" -gt 0 ]]; then
+      ADVISOR_EXPORT_WARN="Advisor context export is ${_adv_age_days}d old; ${_arch_newer} architecture files changed since. Run brain-export-context --single."
+    fi
+  fi
+else
+  ADVISOR_EXPORT_WARN="Advisor context export not found. Run brain-export-context --single to create it."
+fi
+
+# ── Last autonomous run summary (read-only) ──────────────────────
+AUTO_RUN_SUMMARY=""
+_auto_log="$BRAIN/work/logs/autonomous-run.log"
+if [[ -f "$_auto_log" ]]; then
+  AUTO_RUN_SUMMARY=$(python3 - "$BRAIN" <<'PYEOF'
+import re, sys, os
+brain = sys.argv[1]
+log_path = os.path.join(brain, "work/logs/autonomous-run.log")
+if not os.path.isfile(log_path):
+    sys.exit(0)
+with open(log_path) as f:
+    lines = f.readlines()
+if not lines:
+    sys.exit(0)
+start_ts = verdict = signal_eval = task_exec = ""
+for line in lines:
+    line = line.strip()
+    if "AUTONOMOUS_START" in line:
+        start_ts = line.split()[0] if line else ""
+    elif "VERDICT_OK" in line:
+        m = re.search(r"age=(\S+)", line)
+        verdict = f"OK ({m.group(1)})" if m else "OK"
+    elif "VERDICT_FAIL" in line:
+        m = re.search(r"status=(\S+)|stale=(\S+)", line)
+        verdict = f"FAIL ({m.group(0)})" if m else "FAIL"
+    elif "SIGNAL_EVAL" in line:
+        m = re.search(r"value=(\S+) level=(\S+)", line)
+        if m: signal_eval = f"deploy_age={m.group(1)} ({m.group(2)})"
+    elif "SIGNAL_SKIP" in line:
+        m = re.search(r"reason=(\S+)", line)
+        if m: signal_eval = f"skip ({m.group(1)})"
+    elif "SIGNAL_THRESHOLD_MATCH" in line:
+        m = re.search(r"level=(\S+) value=(\S+)", line)
+        if m: signal_eval = f"MATCH {m.group(1)} ({m.group(2)}h)"
+    elif "TASK_COMPLETED" in line:
+        m = re.search(r"task_id=(\S+)", line)
+        if m: task_exec = m.group(1)
+    elif "SCAN_NO_ELIGIBLE" in line or "SCAN_EMPTY" in line:
+        task_exec = "no-op"
+parts = []
+if start_ts: parts.append(start_ts[:10])
+if verdict: parts.append(verdict)
+if signal_eval: parts.append(f"signal: {signal_eval}")
+if task_exec: parts.append(f"exec: {task_exec}")
+if parts: print(" | ".join(parts))
+PYEOF
+  ) || true
+fi
+
+# ── Pending autonomous branches (read-only) ──────────────────────
+PENDING_AUTO_LINES=""
+_pending_auto_head=""
+_pending_auto_branch=""
+if git remote 2>/dev/null | grep -q origin; then
+  git fetch origin --prune 2>/dev/null || true
+  _auto_refs=$(git for-each-ref --sort=-committerdate --format='%(refname:short)|%(committerdate:short)|%(subject)' refs/remotes/origin/auto/ 2>/dev/null)
+  if [[ -n "$_auto_refs" ]]; then
+    # Extract head commit of newest auto branch for Codex verdict lookup
+    _newest_auto_ref=$(echo "$_auto_refs" | head -1 | cut -d'|' -f1)
+    _pending_auto_head=$(git rev-parse --short "$_newest_auto_ref" 2>/dev/null || true)
+    _pending_auto_branch="${_newest_auto_ref#origin/}"
+    PENDING_AUTO_LINES=$(echo "$_auto_refs" | while IFS='|' read -r ref date subject; do
+      branch="${ref#origin/}"
+      count=$(git rev-list --count "origin/main..${ref}" 2>/dev/null || echo "?")
+      echo "${branch} -- ${subject} (${count} commit(s), ${date})"
+    done)
+  fi
+fi
+
+# ── Codex verification verdict (read-only, context-aware) ────────
+# If a pending auto branch exists, show verdict for that branch's head.
+# If no verdict exists for it, show "pending for <branch>".
+# If no auto branch exists, show the newest verdict globally.
+CODEX_VERIFY_LINE=""
+_codex_dir="$BRAIN/brain/ops/codex-verdicts"
+if [[ -n "$_pending_auto_head" ]]; then
+  # Auto branch pending -- look for verdict matching its head commit
+  _branch_verdict="$_codex_dir/${_pending_auto_head}.json"
+  if [[ -f "$_branch_verdict" ]]; then
+    CODEX_VERIFY_LINE=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get('verdict', '?')
+    c = d.get('commit', '?')[:7]
+    f = len(d.get('findings', []))
+    t = d.get('verified_at', '')[:10]
+    print(f'{v} ({c}) | {f} finding(s) | {t}')
+except Exception:
+    pass
+" "$_branch_verdict" 2>/dev/null) || true
+  else
+    CODEX_VERIFY_LINE="not yet verified -- run: brain-review-dispatch ${_pending_auto_head} --type verification"
+  fi
+elif [[ -d "$_codex_dir" ]]; then
+  # No auto branch -- show newest verdict globally
+  _newest_verdict=$(ls -t "$_codex_dir"/*.json 2>/dev/null | head -1)
+  if [[ -n "$_newest_verdict" ]]; then
+    CODEX_VERIFY_LINE=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get('verdict', '?')
+    c = d.get('commit', '?')[:7]
+    f = len(d.get('findings', []))
+    t = d.get('verified_at', '')[:10]
+    print(f'{v} ({c}) | {f} finding(s) | {t}')
+except Exception:
+    pass
+" "$_newest_verdict" 2>/dev/null) || true
+  fi
+fi
+
+# ── Compute velocity summary from build-metrics ─────────────────
+VELOCITY_LINE=""
+_metrics_file="$BRAIN/work/logs/build-metrics.jsonl"
+if [[ -f "$_metrics_file" ]]; then
+  VELOCITY_LINE=$(python3 -c "
+import json, sys
+sessions = []
+tasks_total = 0
+cost_total = 0.0
+hours_total = 0.0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except:
+            continue
+        if d.get('type') == 'session_end':
+            sessions.append(d)
+            tasks_total += d.get('tasks_completed', 0)
+            cost_total += d.get('session_cost_usd', 0) or 0
+            hours_total += (d.get('duration_minutes', 0) or 0) / 60.0
+        elif d.get('type') == 'task_complete':
+            if not any(s.get('tasks_completed', 0) > 0 for s in sessions):
+                tasks_total += 1
+n = len(sessions)
+if n == 0 or hours_total < 0.1:
+    sys.exit(0)
+rate = tasks_total / hours_total if hours_total > 0 else 0
+cpt = cost_total / tasks_total if tasks_total > 0 else 0
+parts = [f'{tasks_total} tasks in {n} sessions']
+if rate >= 0.1:
+    parts.append(f'{rate:.1f}/hr')
+if cost_total > 0 and tasks_total > 0:
+    parts.append(f'\${cpt:.0f}/task')
+print(' | '.join(parts))
+" "$_metrics_file" 2>/dev/null || echo "")
+fi
+
+# ── Candidate arbitration removed (agent knows how to arbitrate) ──
+CANDIDATE_ARBITRATION=""
+
+# ── Read deferred actions ──────────────────────────────────────────
+DEFERRED_DIR="$BRAIN/work/ops/deferred-actions"
+DEFERRED_SECTION=""
+if [[ -d "$DEFERRED_DIR" ]]; then
+  _DEFERRED_LINES=""
+  for df in "$DEFERRED_DIR"/*.md; do
+    [[ -f "$df" ]] || continue
+    _df_status=$(grep -m1 '^status:' "$df" 2>/dev/null | sed 's/^status:\s*//;s/^"//;s/"$//' || true)
+    [[ "$_df_status" != "pending" ]] && continue
+    _df_title=$(grep -m1 '^# ' "$df" 2>/dev/null | sed 's/^# //' || true)
+    _df_window=$(grep -m1 '^recommended_window:' "$df" 2>/dev/null | sed 's/^recommended_window:\s*//;s/^"//;s/"$//' || true)
+    _df_exec=$(grep -m1 '^execution:' "$df" 2>/dev/null | sed 's/^execution:\s*//;s/^"//;s/"$//' || true)
+    _df_exec_label=""
+    [[ -n "$_df_exec" ]] && _df_exec_label=" [${_df_exec}]"
+    [[ -n "$_df_title" ]] && _DEFERRED_LINES="${_DEFERRED_LINES}- ${_df_title} _(window: ${_df_window})_${_df_exec_label}
+"
+  done
+  if [[ -n "$_DEFERRED_LINES" ]]; then
+    DEFERRED_SECTION="### Deferred Actions
+
+${_DEFERRED_LINES}"
+  fi
+fi
+
+# ── Read decision patterns ────────────────────────────────────────
+PATTERNS_DIR="$BRAIN/brain/ops/patterns"
+PATTERNS_SECTION=""
+if [[ -d "$PATTERNS_DIR" ]]; then
+  _PATTERN_NAMES=""
+  for pf in "$PATTERNS_DIR"/*.md; do
+    [[ -f "$pf" ]] || continue
+    _pn=$(grep -m1 '^name:' "$pf" 2>/dev/null | sed 's/^name:\s*//;s/^"//;s/"$//' || true)
+    [[ -z "$_pn" ]] && _pn=$(basename "$pf" .md | tr '-' ' ')
+    if [[ -n "$_PATTERN_NAMES" ]]; then
+      _PATTERN_NAMES="${_PATTERN_NAMES} | ${_pn}"
+    else
+      _PATTERN_NAMES="$_pn"
+    fi
+  done
+  if [[ -n "$_PATTERN_NAMES" ]]; then
+    PATTERNS_SECTION="## Decision Patterns
+
+${_PATTERN_NAMES}
+"
+  fi
+fi
+
+# ── Read compiled insights (last 10) ──────────────────────────────
+INSIGHTS_FILE="$BRAIN/brain/ops/compiled-insights.md"
+INSIGHTS_SECTION=""
+if [[ -f "$INSIGHTS_FILE" ]]; then
+  # Extract bullet lines (insights are "- " prefixed), take last 3
+  _RECENT_INSIGHTS=$(grep '^\- ' "$INSIGHTS_FILE" | tail -3)
+  if [[ -n "$_RECENT_INSIGHTS" ]]; then
+    _INSIGHT_COUNT=$(echo "$_RECENT_INSIGHTS" | wc -l | tr -d ' ')
+    INSIGHTS_SECTION="## Compiled Insights (last ${_INSIGHT_COUNT})
+
+${_RECENT_INSIGHTS}
+
+_Full list: brain/ops/compiled-insights.md_
+"
+  fi
+fi
+
+# ── Brain-native gate runner (fast, non-blocking) ─────────────────
+# Runs core gates, captures verdicts for resume output.
+# Non-blocking: WARN is informational, only FAIL is surfaced prominently.
+# Migrated from codex-lab/experiments on 2026-04-17.
+GATE_SUMMARY=""
+GATE_REPORT_PATHS=""
+_GATES="$BRAIN/scripts/bin"
+if [[ -d "$_GATES" ]]; then
+  _gate_contract=""
+  _gate_integrity=""
+  _gate_transport=""
+  _gate_transport_rc=""
+
+  # Gate 1: Brain/Body contract
+  if [[ -x "$_GATES/brain-gate-contract-check.sh" ]]; then
+    _g1_out=$(bash "$_GATES/brain-gate-contract-check.sh" 2>/dev/null) || true
+    _gate_contract=$(echo "$_g1_out" | grep -oP '(?<=brain-body-contract-check: )\w+' || echo "ERROR")
+    _g1_report=$(echo "$_g1_out" | grep -oP '(?<=Wrote: ).*' || true)
+    [[ -n "$_g1_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  contract: $_g1_report"
+  fi
+
+  # Gate 2: Repo integrity
+  if [[ -x "$_GATES/brain-gate-repo-integrity.sh" ]]; then
+    _g2_out=$(bash "$_GATES/brain-gate-repo-integrity.sh" 2>/dev/null) || true
+    _gate_integrity=$(echo "$_g2_out" | grep -oP '(?<=brain-repo-integrity-gate: )\w+' || echo "ERROR")
+    _g2_report=$(echo "$_g2_out" | grep -oP '(?<=Wrote: ).*' || true)
+    [[ -n "$_g2_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  integrity: $_g2_report"
+  fi
+
+  # Gate 3: VE transport
+  if [[ -x "$_GATES/brain-gate-ve-transport.sh" ]]; then
+    _g3_out=$(bash "$_GATES/brain-gate-ve-transport.sh" 2>/dev/null) || true
+    _gate_transport=$(echo "$_g3_out" | grep -oP '(?<=ve-transport-probe: ).*' || echo "ERROR")
+    _g3_report=$(echo "$_g3_out" | grep -oP '(?<=Wrote: ).*' || true)
+    [[ -n "$_g3_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  transport: $_g3_report"
+
+    # Gate 3b: If transport failed, run root-cause check
+    if [[ "$_gate_transport" == "FAIL" && -x "$_GATES/brain-gate-ve-transport-rootcause.sh" ]]; then
+      _g3b_out=$(bash "$_GATES/brain-gate-ve-transport-rootcause.sh" 2>/dev/null) || true
+      _gate_transport_rc=$(echo "$_g3b_out" | grep -oP '(?<=ve-transport-root-cause-check: )\w+' || echo "ERROR")
+      _g3b_report=$(echo "$_g3b_out" | grep -oP '(?<=Wrote: ).*' || true)
+      [[ -n "$_g3b_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  transport-rc: $_g3b_report"
+    fi
+  fi
+
+  # Build summary line
+  _gate_items=()
+  [[ -n "$_gate_contract" ]] && _gate_items+=("contract=$_gate_contract")
+  [[ -n "$_gate_integrity" ]] && _gate_items+=("integrity=$_gate_integrity")
+  [[ -n "$_gate_transport" ]] && _gate_items+=("transport=$_gate_transport")
+  [[ -n "$_gate_transport_rc" ]] && _gate_items+=("transport-rc=$_gate_transport_rc")
+
+  # Memory integrity gate (optional, non-blocking)
+  _gate_memory=""
+  MEM_GATE="$_GATES/brain-gate-memory-integrity.sh"
+  if [[ -x "$MEM_GATE" ]]; then
+    _mg_out=$("$MEM_GATE" 2>/dev/null || true)
+    _gate_memory=$(echo "$_mg_out" | grep -oP '(?<=memory-integrity-gate: )\w+' || echo "SKIP")
+    _mg_report=$(echo "$_mg_out" | head -1)
+    [[ -n "$_mg_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  memory: $_mg_report"
+  fi
+  [[ -n "$_gate_memory" && "$_gate_memory" != "SKIP" ]] && _gate_items+=("memory=$_gate_memory")
+
+  GATE_SUMMARY=$(IFS=', '; echo "${_gate_items[*]}")
+
+  # Check for any FAIL
+  _gate_has_fail=false
+  for _gv in "$_gate_contract" "$_gate_integrity" "$_gate_transport"; do
+    [[ "$_gv" == FAIL* ]] && _gate_has_fail=true
+  done
+fi
+
+# ── Core-memory queue check ───────────────────────────────────────
+CORE_MEM_LINE=""
+_CMEM_QUEUE="$BRAIN/brain/ops/core-memory/queue.jsonl"
+if [[ -f "$_CMEM_QUEUE" ]] && command -v brain-core-memory-status >/dev/null 2>&1; then
+  _cmem_count=$(brain-core-memory-status --count-only 2>/dev/null || echo "0")
+  if [[ "$_cmem_count" -gt 0 ]]; then
+    _cmem_top=$(brain-core-memory-status 2>/dev/null | grep '^\s*- \[' | head -3 | sed 's/^  //' || true)
+    CORE_MEM_LINE="$_cmem_count unresolved"
+  else
+    CORE_MEM_LINE="0 unresolved"
+  fi
+fi
+
+# ── Seat usage snapshot (agent-agnostic) ──────────────────────────
+# Reads seat-usage-snapshot.json (normalized v1 schema from brain-seat-usage-snapshot).
+# Labels output with actual agent name. Tiered staleness: <=30m fresh, 30m-2h stale, >2h unreliable.
+# Refresh first so we read the current active seat, not a stale prior agent's snapshot.
+"$TOOLS/bin/brain-seat-usage-snapshot" --quiet 2>/dev/null || true
+SEAT_USAGE_LINE=""
+SEAT_USAGE_AGENT=""
+_SEAT_USAGE="$BRAIN/work/logs/seat-usage-snapshot.json"
+if [[ -f "$_SEAT_USAGE" ]]; then
+  read -r SEAT_USAGE_AGENT SEAT_USAGE_LINE < <(python3 - "$_SEAT_USAGE" <<'PY'
+import json,sys,time
+from datetime import datetime, timezone
+path=sys.argv[1]
+try:
+    d=json.load(open(path))
+except Exception:
+    print("unknown ")
+    raise SystemExit
+agent=d.get("agent","unknown")
+def parse_iso(s):
+    if not s: return None
+    try: return datetime.fromisoformat(s.replace("Z","+00:00"))
+    except Exception: return None
+last_raw=d.get("last_activity_at") or d.get("captured_at") or ""
+last_dt=parse_iso(last_raw)
+age_min=None
+if last_dt is not None:
+    age_min=(datetime.now(timezone.utc)-last_dt).total_seconds()/60
+stale_marker=""
+if age_min is None:
+    stale_marker=" (no timestamp)"
+elif age_min > 120:
+    hrs=age_min/60
+    label=f"{hrs:.1f}h" if hrs < 48 else f"{hrs/24:.1f}d"
+    print(f"{agent} stale ({label} old)")
+    raise SystemExit
+elif age_min > 30:
+    stale_marker=f" (stale {int(age_min)}m)"
+def countdown(resets_at):
+    if not resets_at: return ""
+    try: remaining=int(resets_at)-int(time.time())
+    except Exception: return ""
+    if remaining<=0: return ""
+    days,remaining=divmod(remaining,86400)
+    hours,remaining=divmod(remaining,3600)
+    mins=remaining//60
+    if days>0: return f"({days}d{hours}h)"
+    if hours>0: return f"({hours}h{mins:02d}m)"
+    return f"({mins}m)"
+parts=[]
+rl=d.get("rate_limits") or {}
+short=(rl.get("short_window") or {})
+long_w=(rl.get("long_window") or {})
+# claude-code: seat-usage-snapshot returns null rate_limits (JSONL adapter can't read them).
+# Fall back to usage-snapshot.json (statusline path) which has authoritative 5h/7d windows.
+if agent == "claude-code" and short.get("used_percent") is None and long_w.get("used_percent") is None:
+    import os
+    _sl_path = os.path.join(os.path.dirname(path), "usage-snapshot.json")
+    try:
+        _sl = json.load(open(_sl_path))
+        _sl_rl = _sl.get("rate_limits") or {}
+        _fh = _sl_rl.get("five_hour") or {}
+        _7d = _sl_rl.get("seven_day") or {}
+        if _fh.get("used_percentage") is not None:
+            short = {"used_percent": _fh["used_percentage"], "window_label": "5h", "resets_at": _fh.get("resets_at")}
+        if _7d.get("used_percentage") is not None:
+            long_w = {"used_percent": _7d["used_percentage"], "window_label": "7d", "resets_at": _7d.get("resets_at")}
+    except Exception:
+        pass
+if short.get("used_percent") is not None:
+    lbl=short.get("window_label","short")
+    parts.append(f"{lbl} {short['used_percent']}% {countdown(short.get('resets_at'))}".rstrip())
+if long_w.get("used_percent") is not None:
+    lbl=long_w.get("window_label","long")
+    parts.append(f"{lbl} {long_w['used_percent']}% {countdown(long_w.get('resets_at'))}".rstrip())
+ctx=(d.get("context_window") or {}).get("used_percent")
+if ctx is not None: parts.append(f"ctx {ctx}%")
+tok=(d.get("tokens") or {}).get("total")
+if tok is not None:
+    if tok>=1000000: parts.append(f"{tok/1000000:.1f}M tok")
+    elif tok>=1000: parts.append(f"{tok/1000:.0f}k tok")
+    else: parts.append(f"{tok} tok")
+last=d.get("last_activity_at","")
+if last: parts.append(f"last {last[11:16]}Z")
+line=" | ".join(parts)
+if line and stale_marker: line=f"{line}{stale_marker}"
+print(f"{agent} {line}")
+PY
+) || true
+fi
+
+# ── Memory-wiki consistency check ─────────────────────────────────
+# Counts memory files with and without matching wiki pages.
+MEMORY_MAPPED=0
+MEMORY_UNMAPPED=0
+MEMORY_UNMAPPED_LIST=""
+_MEMORY_DIR="$BRAIN/brain/memory"
+_WIKI_PAGES="$BRAIN/brain/wiki/pages"
+_WIKI_SYSTEMS="$BRAIN/brain/wiki/systems"
+if [[ -d "$_MEMORY_DIR" ]]; then
+  for _mf in "$_MEMORY_DIR"/*.md; do
+    _mbase=$(basename "$_mf")
+    [[ "$_mbase" == "MEMORY.md" ]] && continue
+    if [[ -f "$_WIKI_PAGES/$_mbase" || -f "$_WIKI_SYSTEMS/$_mbase" ]]; then
+      MEMORY_MAPPED=$((MEMORY_MAPPED + 1))
+    else
+      MEMORY_UNMAPPED=$((MEMORY_UNMAPPED + 1))
+      MEMORY_UNMAPPED_LIST="${MEMORY_UNMAPPED_LIST}${_mbase}\n"
+    fi
+  done
+fi
+MEMORY_TOTAL=$((MEMORY_MAPPED + MEMORY_UNMAPPED))
+MEMORY_LINE="$MEMORY_MAPPED/$MEMORY_TOTAL mapped"
+[[ $MEMORY_UNMAPPED -gt 0 ]] && MEMORY_LINE="$MEMORY_LINE, $MEMORY_UNMAPPED unmapped"
+
+# ── Proof-of-execution status (read-only) ─────────────────────────
+PROOF_LINE=""
+_PROOF_LATEST="$BRAIN/brain/ops/proof-execution/index/latest.json"
+if [[ -f "$_PROOF_LATEST" ]]; then
+  PROOF_LINE=$(python3 -c "
+import json
+with open('$_PROOF_LATEST') as f:
+    d = json.load(f)
+v = d.get('verdict', d.get('status', 'unknown'))
+print(f\"{v} ({d.get('run_id','?')}) | task={d.get('task_id','?')} executor={d.get('executor','?')}\")
+" 2>/dev/null) || true
+fi
+
+# ── Proof presence check (strict, read-only) ─────────────────────
+# If any active AI-owned task has a proof run but no verified summary, warn.
+PROOF_MISSING_WARN=""
+_ACTIVE_DIR="$BRAIN/brain/ops/tasks/active"
+_PROOF_RUNS="$BRAIN/brain/ops/proof-execution/runs"
+if [[ -d "$_ACTIVE_DIR" ]]; then
+  for _af in "$_ACTIVE_DIR"/*.run.json; do
+    [[ -f "$_af" ]] || continue
+    _proof_rid=$(python3 -c "import json; d=json.load(open('$_af')); print(d.get('proof_run_id',''))" 2>/dev/null) || true
+    if [[ -n "$_proof_rid" ]]; then
+      _summary="$_PROOF_RUNS/${_proof_rid}.summary.json"
+      if [[ ! -f "$_summary" ]]; then
+        _task_id=$(python3 -c "import json; print(json.load(open('$_af')).get('task_id','?'))" 2>/dev/null)
+        PROOF_MISSING_WARN="Active task $_task_id has proof run $_proof_rid but NO verified summary. Run: brain-proof-verify --run $_proof_rid"
+      else
+        _verdict=$(python3 -c "import json; print(json.load(open('$_summary')).get('verdict',''))" 2>/dev/null) || true
+        if [[ "$_verdict" == "FAIL" ]]; then
+          _task_id=$(python3 -c "import json; print(json.load(open('$_af')).get('task_id','?'))" 2>/dev/null)
+          PROOF_MISSING_WARN="Active task $_task_id has FAILED proof run $_proof_rid. Fix and re-verify: brain-proof-verify --run $_proof_rid"
+        fi
+      fi
+    fi
+  done
+fi
+
+# ── Write session-resume.md (atomic: temp + rename) ──────────────
+RESUME_TMP=$(mktemp "$BRAIN/brain/index/.session-resume.md.XXXXXX")
+cat > "$RESUME_TMP" << RESUME_EOF
+---
+title: "Session Resume"
+type: "auto-generated"
+generated: "$NOW_ISO"
+---
+
+# Session Resume
+
+> Auto-generated by brain-resume on $NOW_DISPLAY
+
+$(if [[ $ACTIVE_TASK_COUNT -gt 0 || $BLOCKED_TASK_COUNT -gt 0 ]]; then
+echo "## Active Tasks (brain-task)"
+echo ""
+echo -e "$ACTIVE_TASKS"
+echo ""
+fi)
+$(if [[ $OPS_ACTIVE_COUNT -gt 0 ]]; then
+echo "## Active Tasks (task queue)"
+echo ""
+echo -e "$OPS_ACTIVE_LIST"
+echo ""
+fi)
+$(if [[ -n "$HANDOFF_CONTENT" ]]; then
+echo "## Last Session Handoff"
+echo ""
+echo "**File:** \`work/session-handoffs/$LATEST_HANDOFF\`"
+echo ""
+echo "$HANDOFF_CONTENT"
+echo ""
+fi)
+$(if [[ -n "$LATEST_CHECKPOINT" ]]; then
+echo "## Latest Checkpoint"
+echo ""
+echo "**\`$LATEST_CHECKPOINT\`** — ${CHECKPOINT_CHANGES} dirty, ${CHECKPOINT_AHEAD} ahead.$(if [[ -n "$CHECKPOINT_NOTE" ]]; then echo " Reason: $CHECKPOINT_NOTE"; fi)"
+echo ""
+fi)
+$(if [[ $CORRECTIONS_COUNT -gt 0 ]]; then
+echo "## Pending Corrections"
+echo ""
+echo "$CORRECTIONS"
+echo ""
+fi)
+$(if [[ $P1_COUNT -gt 0 || $P2_COUNT -gt 0 ]]; then
+echo "## Priority Queue"
+echo ""
+if [[ $P1_COUNT -gt 0 ]]; then
+echo "### P1 — BLOCKING"
+echo ""
+echo "$P1_ITEMS"
+echo ""
+fi
+if [[ $P2_COUNT -gt 0 ]]; then
+echo "### P2 — Important"
+echo ""
+echo "$P2_ITEMS"
+echo ""
+fi
+fi)
+$(if [[ $QUEUED_COUNT -gt 0 ]]; then
+echo "## Queued Messages (URGENT)"
+echo ""
+echo "$QUEUED_MESSAGES"
+echo ""
+echo "_Run \`brain-message clear\` after reading._"
+echo ""
+fi)
+$(if [[ $FIRED_COUNT -gt 0 || $PENDING_REMINDER_COUNT -gt 0 ]]; then
+echo "## Reminders"
+echo ""
+[[ -n "$FIRED_REMINDERS" ]] && echo -e "$FIRED_REMINDERS"
+[[ -n "$PENDING_REMINDERS" ]] && echo -e "$PENDING_REMINDERS"
+echo ""
+fi)
+$(if [[ -n "$RECENT_ACTIVITY" ]]; then
+echo "## Recent Business Activity"
+echo ""
+echo "| Date | Type | Notes |"
+echo "|------|------|-------|"
+echo "$RECENT_ACTIVITY"
+echo ""
+fi)
+$(if [[ -n "$SESSION_ARC" ]]; then
+echo "## Session Arc"
+echo ""
+echo "$SESSION_ARC"
+echo ""
+fi)
+## Last Session Activity
+
+$(echo "$COMMITS" | sed 's/^/- /')
+
+## Current Focus
+
+$FOCUS
+
+## System Health
+
+$HEALTH_SUMMARY
+$( [[ -n "$DOWN_SERVICES" ]] && echo -e "\n$DOWN_SERVICES" || echo "" )
+
+## Review & Health
+
+- **Triage:** $REVIEW_TRIAGE_AGE | **Weekly:** $REVIEW_WEEKLY_AGE$(if [[ -n "$REVIEW_NEXT_DUE" && "$REVIEW_NEXT_DUE" != "_not set_" ]]; then echo " (due $REVIEW_NEXT_DUE)"; fi)
+$(echo "$REFLECT_STATUS" | head -1)
+$(if [[ -n "$HEALING_SECTION" ]]; then echo "$HEALING_SECTION" | grep -E '^\d|signal' | head -1; fi)
+$HEALING_CANDIDATES
+$DEFERRED_SECTION
+$(if [[ -n "$INSIGHTS_SECTION" ]]; then echo "- **Insights:** ${_INSIGHT_COUNT:-0} compiled — see \`brain/ops/compiled-insights.md\`"; fi)
+## Inbox Status
+
+- **Inbox:** $INBOX_COUNT items | **Deletions:** $PENDING_COUNT | **Questions:** $OPEN_Q_COUNT | **Messages:** $QUEUED_COUNT
+$(if [[ $CORRECTIONS_COUNT -gt 0 ]]; then echo "- **Corrections:** $CORRECTIONS_COUNT from Arson"; fi)
+$(if [[ $FIRED_COUNT -gt 0 ]]; then echo "- **Reminders:** $FIRED_COUNT fired"; fi)
+$(if [[ -n "$SPOTCHECK_SCORE" ]]; then
+echo "- **Clip Spotcheck:** $SPOTCHECK_SCORE ($SPOTCHECK_FAILS failure(s)) — $SPOTCHECK_DATE"
+else
+echo "- **Clip Spotcheck:** _not yet run_"
+fi)
+$(if [[ -n "$LATEST_INGEST" ]]; then
+echo "- **Clip Ingest:** $INGEST_COUNT digest(s) — latest: \`$LATEST_INGEST\`"
+else
+echo "- **Clip Ingest:** _no digests yet_"
+fi)
+- **Deploy:** $DEPLOY_AGE_LABEL$(if [[ -n "$SIGNAL_SUMMARY" ]]; then echo " | **Traffic:** $SIGNAL_SUMMARY"; fi)
+- **Tasks:** $OPS_QUEUED_COUNT queued, $OPS_ACTIVE_COUNT active, $OPS_COMPLETED_COUNT completed
+$(if [[ -n "$NEXT_FOCUS_SECTION" ]]; then echo "$NEXT_FOCUS_SECTION"; fi)
+- **Verdict:** ${VERDICT_STATUS:-unknown}$(if [[ -n "$DRIFT_SCORE" ]]; then echo " | **Drift:** ${DRIFT_SCORE}%"; fi)$(if [[ -n "$FRESHNESS_LINE" ]]; then echo " | **Freshness:** $FRESHNESS_LINE"; fi)
+$(if [[ -n "$ASSESS_LINE" && "$ASSESS_LINE" != "ALL_NORMAL" ]]; then echo "- **Attention:** $ASSESS_LINE"; fi)
+$(if [[ -n "$ADVISOR_EXPORT_WARN" ]]; then echo "- **Attention:** $ADVISOR_EXPORT_WARN"; fi)
+$(if [[ -n "$OUTCOMES_LINE" ]]; then echo "- **Outcomes:** $OUTCOMES_LINE"; fi)
+$(if [[ -n "$CODEX_VERIFY_LINE" ]]; then echo "- **Codex:** $CODEX_VERIFY_LINE"; fi)
+
+$(if [[ "$VE_SYNC_STATUS" == "failed" ]]; then echo "- **VE sync:** FAILED"; fi)
+
+$(if [[ -n "$GATE_SUMMARY" || $MEMORY_TOTAL -gt 0 ]]; then
+echo "## Gate Summary"
+echo ""
+[[ -n "$GATE_SUMMARY" ]] && echo "- **Gates:** $GATE_SUMMARY"
+if [[ -n "$GATE_REPORT_PATHS" ]]; then
+echo -e "- **Reports:**$GATE_REPORT_PATHS"
+fi
+echo "- **Memory:** $MEMORY_LINE"
+[[ -n "$CORE_MEM_LINE" ]] && echo "- **Core-memory queue:** $CORE_MEM_LINE"
+[[ -n "$PROOF_LINE" ]] && echo "- **Proof:** $PROOF_LINE"
+[[ -n "$SEAT_USAGE_LINE" ]] && echo "- **${SEAT_USAGE_AGENT:-Agent} usage:** $SEAT_USAGE_LINE"
+if [[ -n "$PROOF_MISSING_WARN" ]]; then
+echo ""
+echo "> **PROOF WARNING:** $PROOF_MISSING_WARN"
+echo ""
+fi
+if [[ $MEMORY_UNMAPPED -gt 0 ]]; then
+echo -e "- **Unmapped:** $(echo -e "$MEMORY_UNMAPPED_LIST" | sed '/^$/d' | tr '\n' ', ' | sed 's/, $//')"
+fi
+if [[ -n "$CORE_MEM_LINE" && "$CORE_MEM_LINE" != "0 unresolved" ]]; then
+echo ""
+echo "> **CORE MEMORY:** $CORE_MEM_LINE. Meditate will block until resolved."
+if [[ -n "${_cmem_top:-}" ]]; then
+echo '```'
+echo "$_cmem_top"
+echo '```'
+fi
+fi
+if [[ "$_gate_has_fail" == true ]]; then
+echo ""
+echo "> **GATE FAIL detected.** Review report paths above before mutating brain state."
+fi
+echo ""
+fi)
+$(echo -e "$INC_SECTION")
+$(echo -e "$DIAG_SECTION")
+## Pending Actions
+
+$(echo -e "$PENDING_ACTIONS")
+
+$(if [[ -f "$BRAIN/brain/ops/tactical-focus.md" ]]; then
+  # Extract "This Week" section
+  _tf_items=$(sed -n '/^## This Week/,/^## /{/^## /d;/^$/d;p;}' "$BRAIN/brain/ops/tactical-focus.md" 2>/dev/null)
+  _tf_updated=$(grep "^last_updated:" "$BRAIN/brain/ops/tactical-focus.md" 2>/dev/null | sed 's/last_updated: *//;s/"//g')
+  if [[ -n "$_tf_items" ]]; then
+    echo "## Tactical Focus (set $_tf_updated)"
+    echo ""
+    echo "$_tf_items"
+    echo ""
+  fi
+fi)
+$(if [[ -f "$BRAIN/brain/ops/queue-execution-plan.md" ]]; then
+  _qep_updated=$(grep "^last_updated:" "$BRAIN/brain/ops/queue-execution-plan.md" 2>/dev/null | sed 's/last_updated: *//;s/"//g')
+  echo "## Queue Execution Plan"
+  echo ""
+  echo "> Operator-approved task ordering exists at \`brain/ops/queue-execution-plan.md\` (updated $_qep_updated). Read it before claiming tasks."
+  echo ""
+fi)
+## Suggested First Action
+
+> $SUGGESTED_ACTION
+RESUME_EOF
+
+mv "$RESUME_TMP" "$RESUME"
+
+# ── Post-process: strip zero-count lines from Inbox Status for token efficiency ──
+sed -i '/^- \*\*0\*\* /d' "$RESUME"
+
+# ── Generate derived/system-state.md (ADR-0004 Phase 0f cutover) ──
+# This is now the canonical system-state writer. The old manual sync path
+# has been retired. system-state.md is generated from source data on every
+# brain-resume run.
+_DERIVED_SSTATE="$BRAIN/brain/ops/derived/system-state.md"
+_DERIVED_TMP=$(mktemp "$BRAIN/brain/ops/derived/.system-state.md.XXXXXX")
+python3 - "$BRAIN" "$OPS_QUEUED_COUNT" "$OPS_ACTIVE_COUNT" "$OPS_COMPLETED_COUNT" \
+  "$VERDICT_STATUS" "$VERDICT_ISSUE_COUNT" "$HEALTH_SUMMARY" "$NOW_DISPLAY" "$_DERIVED_TMP" \
+  "$(echo -e "$DOWN_SERVICES")" "${DRIFT_SCORE:-}" "${DRIFT_VERDICT:-}" "${SPOTCHECK_SCORE:-}" <<'PYEOF'
+import json, os, sys, re
+from datetime import datetime, timezone
+
+brain = sys.argv[1]
+q, a, c = sys.argv[2], sys.argv[3], sys.argv[4]
+verdict_status = sys.argv[5] or "unknown"
+verdict_issues = sys.argv[6] or "0"
+health_summary = sys.argv[7] or "unknown"
+generated_at = sys.argv[8]
+tmp_path = sys.argv[9]
+down_services_raw = sys.argv[10] if len(sys.argv) > 10 else ""
+drift_score = sys.argv[11] if len(sys.argv) > 11 else ""
+drift_verdict = sys.argv[12] if len(sys.argv) > 12 else ""
+spotcheck_score = sys.argv[13] if len(sys.argv) > 13 else ""
+
+out = []
+
+# ── Header ──
+out.append("---")
+out.append(f'generated_at: "{datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}"')
+out.append('type: "derived"')
+out.append('generator: "brain-resume"')
+out.append("---")
+out.append("")
+out.append("# System State")
+out.append("")
+out.append("> **Generated** by brain-resume. Do not hand-edit — changes will be overwritten.")
+out.append(f"> Last generated: {generated_at}")
+out.append("")
+
+# ── Mission (from active-context.md) ──
+ac_path = os.path.join(brain, "brain/index/active-context.md")
+mission = ""
+focus_lines = []
+if os.path.exists(ac_path):
+    with open(ac_path) as f:
+        content = f.read()
+    m = re.search(r'## North Star\s*\n\s*\n(.+?)(?:\n\n|\n##)', content, re.DOTALL)
+    if m:
+        mission = m.group(1).strip()
+    m = re.search(r'## Current Focus Areas\s*\n((?:- .+\n?)+)', content)
+    if m:
+        focus_lines = [l.strip() for l in m.group(1).strip().split('\n') if l.strip().startswith('- ')]
+
+out.append("## Mission & Focus")
+out.append("")
+out.append(mission if mission else "_Could not read from active-context.md_")
+out.append("")
+out.append("_Current focus: see `brain/index/active-context.compact.md` or session-resume.md._")
+out.append("")
+
+# ── Operator notes ──
+notes_path = os.path.join(brain, "brain/ops/operator-notes.jsonl")
+service_notes = {}
+agent_notes = []
+issue_notes = []
+if os.path.exists(notes_path):
+    superseded = set()
+    entries = []
+    with open(notes_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    for e in entries:
+        sup = e.get("supersedes")
+        if sup:
+            superseded.add(sup)
+    now = datetime.now(timezone.utc)
+    for e in entries:
+        ts = e.get("ts", "")
+        if ts in superseded:
+            continue
+        ttl = e.get("ttl_hours")
+        if ttl is not None:
+            try:
+                note_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if (now - note_time).total_seconds() > ttl * 3600:
+                    continue
+            except:
+                pass
+        ntype = e.get("type", "")
+        if ntype == "service-note":
+            service_notes[e.get("subject", "")] = e.get("note", "")
+        elif ntype == "agent-status":
+            agent_notes.append(e)
+        elif ntype == "issue":
+            issue_notes.append(e)
+
+# ── Service Health (live status + operator notes) ──
+# Parse down services from brain-resume's DOWN_SERVICES variable
+down_subjects = set()
+if down_services_raw.strip():
+    for line in down_services_raw.strip().split('\n'):
+        m = re.search(r'\*\*(.+?)\*\*', line)
+        if m:
+            down_subjects.add(m.group(1).lower().strip())
+
+# Known service list with display names
+known_services = []
+
+out.append("## Current Status")
+out.append("")
+out.append("### Service Health")
+out.append("")
+out.append(f"Status classes: `online` | `degraded` | `down-unexpected` | `inactive-until-stream` | `inactive-on-demand` | `decommissioned`")
+out.append("")
+out.append("| Service | Status | Notes |")
+out.append("|---------|--------|-------|")
+
+status_classes = ["down-unexpected", "degraded", "inactive-until-stream", "inactive-on-demand", "decommissioned"]
+
+for display_name, note_key in known_services:
+    note = service_notes.get(note_key, "")
+    note_lower = note.lower()
+    # Operator-note explicit status: if the note starts with a recognized
+    # status class, that status is authoritative (overrides live probe).
+    explicit_status = ""
+    for sc in status_classes:
+        if note_lower.startswith(sc):
+            explicit_status = sc
+            break
+    # Determine status: explicit operator-note > keyword scan > live probe
+    name_lower = display_name.lower()
+    is_down = False
+    for d in down_subjects:
+        if name_lower in d or d in name_lower or note_key in d or d in note_key:
+            is_down = True
+            break
+    if explicit_status:
+        status = explicit_status
+    elif "inactive-until-stream" in note_lower:
+        status = "inactive-until-stream"
+    elif "inactive-on-demand" in note_lower:
+        status = "inactive-on-demand"
+    elif is_down:
+        status = "down-unexpected"
+    else:
+        status = "online"
+    out.append(f"| {display_name} | {status} | {note} |")
+out.append("")
+
+# ── Brain Health ──
+out.append("### Brain Health")
+out.append("")
+out.append("| Metric | Value | Notes |")
+out.append("|--------|-------|-------|")
+
+# Spotcheck
+if spotcheck_score:
+    out.append(f"| Spotcheck | {spotcheck_score} | Claude Haiku 4.5 |")
+
+# Drift
+if drift_score:
+    out.append(f"| Drift | {drift_score}% {drift_verdict} | Baseline: 3 runs |")
+
+# Export sizes
+exports_dir = os.path.join(brain, "work/exports")
+core_size = live_size = 0
+try:
+    core_path = os.path.join(exports_dir, "brain-knowledge-core.json")
+    live_path = os.path.join(exports_dir, "brain-knowledge-live.json")
+    if os.path.exists(core_path):
+        core_size = os.path.getsize(core_path)
+    if os.path.exists(live_path):
+        live_size = os.path.getsize(live_path)
+    if core_size or live_size:
+        # Count indexed files from search index
+        search_path = os.path.join(exports_dir, "brain-knowledge-search.json")
+        indexed = 0
+        if os.path.exists(search_path):
+            try:
+                sd = json.load(open(search_path))
+                indexed = len(sd.get("entries", sd.get("documents", [])))
+            except:
+                pass
+        core_kb = f"{core_size // 1024}KB" if core_size else "?"
+        live_kb = f"{live_size // 1024}KB" if live_size else "?"
+        notes = f"{indexed} files indexed" if indexed else ""
+        out.append(f"| Export | core {core_kb}, live {live_kb} | {notes} |")
+except:
+    pass
+
+# P1/P2
+pq_path = os.path.join(brain, "work/logs/priority-queue.md")
+p1 = p2 = 0
+if os.path.exists(pq_path):
+    with open(pq_path) as f:
+        pq = f.read()
+    b1 = re.search(r'## P1.*?(?=## |$)', pq, re.DOTALL)
+    b2 = re.search(r'## P2.*?(?=## |$)', pq, re.DOTALL)
+    if b1:
+        p1 = len([l for l in b1.group().split('\n') if l.strip().startswith('- ') and 'None' not in l])
+    if b2:
+        p2 = len([l for l in b2.group().split('\n') if l.strip().startswith('- ') and 'None' not in l])
+pq_label = f"{p1} P1, {p2} P2" if p1 + p2 > 0 else "none"
+out.append(f"| P1/P2 items | {pq_label} | Priority queue {'clear' if p1+p2==0 else 'has items'} |")
+out.append("")
+
+# ── Active Agents ──
+out.append("## Active Agents")
+out.append("")
+out.append("| Agent | Role | Status |")
+out.append("|-------|------|--------|")
+out.append("| Claude Code | Primary builder, system operator | Active — this session |")
+for an in agent_notes:
+    out.append(f"| {an.get('subject', '').title()} | {an.get('note', '')} | Available |")
+out.append("")
+
+# ── Task Queue ──
+out.append("## Task Queue")
+out.append("")
+out.append("| Location | Count | Notes |")
+out.append("|----------|-------|-------|")
+ql = f"{q} queued" if int(q) > 0 else "No tasks queued"
+al = f"{a} in progress" if int(a) > 0 else "No tasks in progress"
+cl = f"{c} completed" if int(c) > 0 else "No tasks completed"
+out.append(f"| `brain/ops/tasks/queue/` | {q} | {ql} |")
+out.append(f"| `brain/ops/tasks/active/` | {a} | {al} |")
+out.append(f"| `brain/ops/tasks/completed/` | {c} | {cl} |")
+out.append("")
+
+# ── Open Issues (from operator-notes) ──
+if issue_notes:
+    out.append("## Open Issues")
+    out.append("")
+    for iss in issue_notes:
+        out.append(f"- {iss.get('note', '')}")
+    out.append("")
+    out.append("See `work/open-questions.md` for the full list.")
+    out.append("")
+
+# ── Recently Changed (events.jsonl + task file summaries) ──
+events_path = os.path.join(brain, "brain/ops/events.jsonl")
+completions = []
+if os.path.exists(events_path):
+    with open(events_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                if ev.get("op") == "TASK_COMPLETE":
+                    completions.append(ev)
+            except json.JSONDecodeError:
+                pass
+
+# Build task_id → summary lookup from task markdown files
+task_summaries = {}
+for subdir in ("completed", "completed/archive/2026-03"):
+    task_dir = os.path.join(brain, "brain/ops/tasks", subdir)
+    if not os.path.isdir(task_dir):
+        continue
+    for fname in os.listdir(task_dir):
+        if not fname.startswith("TASK-") or not fname.endswith(".md"):
+            continue
+        tid = fname.replace(".md", "")
+        try:
+            with open(os.path.join(task_dir, fname)) as f:
+                tc = f.read()
+            m = re.search(r'^# (.+)$', tc, re.MULTILINE)
+            if m:
+                task_summaries[tid] = m.group(1).strip()
+        except:
+            pass
+
+if completions:
+    recent = completions[-5:]
+    out.append("## Recently Changed")
+    out.append("")
+    out.append("| Date | What |")
+    out.append("|------|------|")
+    for ev in reversed(recent):
+        ts = ev.get("ts", "")[:10]
+        eid = ev.get("entity_id", "")
+        summary = task_summaries.get(eid, eid)
+        out.append(f"| {ts} | {eid}: {summary} |")
+    out.append("")
+
+# ── Latest Session (from most recent devlog — title + shipped items) ──
+devlog_dir = os.path.join(brain, "work/logs/devlog")
+if os.path.isdir(devlog_dir):
+    devlogs = sorted([f for f in os.listdir(devlog_dir) if f.endswith(".md") and f != "README.md"])
+    if devlogs:
+        latest = devlogs[-1]
+        with open(os.path.join(devlog_dir, latest)) as f:
+            dl = f.read()
+        title_m = re.search(r'^title:\s*"?(.+?)"?\s*$', dl, re.MULTILINE)
+        title = title_m.group(1) if title_m else latest.replace('.md', '')
+        out.append(f"## Latest Session")
+        out.append("")
+        out.append(f"**{title}** ({latest[:10]})")
+        out.append("")
+        # Extract summary from the first content section (What shipped / Shipped / What changed)
+        shipped_m = re.search(r'## (?:What shipped|Shipped|What changed)\s*\n(.*?)(?:\n## |\Z)', dl, re.DOTALL)
+        if shipped_m:
+            shipped_lines = []
+            for line in shipped_m.group(1).strip().split('\n'):
+                # Capture ### headings and top-level bullets
+                if line.startswith('### '):
+                    shipped_lines.append(f"- {line[4:].strip()}")
+                elif line.startswith('- ') and not line.startswith('  '):
+                    shipped_lines.append(line)
+            if shipped_lines:
+                for sl in shipped_lines[:8]:
+                    out.append(sl)
+                out.append("")
+            else:
+                # No bullets or headings — grab first non-empty paragraph
+                first_para = shipped_m.group(1).strip().split('\n\n')[0].strip()
+                if first_para and not first_para.startswith('|'):
+                    out.append(first_para[:200])
+                    out.append("")
+
+# "Where This File Fits" table removed for token efficiency.
+# See CLAUDE.md Key Paths for file role reference.
+
+with open(tmp_path, "w") as f:
+    f.write("\n".join(out) + "\n")
+PYEOF
+
+if [[ -s "$_DERIVED_TMP" ]]; then
+  mv "$_DERIVED_TMP" "$_DERIVED_SSTATE"
+  echo "[brain-resume] Generated derived/system-state.md (parallel run)"
+  # Generate compact version for token-efficient session starts
+  _COMPACT_SSTATE="$BRAIN/brain/ops/derived/system-state.compact.md"
+  python3 - "$_DERIVED_SSTATE" "$_COMPACT_SSTATE" <<'PYCOMPACT'
+import sys, re, os, json
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    content = f.read()
+# Extract key metrics
+ts_match = re.search(r'generated_at: "(.+?)"', content)
+ts = ts_match.group(1) if ts_match else ""
+# Service health one-liner -- scope to Service Health section only
+svc_section = ""
+m = re.search(r'### Service Health\n(.*?)###', content, re.DOTALL)
+if m:
+    svc_section = m.group(1)
+online = len(re.findall(r'\| online \|', svc_section))
+# Count data rows only (skip header row "| Service |" and separator "|----|")
+svc_rows = [l for l in svc_section.split('\n') if re.match(r'^\| [A-Za-z]', l) and '| Status |' not in l and '| decommissioned |' not in l]
+total = len(svc_rows)
+down = [m.group(1) for m in re.finditer(r'\| (.+?) \| down-unexpected', svc_section)]
+# Brain health
+spot = re.search(r'Spotcheck \| (.+?) \|', content)
+drift = re.search(r'Drift \| (.+?) \|', content)
+export = re.search(r'Export \| (.+?) \|', content)
+p1p2 = re.search(r'P1/P2 items \| (.+?) \|', content)
+# Tasks
+q_match = re.findall(r'\| (\d+) \|', content[content.find("## Task Queue"):] if "## Task Queue" in content else "")
+lines = [
+    '---',
+    f'generated_at: "{ts}"',
+    'type: "derived-compact"',
+    'generator: "brain-resume"',
+    'full_file: "brain/ops/derived/system-state.md"',
+    '---', '',
+    '# System State (compact)', '',
+    f'> Compact snapshot. Full detail: `brain/ops/derived/system-state.md`', '',
+    '## Service Health', '',
+    f'{online}/{total} online.' + (f' Down: {", ".join(down)}.' if down else ' All services up.'), '',
+    '## Brain Health', '',
+]
+metrics = []
+if spot: metrics.append(f'Spotcheck: {spot.group(1).strip()}')
+if drift: metrics.append(f'Drift: {drift.group(1).strip()}')
+if export: metrics.append(f'Export: {export.group(1).strip()}')
+if p1p2: metrics.append(f'P1/P2: {p1p2.group(1).strip()}')
+lines.append(' | '.join(metrics))
+lines.extend(['', '## Tasks', ''])
+if len(q_match) >= 3:
+    lines.append(f'Queue: {q_match[0]} | Active: {q_match[1]} | Completed: {q_match[2]}')
+lines.append('')
+with open(dst, 'w') as f:
+    f.write('\n'.join(lines))
+PYCOMPACT
+else
+  rm -f "$_DERIVED_TMP"
+  echo "[brain-resume] WARNING: derived/system-state.md generation failed"
+fi
+
+echo "[brain-resume] Session resume written to $RESUME"
+
+# ── Auto-generate active-context.compact.md from full file ──────
+if ! $CLOSE_REFRESH; then
+_AC_FULL="$BRAIN/brain/index/active-context.md"
+_AC_COMPACT_OUT="$BRAIN/brain/index/active-context.compact.md"
+if [[ -f "$_AC_FULL" ]]; then
+  python3 - "$_AC_FULL" "$_AC_COMPACT_OUT" <<'PYAC'
+import re, os, sys
+from datetime import datetime, timezone
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    content = f.read()
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+# Extract sections
+def extract(pattern, text, dotall=False):
+    flags = re.DOTALL if dotall else 0
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else ""
+
+mission = extract(r'## North Star\s*\n\s*\n(.+?)(?:\n\n|\n##)', content, dotall=True)
+
+# Focus: condense each bullet to shorter form
+focus_raw = extract(r'## Current Focus Areas\s*\n((?:- .+\n?)+)', content)
+focus_lines = [l.strip() for l in focus_raw.split('\n') if l.strip().startswith('- ')]
+
+# Nodes table
+nodes = []
+in_table = False
+for line in content.split('\n'):
+    if line.startswith('| Node'):
+        in_table = True
+        continue
+    if in_table and line.startswith('|---'):
+        continue
+    if in_table and line.startswith('|'):
+        cols = [c.strip() for c in line.split('|')]
+        if len(cols) >= 3:
+            name, status = cols[1], cols[2]
+            if name:
+                nodes.append((name, status))
+    elif in_table and not line.startswith('|'):
+        break
+
+# Founder
+founder = extract(r'## Founder\s*\n((?:- .+\n?)+)', content)
+# Condense founder to one line
+founder_line = ""
+for line in founder.split('\n'):
+    if 'Name:' in line:
+        founder_line = re.sub(r'- \*\*Name:\*\* ', '', line.strip())
+        break
+
+# Build compact
+out = []
+out.append("---")
+out.append(f'title: "Active Context (compact)"')
+out.append('type: "index"')
+out.append('status: "active"')
+out.append(f'last_updated: "{now}"')
+out.append(f'full_file: "brain/index/active-context.md"')
+out.append('generated: true')
+out.append("---")
+out.append("")
+out.append("# Active Context (compact)")
+out.append("")
+out.append("> Auto-generated from `brain/index/active-context.md`. Full context there.")
+out.append("")
+out.append("## North Star")
+out.append("")
+out.append(mission if mission else "_Could not extract_")
+out.append("")
+out.append("## Current Focus")
+out.append("")
+for fl in focus_lines:
+    out.append(fl)
+out.append("")
+out.append(f"## Active Nodes ({len(nodes)})")
+out.append("")
+out.append("| Node | Status |")
+out.append("|------|--------|")
+for name, status in nodes:
+    out.append(f"| {name} | {status} |")
+out.append("")
+if founder_line:
+    out.append(f"## Founder")
+    out.append("")
+    out.append(founder_line)
+    out.append("")
+
+with open(dst, 'w') as f:
+    f.write('\n'.join(out))
+
+PYAC
+fi
+fi
+
+# ── Auto-generate digest-preamble.md (agent-agnostic rule index) ─────
+# Concatenates the 7 memory digests so every seat (Claude/Codex/Gemini)
+# absorbs the same one-liner rule view at bootstrap. Digest bodies
+# (full wiki rule pages) remain lazy via `brain-wiki show`.
+if ! $CLOSE_REFRESH; then
+_DIGEST_PREAMBLE="$BRAIN/brain/index/digest-preamble.md"
+_DIGEST_TMP=$(mktemp "$BRAIN/brain/index/.digest-preamble.md.XXXXXX")
+{
+  cat <<PREHDR
+---
+title: "Digest Preamble"
+type: "auto-generated"
+generated: "$NOW_ISO"
+source: "brain/wiki/pages/memory_digest_*.md"
+---
+
+# Digest Preamble
+
+> Agent-agnostic rule index. Auto-generated by brain-resume. Every seat reads this
+> at bootstrap so all agents share the same one-liner rule view. For rule bodies,
+> run \`brain-wiki show <page_name>\` (pointers shown as [[page_name]]).
+
+PREHDR
+  for _d in \
+    "memory_digest_core_rules" \
+    "memory_digest_session_lifecycle" \
+    "memory_digest_tools_capabilities" \
+    "memory_digest_infrastructure_safety" \
+    "memory_digest_content_publishing" \
+    "memory_digest_governance" \
+    "memory_digest_ve_multiseat"; do
+    _f="$BRAIN/brain/wiki/pages/${_d}.md"
+    if [[ -f "$_f" ]]; then
+      # Strip frontmatter (handles both `---` on own line and `...]---` inline trailer)
+      python3 -c "
+import re, sys
+t = open('$_f').read()
+# Skip leading frontmatter: drop everything from opening --- through the next ---
+m = re.match(r'---\n.*?---(\r?\n)?', t, re.DOTALL)
+sys.stdout.write(t[m.end():] if m else t)
+"
+      echo ""
+    fi
+  done
+} > "$_DIGEST_TMP"
+mv "$_DIGEST_TMP" "$_DIGEST_PREAMBLE"
+echo "[brain-resume] Digest preamble written to $_DIGEST_PREAMBLE"
+
+# ── Auto-generate session-start-contract.compact.md (Tier-0 startup contract) ──
+# Canonical compact startup contract shared by all seats.
+# Source of truth: brain/MANUAL.md + digest-preamble.md (generated above).
+_SESSION_CONTRACT="$BRAIN/brain/index/session-start-contract.compact.md"
+_SESSION_CONTRACT_TMP=$(mktemp "$BRAIN/brain/index/.session-start-contract.compact.md.XXXXXX")
+python3 - "$BRAIN/brain/MANUAL.md" "$_DIGEST_PREAMBLE" "$NOW_ISO" "$_SESSION_CONTRACT_TMP" <<'PYTIER0'
+import re
+import sys
+from pathlib import Path
+
+manual_path = Path(sys.argv[1])
+digest_path = Path(sys.argv[2])
+generated_at = sys.argv[3]
+out_path = Path(sys.argv[4])
+
+manual = manual_path.read_text()
+digest = digest_path.read_text()
+
+def section(text: str, heading: str, next_heading: str) -> str:
+    pat = re.compile(rf"{re.escape(heading)}\n(.*?)(?=\n{re.escape(next_heading)}\n)", re.DOTALL)
+    m = pat.search(text)
+    return m.group(1).strip() if m else ""
+
+def strip_blanks(lines):
+    return [ln.rstrip() for ln in lines if ln.strip()]
+
+verdict_block = section(manual, "### 2.2 Verdict gate", "### 2.3 Inbox and triage")
+auth_block = section(manual, "### 6.2 Session-start gate (all seats)", "### 6.3 Session-close pipeline")
+destructive_block = section(manual, "### 9.2 Destructive operations", "### 9.3 Publishing")
+permission_block = section(
+    manual,
+    "### 9.13 Permission modes and authority stops (applies_to: all)",
+    "### 9.16 Sub-agent dispatch — custom system over native (applies_to: all)",
+)
+
+auth_lines = []
+for ln in auth_block.splitlines():
+    if "Present a concise briefing to the operator. STOP." in ln:
+        auth_lines.append(ln.strip())
+    if "Do NOT Read task files, queue files, or any work artifacts before" in ln:
+        auth_lines.append(ln.strip())
+    if "presenting the briefing and receiving explicit human authorization." in ln:
+        auth_lines.append(ln.strip())
+    if "Seeing \"N tasks queued\" in the brief is NOT authorization to open them." in ln:
+        auth_lines.append(ln.strip())
+
+destructive_lines = []
+for ln in destructive_block.splitlines():
+    s = ln.rstrip()
+    if not s.strip():
+        if destructive_lines:
+            break
+        continue
+    destructive_lines.append(s)
+
+permission_lines = []
+capture = False
+captured_any = False
+for ln in permission_block.splitlines():
+    s = ln.rstrip()
+    if "remove or weaken any of the following:" in s:
+        capture = True
+        continue
+    if capture:
+        if not s.strip():
+            if captured_any:
+                break
+            continue
+        permission_lines.append(s)
+        if s.lstrip().startswith("- "):
+            captured_any = True
+permission_lines = strip_blanks(permission_lines)
+
+digest_samples = []
+for sec in (
+    "Memory Digest: Core Rules",
+    "Memory Digest: Session Lifecycle",
+    "Memory Digest: Tools & Capabilities",
+    "Memory Digest: Infrastructure Safety",
+    "Memory Digest: Content & Publishing",
+    "Memory Digest: Governance",
+    "Memory Digest: VE / Multi-Seat",
+):
+    m = re.search(rf"# {re.escape(sec)}\n(.*?)(?=\n# Memory Digest:|\Z)", digest, re.DOTALL)
+    if not m:
+        continue
+    body = m.group(1)
+    bullet = ""
+    for line in body.splitlines():
+        if line.startswith("- "):
+            bullet = line
+            break
+    if bullet:
+        digest_samples.append((sec.replace("Memory Digest: ", ""), bullet))
+
+lines = [
+    "---",
+    'title: "Session-Start Contract (Tier-0, compact)"',
+    'type: "auto-generated"',
+    f'generated: "{generated_at}"',
+    'source: "brain/MANUAL.md + brain/index/digest-preamble.md"',
+    'applies_to: "all"',
+    "---",
+    "",
+    "# Session-Start Contract (Tier-0)",
+    "",
+    "> Mandatory startup contract read for every seat before first authorized action.",
+    "> Long-form manuals and digests are on-demand lookup surfaces only.",
+    "",
+    "## Startup Sequence (All Seats)",
+    "",
+    "1. Bootstrap seat (`brain-codex-enter` / SessionStart hook / `brain-agent-bootstrap --agent gemini`).",
+    "2. Use bootstrap summary source (`session-brief.md` for Claude, stdout tail for Codex/Gemini).",
+    "3. Read this file (`brain/index/session-start-contract.compact.md`).",
+    "4. Check Prepared Focus in the summary.",
+    "5. Present briefing and STOP until explicit human authorization.",
+    "",
+    "## Authorization Stop (Verbatim)",
+    "",
+]
+lines.extend(auth_lines or [
+    "**Present a concise briefing to the operator. STOP.**",
+    "Do NOT Read task files, queue files, or any work artifacts before presenting the briefing and receiving explicit human authorization.",
+    'Seeing "N tasks queued" in the brief is NOT authorization to open them.',
+])
+lines.extend([
+    "",
+    "## Verdict Gate (Verbatim)",
+    "",
+])
+lines.extend(strip_blanks(verdict_block.splitlines()))
+lines.extend([
+    "",
+    "## Safety and Approval Boundaries (Verbatim excerpts)",
+    "",
+])
+lines.extend(destructive_lines)
+lines.append("")
+lines.extend(permission_lines)
+lines.extend([
+    "",
+    "## Seat Overlay (Minimal)",
+    "",
+    "- Claude Code: read `brain/index/session-brief.md` (SessionStart output file).",
+    "- Codex: use `brain-codex-enter` stdout tail as brief source.",
+    "- Gemini: use `brain-agent-bootstrap --agent gemini` stdout tail as brief source.",
+    "",
+    "## On-Demand Lookup (Not Mandatory at startup)",
+    "",
+    "- `brain/MANUAL.md` (full contract and lifecycle details).",
+    "- `brain/index/digest-preamble.md` (full one-line digest index).",
+    "- `brain/index/session-resume.md` (open only on anomaly or explicit operator request).",
+    "",
+    "## Digest Coverage Snapshot",
+    "",
+    f"- Sections detected: {len(digest_samples)}",
+])
+for name, bullet in digest_samples:
+    lines.append(f"- {name}: {bullet[2:]}")
+
+out_path.write_text("\n".join(lines) + "\n")
+PYTIER0
+mv "$_SESSION_CONTRACT_TMP" "$_SESSION_CONTRACT"
+echo "[brain-resume] Session-start contract written to $_SESSION_CONTRACT"
+fi
+
+# Write session brief to both stdout and session-brief.md (for hook injection into systemMessage)
+if ! $CLOSE_REFRESH; then
+_SESSION_BRIEF="$BRAIN/brain/index/session-brief.md"
+{
+echo ""
+echo "=== Session Resume ==="
+if [[ -n "$VERDICT_STATUS" ]]; then
+  if [[ "$VERDICT_STATUS" == "OK" ]]; then
+    echo "Brain Verdict: OK"
+  else
+    echo "Brain Verdict: $VERDICT_STATUS ($VERDICT_ISSUE_COUNT issue(s))"
+  fi
+fi
+[[ -n "$LATEST_HANDOFF" ]] && echo "HANDOFF: $LATEST_HANDOFF"
+[[ -n "$LATEST_CHECKPOINT" ]] && echo "CHECKPOINT: $LATEST_CHECKPOINT ($CHECKPOINT_CHANGES changed, $CHECKPOINT_AHEAD ahead)"
+[[ $CORRECTIONS_COUNT -gt 0 ]] && echo "CLIP CORRECTIONS: $CORRECTIONS_COUNT new correction(s) from Arson — review and update brain"
+[[ $P1_COUNT -gt 0 ]] && echo "P1 BLOCKING: $P1_COUNT item(s) — check priority-queue.md"
+[[ $P2_COUNT -gt 0 ]] && echo "P2 IMPORTANT: $P2_COUNT item(s) — check priority-queue.md"
+[[ $QUEUED_COUNT -gt 0 ]] && echo "URGENT: $QUEUED_COUNT queued message(s) — run brain-message list"
+[[ $FIRED_COUNT -gt 0 ]] && echo "REMINDER: $FIRED_COUNT reminder(s) have fired"
+echo "Last commits: $(echo "$COMMITS" | wc -l | tr -d ' ')"
+echo "System health: $HEALTH_SUMMARY"
+echo "Activity: $(echo "$RECENT_ACTIVITY" | wc -l | tr -d ' ') recent entries"
+echo "Review: triage=$REVIEW_TRIAGE_AGE, weekly=$REVIEW_WEEKLY_AGE"
+echo "Inbox: $INBOX_COUNT items | Pending deletions: $PENDING_COUNT | Suggestions: $SUGGESTION_COUNT | Open Qs: $OPEN_Q_COUNT"
+[[ -n "$SPOTCHECK_SCORE" ]] && echo "Spotcheck: $SPOTCHECK_SCORE | Ingest: $INGEST_COUNT digest(s)"
+[[ $ACTIVE_TASK_COUNT -gt 0 ]] && echo "Tasks: $ACTIVE_TASK_COUNT active, $BLOCKED_TASK_COUNT blocked"
+echo "Task Queue: $OPS_QUEUED_COUNT queued, $OPS_ACTIVE_COUNT active, $OPS_COMPLETED_COUNT completed"
+[[ -n "$LATEST_SNAPSHOT" ]] && echo "Snapshot: $LATEST_SNAPSHOT"
+[[ -n "$DRIFT_SCORE" ]] && echo "Clip drift: ${DRIFT_SCORE}% — $DRIFT_VERDICT"
+[[ -n "$LATEST_SEEDS" ]] && echo "Seeds: $SEEDS_COUNT digest(s)"
+[[ -n "$LATEST_CURATE" ]] && echo "Curate: $LATEST_CURATE ($CURATE_PROMOTIONS promotions, $CURATE_ARCHIVES archives)"
+[[ -n "$ASSESS_LINE" && "$ASSESS_LINE" != "ALL_NORMAL" ]] && echo "Attention: $ASSESS_LINE"
+[[ -n "$ADVISOR_EXPORT_WARN" ]] && echo "Attention: $ADVISOR_EXPORT_WARN"
+[[ -n "$OUTCOMES_LINE" ]] && echo "Outcomes: $OUTCOMES_LINE"
+[[ -n "$FRESHNESS_LINE" ]] && echo "Freshness: $FRESHNESS_LINE"
+[[ -n "$VELOCITY_LINE" ]] && echo "Velocity: $VELOCITY_LINE"
+[[ -n "$AUTO_RUN_SUMMARY" ]] && echo "Last autonomous: $AUTO_RUN_SUMMARY"
+[[ -n "$CODEX_VERIFY_LINE" ]] && echo "Codex verify: $CODEX_VERIFY_LINE"
+[[ -n "$SEAT_USAGE_LINE" ]] && echo "${SEAT_USAGE_AGENT:-Agent} usage: $SEAT_USAGE_LINE"
+[[ -n "$PENDING_AUTO_LINES" ]] && echo "Pending auto: $(echo "$PENDING_AUTO_LINES" | wc -l | tr -d ' ') branch(es)"
+[[ -n "$GATE_SUMMARY" ]] && echo "Gates: $GATE_SUMMARY"
+[[ $MEMORY_TOTAL -gt 0 ]] && echo "Memory: $MEMORY_LINE"
+[[ -n "$PROOF_LINE" ]] && echo "Proof: $PROOF_LINE"
+[[ -n "$PROOF_MISSING_WARN" ]] && echo "PROOF WARNING: $PROOF_MISSING_WARN"
+echo "Suggested action: $SUGGESTED_ACTION"
+} | tee "$_SESSION_BRIEF"
+echo "[brain-resume] Session brief written to $_SESSION_BRIEF"
+else
+echo "[brain-resume] Close-refresh mode: skipped startup derivatives (active-context.compact, digest-preamble, session-start-contract, session-brief)"
+fi

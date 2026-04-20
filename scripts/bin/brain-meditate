@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# brain-meditate — Canonical session-close for all seats: hard gates, memory pipeline, seal-state, and SESSION_END in order
+#
+# One close command for every seat (claude-code, codex, gemini, future).
+# Runs the session-close pipeline in order with fail-closed behavior on required
+# stages. Absorbs the prior brain-wrap-up pipeline plus Claude-specific extras,
+# gated on detected agent.
+#
+# Pipeline order:
+#   0b. task-schema-repair          (pre-state-check repair)
+#   1.  state-check                 (read-only sanity; FAIL on DRIFT/CONFLICT)
+#   1b. core-memory                 (HARD GATE: unresolved items)
+#   2.  memory-flush                (daily decisions/lessons bullets)
+#   3.  memory-compile              (insights artifact for next resume)
+#   4.  seed-audit                  (content/product seed check, non-blocking)
+#   5.  closeout-gate               (HARD GATE: devlog + usage + wiki mapping)
+#   6.  content-brief               (opt-in; --with-content-brief)
+#   6b. session-digest              (agent-aware session capture)
+#   6b.5 terminal-monitor cleanup
+#   6b.6 promptbox-archive             (archive executed terminal digests)
+#   6c. seal-state                  (DURABILITY: commit + push)
+#   6d. checkpoint                  (recovery point)
+#   6e. remote-handoff              (opt-in; --remote)
+#   6f. post-seal (Claude only)     (external repo commits, Clip deploy, VE yield)
+#   6g. memory-maintain (Claude)    (soft-fail)
+#   6h. next-focus (Claude)         (advisory; soft-fail)
+#   7.  session-end                 (LAST: logs SESSION_END boundary marker)
+#
+# Usage: brain-meditate [--agent <name>] [--remote] [--dry-run] [--no-push]
+#                       [--skip-memory] [--json] [--with-content-brief]
+#                       [--summary "..."] ["reason"]
+#
+# Agent detection precedence:
+#   1. --agent <name> explicit flag
+#   2. $BRAIN_AGENT env (set by brain-agent-bootstrap)
+#   3. Environment sniff: $CLAUDECODE → claude-code; $CODEX_SESSION_ID → codex;
+#      $GEMINI_CLI → gemini
+#   4. Default: claude-code
+#
+# Claude-specific stages (post-seal hook, memory-maintain, next-focus) run only
+# when agent resolves to claude-code. All other stages are agent-agnostic.
+
+set -uo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/bin"
+POST_SEAL="$BRAIN/scripts/hooks/post-seal"
+
+AGENT=""
+SUMMARY=""
+REASON=""
+WITH_CONTENT_BRIEF=false
+SKIP_MEMORY=false
+DRY_RUN=false
+NO_PUSH=false
+JSON_OUT=false
+REMOTE_HANDOFF=false
+
+usage() {
+  sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="${2:-}"; shift 2 ;;
+    --summary) SUMMARY="${2:-}"; shift 2 ;;
+    --with-content-brief) WITH_CONTENT_BRIEF=true; shift ;;
+    --skip-memory) SKIP_MEMORY=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --no-push) NO_PUSH=true; shift ;;
+    --json) JSON_OUT=true; shift ;;
+    --remote) REMOTE_HANDOFF=true; shift ;;
+    -h|--help) usage ;;
+    --*) echo "Unknown arg: $1" >&2; usage ;;
+    *) REASON="$1"; [[ -z "$SUMMARY" ]] && SUMMARY="$1"; shift ;;
+  esac
+done
+
+# ── Agent auto-detection ───────────────────────────────────────
+if [[ -z "$AGENT" ]]; then
+  if [[ -n "${BRAIN_AGENT:-}" ]]; then
+    AGENT="$BRAIN_AGENT"
+  elif [[ "${CLAUDECODE:-}" == "1" ]]; then
+    AGENT="claude-code"
+  elif [[ -n "${CODEX_SESSION_ID:-}" ]]; then
+    AGENT="codex"
+  elif [[ -n "${GEMINI_CLI:-}" || -n "${GEMINI_SESSION:-}" ]]; then
+    AGENT="gemini"
+  else
+    AGENT="claude-code"
+  fi
+fi
+
+IS_CLAUDE=false
+[[ "$AGENT" == "claude-code" ]] && IS_CLAUDE=true
+
+# Claude: suppress post-commit hook while we manage the commit ourselves
+$IS_CLAUDE && export BRAIN_MEDITATE_ACTIVE=1
+
+# ── Stage result tracking ──────────────────────────────────────
+STAGE_RESULTS=()
+record_stage() {
+  local name="$1" status="$2" detail="${3:-}"
+  STAGE_RESULTS+=("${name}|${status}|${detail}")
+  if ! $JSON_OUT; then
+    printf "  [%s] %-22s %s\n" "$status" "$name" "$detail"
+  fi
+}
+
+emit_json() {
+  python3 - "$AGENT" "$DRY_RUN" "${STAGE_RESULTS[@]}" <<'PYEOF'
+import json, sys
+agent = sys.argv[1]
+dry_run = sys.argv[2].lower() == "true"
+stages = []
+for line in sys.argv[3:]:
+    parts = line.split("|", 2)
+    if len(parts) == 3:
+        stages.append({"stage": parts[0], "status": parts[1], "detail": parts[2]})
+ok = not any(s["status"] == "FAIL" for s in stages)
+print(json.dumps({
+    "tool": "brain-meditate",
+    "agent": agent,
+    "dry_run": dry_run,
+    "ok": ok,
+    "stages": stages,
+}, indent=2))
+PYEOF
+}
+
+finish() {
+  local exit_code="$1"
+  if $JSON_OUT; then
+    emit_json
+  else
+    echo ""
+    if [[ "$exit_code" -eq 0 ]]; then
+      echo "=== brain-meditate: OK (agent=$AGENT) ==="
+    else
+      echo "=== brain-meditate: FAILED (exit $exit_code, agent=$AGENT) ==="
+    fi
+  fi
+  exit "$exit_code"
+}
+
+if ! $JSON_OUT; then
+  echo "=== brain-meditate ==="
+  echo "agent: $AGENT"
+  $DRY_RUN && echo "mode: DRY-RUN (no writes)"
+  $SKIP_MEMORY && echo "skip: memory stages"
+  $WITH_CONTENT_BRIEF && echo "opt-in: content-brief"
+  $REMOTE_HANDOFF && echo "handoff: remote-seat"
+  echo ""
+fi
+
+# ── 0b. task schema repair (pre-state-check) ───────────────────
+if [[ -x "$TOOLS/brain-task-schema-repair" ]]; then
+  repair_out="$("$TOOLS/brain-task-schema-repair" --quiet 2>&1 || true)"
+  if [[ -n "$repair_out" ]]; then
+    record_stage "task-schema-repair" "PASS" "$repair_out"
+  else
+    record_stage "task-schema-repair" "PASS" "no repairs needed"
+  fi
+else
+  record_stage "task-schema-repair" "SKIP" "tool not found"
+fi
+
+# ── 1. state-check (read-only) ─────────────────────────────────
+if [[ -x "$TOOLS/brain-state-check" ]]; then
+  sc_out="$("$TOOLS/brain-state-check" --quiet 2>&1 || true)"
+  verdict_json="$BRAIN/brain/ops/derived/state-verdict.json"
+  status="UNKNOWN"
+  if [[ -f "$verdict_json" ]]; then
+    status="$(python3 -c "import json; print(json.load(open('$verdict_json')).get('status','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")"
+  fi
+  case "$status" in
+    OK|STALE)
+      record_stage "state-check" "PASS" "verdict=$status" ;;
+    DRIFT|CONFLICT)
+      record_stage "state-check" "FAIL" "verdict=$status (pipeline aborted)"
+      finish 3 ;;
+    *)
+      record_stage "state-check" "WARN" "verdict=$status (continuing)" ;;
+  esac
+else
+  record_stage "state-check" "SKIP" "brain-state-check not found"
+fi
+
+# ── 1b. core-memory (HARD GATE) ─────────────────────────────
+# Hard gate: missing tool is itself a failure — SKIP would silently bypass the gate.
+if [[ ! -x "$TOOLS/brain-core-memory-status" ]]; then
+  record_stage "core-memory" "FAIL" "tool not found (hard gate cannot be skipped)"
+  finish 2
+else
+  cm_count=$("$TOOLS/brain-core-memory-status" --count-only 2>/dev/null || echo "0")
+  if [[ "$cm_count" -gt 0 ]]; then
+    record_stage "core-memory" "FAIL" "$cm_count unresolved item(s)"
+    echo "  BLOCKED: $cm_count unresolved core-memory item(s). Resolve before meditate." >&2
+    finish 2
+  else
+    record_stage "core-memory" "PASS" "queue clear"
+  fi
+fi
+
+# ── 2. memory-flush ────────────────────────────────────────────
+if $SKIP_MEMORY; then
+  record_stage "memory-flush" "SKIP" "--skip-memory"
+elif [[ ! -x "$TOOLS/brain-memory-flush" ]]; then
+  record_stage "memory-flush" "SKIP" "tool not found"
+else
+  args=()
+  $DRY_RUN && args+=(--dry-run)
+  flush_out="$("$TOOLS/brain-memory-flush" "${args[@]}" 2>&1)"
+  flush_rc=$?
+  if [[ $flush_rc -eq 0 ]]; then
+    summary="$(echo "$flush_out" | grep -E '^brain-memory-flush:|^New bullets:' | tail -1)"
+    [[ -z "$summary" ]] && summary="$(echo "$flush_out" | tail -1 | cut -c1-80)"
+    record_stage "memory-flush" "PASS" "$summary"
+  else
+    record_stage "memory-flush" "WARN" "exit=$flush_rc (continuing)"
+  fi
+fi
+
+# ── 3. memory-compile ──────────────────────────────────────────
+if $SKIP_MEMORY; then
+  record_stage "memory-compile" "SKIP" "--skip-memory"
+elif [[ ! -x "$TOOLS/brain-memory-compile" ]]; then
+  record_stage "memory-compile" "SKIP" "tool not found"
+else
+  args=()
+  $DRY_RUN && args+=(--dry-run)
+  comp_out="$("$TOOLS/brain-memory-compile" "${args[@]}" 2>&1)"
+  comp_rc=$?
+  if [[ $comp_rc -eq 0 ]]; then
+    summary="$(echo "$comp_out" | grep -E '^brain-memory-compile:|^New insights:|^No uncompiled' | tail -1)"
+    [[ -z "$summary" ]] && summary="$(echo "$comp_out" | tail -1 | cut -c1-80)"
+    record_stage "memory-compile" "PASS" "$summary"
+  else
+    record_stage "memory-compile" "WARN" "exit=$comp_rc (continuing)"
+  fi
+fi
+
+# ── 4. seed-audit (non-blocking check) ─────────────────────────
+if [[ ! -x "$TOOLS/brain-seed-audit" ]]; then
+  record_stage "seed-audit" "SKIP" "tool not found"
+else
+  sa_out="$("$TOOLS/brain-seed-audit" 2>/dev/null || true)"
+  if [[ -n "$sa_out" ]]; then
+    sa_msg="$(echo "$sa_out" | python3 -c "import json, sys; d = json.loads(sys.stdin.read()); print(d.get('systemMessage', ''))" 2>/dev/null)"
+    if [[ -n "$sa_msg" ]]; then
+      record_stage "seed-audit" "PASS" "$sa_msg"
+    else
+      record_stage "seed-audit" "PASS" "no gaps"
+    fi
+  else
+    record_stage "seed-audit" "PASS" "no gaps"
+  fi
+fi
+
+# ── 4.5. devlog-ensure (non-blocking; runs before closeout-gate) ──
+# Creates a minimal devlog stub if none exists for today. Ensures operational
+# logging is always written as part of session close, independent of content-brief.
+_DEVLOG_DATE=$(date +%Y-%m-%d)
+_DEVLOG_DIR="$BRAIN/work/logs/devlog"
+_DEVLOG_EXISTING=$(ls "$_DEVLOG_DIR/${_DEVLOG_DATE}"*.md 2>/dev/null | head -1 || true)
+if [[ -n "$_DEVLOG_EXISTING" ]]; then
+  record_stage "devlog-ensure" "PASS" "exists: $(basename "$_DEVLOG_EXISTING")"
+else
+  _DEVLOG_STUB="$_DEVLOG_DIR/${_DEVLOG_DATE}-session-notes.md"
+  mkdir -p "$_DEVLOG_DIR"
+  _DEVLOG_SUMMARY="${SUMMARY:-session close}"
+  _DEVLOG_TASKS=""
+  if [[ -f "$BRAIN/brain/ops/events.log" ]]; then
+    _DEVLOG_TASKS=$(grep "^${_DEVLOG_DATE}" "$BRAIN/brain/ops/events.log" 2>/dev/null | grep "TASK_COMPLETE" | awk '{print $3}' | sort -u | sed 's/^/- /' || true)
+  fi
+  {
+    echo "---"
+    echo "title: \"Session Notes ${_DEVLOG_DATE}\""
+    echo "date: \"${_DEVLOG_DATE}\""
+    echo "type: \"devlog\""
+    echo "tags: [session-notes]"
+    echo "privacy: internal"
+    echo "---"
+    echo ""
+    echo "# Session Notes ${_DEVLOG_DATE}"
+    echo ""
+    echo "## Summary"
+    echo ""
+    echo "${_DEVLOG_SUMMARY}"
+    echo ""
+    if [[ -n "$_DEVLOG_TASKS" ]]; then
+      echo "## Completed Tasks"
+      echo ""
+      echo "$_DEVLOG_TASKS"
+      echo ""
+    fi
+  } > "$_DEVLOG_STUB" 2>/dev/null \
+    && record_stage "devlog-ensure" "PASS" "created: $(basename "$_DEVLOG_STUB")" \
+    || record_stage "devlog-ensure" "WARN" "stub creation failed (closeout-gate will catch)"
+fi
+
+# ── 5. closeout-gate (HARD GATE) ──────────────────────────────
+# Hard gate: missing tool is itself a failure — SKIP would silently bypass the gate.
+if [[ ! -x "$TOOLS/brain-closeout-gate" ]]; then
+  record_stage "closeout-gate" "FAIL" "tool not found (hard gate cannot be skipped)"
+  finish 2
+else
+  cg_out="$("$TOOLS/brain-closeout-gate" 2>&1)"
+  cg_rc=$?
+  if [[ $cg_rc -eq 0 ]]; then
+    adv_count="$(echo "$cg_out" | grep -c "^  -" || echo "0")"
+    record_stage "closeout-gate" "PASS" "ok with $adv_count advisory warning(s)"
+  else
+    record_stage "closeout-gate" "FAIL" "blocked by core rules"
+    echo "$cg_out" >&2
+    finish 2
+  fi
+fi
+
+# ── 6. content-brief (opt-in only) ─────────────────────────────
+if ! $WITH_CONTENT_BRIEF; then
+  record_stage "content-brief" "SKIP" "not requested (--with-content-brief)"
+elif [[ ! -x "$TOOLS/brain-content-brief" ]]; then
+  record_stage "content-brief" "SKIP" "tool not found"
+else
+  args=()
+  $DRY_RUN && args+=(--dry-run)
+  cb_out="$("$TOOLS/brain-content-brief" "${args[@]}" 2>&1)"
+  cb_rc=$?
+  if [[ $cb_rc -eq 0 ]]; then
+    last_line="$(echo "$cb_out" | tail -1 | cut -c1-80)"
+    record_stage "content-brief" "PASS" "$last_line"
+  else
+    record_stage "content-brief" "WARN" "exit=$cb_rc (continuing)"
+  fi
+fi
+
+# ── 6b. session-digest (agent-aware capture) ───────────────────
+if [[ -x "$TOOLS/brain-session-digest" ]]; then
+  if $DRY_RUN; then
+    record_stage "session-digest" "SKIP" "dry-run"
+  else
+    digest_rc=0
+    case "$AGENT" in
+      codex)
+        # Prefer native Codex rollout (~/.codex/sessions/**/rollout-*.jsonl) — canonical.
+        # Fall back to legacy codex-lab/runs/CODEX-* sidecar dirs only if no native rollout exists.
+        _LATEST_ROLLOUT=$(find "$HOME/.codex/sessions" -type f -name "rollout-*.jsonl" 2>/dev/null | xargs ls -t 2>/dev/null | head -1 || true)
+        if [[ -n "$_LATEST_ROLLOUT" ]]; then
+          "$TOOLS/brain-session-digest" --codex-rollout "$_LATEST_ROLLOUT" >/dev/null 2>&1 || digest_rc=$?
+          [[ $digest_rc -eq 0 ]] && record_stage "session-digest" "PASS" "codex rollout=$(basename "$_LATEST_ROLLOUT" .jsonl)" || record_stage "session-digest" "WARN" "codex rollout digest exit=$digest_rc"
+        else
+          _LATEST_RUN=$(ls -td "$HOME"/codex-lab/runs/CODEX-* 2>/dev/null | head -1 || true)
+          if [[ -n "$_LATEST_RUN" ]]; then
+            _RUN_ID=$(basename "$_LATEST_RUN")
+            "$TOOLS/brain-session-digest" --codex-run "$_RUN_ID" >/dev/null 2>&1 || digest_rc=$?
+            [[ $digest_rc -eq 0 ]] && record_stage "session-digest" "PASS" "codex run=$_RUN_ID (legacy sidecar)" || record_stage "session-digest" "WARN" "codex digest exit=$digest_rc"
+          else
+            record_stage "session-digest" "SKIP" "no codex rollouts or runs found"
+          fi
+        fi
+        ;;
+      gemini|gemini-cli)
+        # Glob across all Gemini project dirs (gmgn-brain, gemini-lab, etc.)
+        _LATEST_SESSION=$(ls -t "$HOME"/.gemini/tmp/*/chats/session-*.json 2>/dev/null | head -1 || true)
+        if [[ -n "$_LATEST_SESSION" ]]; then
+          "$TOOLS/brain-session-digest" --gemini-session "$_LATEST_SESSION" >/dev/null 2>&1 || digest_rc=$?
+          [[ $digest_rc -eq 0 ]] && record_stage "session-digest" "PASS" "gemini session=$(basename "$_LATEST_SESSION")" || record_stage "session-digest" "WARN" "gemini digest exit=$digest_rc"
+        else
+          record_stage "session-digest" "SKIP" "no gemini sessions found"
+        fi
+        ;;
+      *)
+        "$TOOLS/brain-session-digest" >/dev/null 2>&1 || digest_rc=$?
+        [[ $digest_rc -eq 0 ]] && record_stage "session-digest" "PASS" "claude latest session" || record_stage "session-digest" "WARN" "exit=$digest_rc"
+        ;;
+    esac
+  fi
+else
+  record_stage "session-digest" "SKIP" "tool not found"
+fi
+
+# ── 6b.4 prune old system reports (keep 7 days) ─────────────
+if [[ -d "$REPO/work/reports/system" ]]; then
+  find "$REPO/work/reports/system" -name "*.md" -mtime +7 -delete 2>/dev/null || true
+fi
+
+# ── 6b.5 terminal monitor cleanup ────────────────────────────
+if [[ -x "$TOOLS/brain-terminal-watch-stop" ]]; then
+  _term_out="$("$TOOLS/brain-terminal-watch-stop" --no-api 2>&1 || true)"
+  record_stage "terminal-monitor" "PASS" "$_term_out"
+else
+  _TERM_PID=$(cat /tmp/brain-terminal-watcher.pid 2>/dev/null || echo "")
+  [[ -n "$_TERM_PID" ]] && kill "$_TERM_PID" 2>/dev/null || true
+  rm -f /tmp/brain-terminal-watcher.pid /tmp/brain-terminal-watch.stop 2>/dev/null || true
+  record_stage "terminal-monitor" "PASS" "watcher stopped (fallback)"
+fi
+
+# ── 6b.6 archive terminal prompt digests ─────────────────────
+if [[ -x "$TOOLS/brain-promptbox-archive" ]]; then
+  if $DRY_RUN; then
+    record_stage "promptbox-archive" "SKIP" "dry-run"
+  else
+    _arch_out="$("$TOOLS/brain-promptbox-archive" 2>&1 || true)"
+    record_stage "promptbox-archive" "PASS" "$_arch_out"
+  fi
+else
+  record_stage "promptbox-archive" "SKIP" "tool not found"
+fi
+
+# ── 6c. seal-state (DURABILITY) ─────────────────────────────
+if $DRY_RUN; then
+  record_stage "seal-state" "SKIP" "dry-run"
+else
+  if [[ -x "$TOOLS/brain-resume" ]]; then
+    if "$TOOLS/brain-resume" --close-refresh >/dev/null 2>&1; then
+      record_stage "close-refresh" "PASS" "session-resume + derived/system-state refreshed"
+    else
+      record_stage "close-refresh" "WARN" "targeted refresh failed (continuing with existing state)"
+    fi
+  else
+    record_stage "close-refresh" "SKIP" "brain-resume not found"
+  fi
+
+  cd "$BRAIN"
+  DIRTY_BEFORE=$(git status --porcelain 2>/dev/null | wc -l | tr -d " ")
+  [[ "$DIRTY_BEFORE" -gt 0 ]] && git add -A 2>/dev/null || true
+  DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d " ")
+  if [[ "$DIRTY" -gt 0 ]]; then
+    git add -A 2>/dev/null
+    AUTO_REASON="brain-meditate: $AGENT session close"
+    [[ -n "$SUMMARY" ]] && AUTO_REASON="brain-meditate: $SUMMARY"
+    _commit_rc=0
+    git commit -m "$AUTO_REASON" >/dev/null 2>&1 || _commit_rc=$?
+    if [[ $_commit_rc -eq 0 ]]; then
+      record_stage "seal-state" "PASS" "committed changes"
+      if $NO_PUSH; then
+        record_stage "push" "SKIP" "--no-push"
+      else
+        BEHIND=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+        if [[ "$BEHIND" -gt 0 ]]; then
+          record_stage "push" "FAIL" "behind remote by $BEHIND commit(s) — pull required"
+          finish 4
+        fi
+        if git push >/dev/null 2>&1; then
+          record_stage "push" "PASS" "gmgn-brain pushed"
+        else
+          record_stage "push" "WARN" "push failed (likely auth/network)"
+        fi
+      fi
+    else
+      # $DIRTY > 0 was confirmed above — a non-zero exit here is a real commit failure.
+      record_stage "seal-state" "WARN" "git commit failed (exit=$_commit_rc, $DIRTY file(s) staged)"
+    fi
+  else
+    record_stage "seal-state" "PASS" "repo clean"
+  fi
+  if [[ -x "$TOOLS/brain-checkpoint" ]]; then
+    "$TOOLS/brain-checkpoint" "$AGENT meditate" >/dev/null 2>&1 && record_stage "checkpoint" "PASS" "created" || record_stage "checkpoint" "WARN" "failed"
+  fi
+fi
+
+# ── 6e. Remote handoff (only with --remote flag) ──────────────────────
+if $REMOTE_HANDOFF; then
+  if $DRY_RUN; then
+    record_stage "remote-handoff" "SKIP" "dry-run"
+  else
+    touch "$BRAIN/brain/ops/.session-remote-handoff"
+    _VE_HOOK="$BRAIN/scripts/hooks/remote-handoff"
+    if [[ -x "$_VE_HOOK" ]]; then
+      record_stage "remote-handoff" "PASS" "hook triggered"
+      "$_VE_HOOK" 2>&1 | sed 's/^/  /' || record_stage "remote-handoff" "WARN" "hook failed"
+    else
+      record_stage "remote-handoff" "SKIP" "hook not found"
+    fi
+  fi
+fi
+
+# ── 6f/g/h. Claude-specific extras (only when IS_CLAUDE) ───────
+if $IS_CLAUDE && ! $DRY_RUN; then
+  if [[ -x "$POST_SEAL" ]]; then
+    "$POST_SEAL" "${REASON:-brain-meditate}" "$NO_PUSH" "$DRY_RUN" >/dev/null 2>&1 \
+      && record_stage "post-seal" "PASS" "external effects applied" \
+      || record_stage "post-seal" "WARN" "post-seal hook failed (soft)"
+  fi
+  "$TOOLS/brain-memory-maintain" >/dev/null 2>&1 \
+    && record_stage "memory-maintain" "PASS" "wiki mirrors verified" \
+    || record_stage "memory-maintain" "WARN" "maintain soft-failed"
+  "$TOOLS/brain-next-focus" >/dev/null 2>&1 \
+    && record_stage "next-focus" "PASS" "focus advisory generated" \
+    || record_stage "next-focus" "WARN" "next-focus soft-failed"
+fi
+
+# ── 7. session-end (LAST: boundary marker) ─────────────────────
+if $DRY_RUN; then
+  record_stage "session-end" "SKIP" "dry-run"
+  finish 0
+fi
+
+if [[ ! -x "$TOOLS/brain-session-end" ]]; then
+  record_stage "session-end" "FAIL" "tool not found (required)"
+  finish 4
+fi
+
+se_args=(--agent "$AGENT")
+[[ -n "$SUMMARY" ]] && se_args+=(--summary "$SUMMARY")
+se_out="$("$TOOLS/brain-session-end" "${se_args[@]}" 2>&1)"
+se_rc=$?
+if [[ $se_rc -eq 0 ]]; then
+  sess_id="$(echo "$se_out" | grep '^session-end:' | head -1 | awk '{print $2}')"
+  record_stage "session-end" "PASS" "sess=${sess_id:-logged}"
+else
+  record_stage "session-end" "FAIL" "exit=$se_rc"
+  finish 4
+fi
+
+finish 0

@@ -1,0 +1,75 @@
+{
+  "hooksConfig": {
+    "enabled": true
+  },
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "command": "~/brain/scripts/bin/brain-sessionstart-handoff-gate pretool --format gemini",
+            "type": "command",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "_brain_managed": true,
+        "_brain_hook": "agent-agnostic-gate",
+        "matcher": "edit_file|write_file|replace_file|replace",
+        "hooks": [
+          {
+            "command": "~/brain/scripts/hooks/adapters/gemini-pretooluse.sh agent-agnostic-gate",
+            "type": "command",
+            "timeout": 10000
+          }
+        ]
+      },
+      {
+        "_brain_managed": true,
+        "_brain_hook": "reddit-fetch-guard",
+        "matcher": "web_fetch|WebFetch",
+        "hooks": [
+          {
+            "command": "~/brain/scripts/hooks/adapters/gemini-pretooluse.sh reddit-fetch-guard",
+            "type": "command",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [],
+    "BeforeAgent": [],
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "command": "~/brain/scripts/hooks/brain-session-end-commit",
+            "type": "command",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "Notification": [],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "command": "~/brain/scripts/hooks/agent-autonomous-hook SessionStart gemini",
+            "type": "command",
+            "timeout": 45000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [],
+    "PreCompress": [],
+    "BeforeModel": [],
+    "AfterModel": [],
+    "BeforeToolSelection": []
+  }
+}

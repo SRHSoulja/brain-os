@@ -1,0 +1,130 @@
+#!/bin/bash
+# brain-status — Concise CLI status summary of all brain systems
+# Usage: brain-status
+
+set -uo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+
+# ── Snapshot ─────────────────────────────────────────────────────
+SNAPSHOT=$(cd "$BRAIN" && git tag -l 'brain-snapshot-*' --sort=-creatordate 2>/dev/null | head -1)
+
+# ── Tasks ────────────────────────────────────────────────────────
+ACTIVE=0; BLOCKED=0
+for tf in "$BRAIN"/work/tasks/task-*.md; do
+  [[ -f "$tf" ]] || continue
+  s=$(grep '^status:' "$tf" | head -1 | sed 's/status: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  [[ "$s" == "active" ]] && ACTIVE=$((ACTIVE + 1))
+  [[ "$s" == "blocked" ]] && BLOCKED=$((BLOCKED + 1))
+done
+
+# ── Seeds ────────────────────────────────────────────────────────
+SEEDS=$(ls "$BRAIN"/work/inbox/content-seeds/*-discord-seeds.md 2>/dev/null | wc -l | tr -d ' ')
+
+# ── Spotcheck ────────────────────────────────────────────────────
+SC_SCORE="—"
+latest_sc=$(ls -t "$BRAIN"/work/logs/clip-health/*-spotcheck.md 2>/dev/null | head -1)
+if [[ -n "$latest_sc" ]]; then
+  sc_match=$(grep '^\*\*Score:' "$latest_sc" | head -1)
+  [[ -n "$sc_match" ]] && SC_SCORE="$sc_match"
+fi
+
+# ── Drift ────────────────────────────────────────────────────────
+DRIFT="—"
+DRIFT_FILE="$BRAIN/work/logs/clip-health/personality-drift.md"
+if [[ -f "$DRIFT_FILE" ]]; then
+  d_score=$(grep '^drift_score:' "$DRIFT_FILE" | head -1 | sed 's/drift_score: *//')
+  d_verdict=$(grep '^verdict:' "$DRIFT_FILE" | head -1 | sed 's/verdict: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  [[ -n "$d_score" ]] && DRIFT="${d_score}% — $d_verdict"
+fi
+
+# ── Export sizes ─────────────────────────────────────────────────
+EXPORT="—"
+core_f="$BRAIN/work/exports/brain-knowledge-core.json"
+live_f="$BRAIN/work/exports/brain-knowledge-live.json"
+if [[ -f "$core_f" && -f "$live_f" ]]; then
+  core_kb=$(( $(stat -c%s "$core_f") / 1024 ))
+  live_kb=$(( $(stat -c%s "$live_f") / 1024 ))
+  EXPORT="core ${core_kb}KB | live ${live_kb}KB"
+fi
+
+# ── Search index ─────────────────────────────────────────────────
+INDEX="—"
+idx="$BRAIN/.brain-index.json"
+if [[ -f "$idx" ]]; then
+  count=$(python3 -c "import json; print(json.load(open('$idx'))['file_count'])" 2>/dev/null)
+  [[ -n "$count" ]] && INDEX="$count files"
+fi
+
+# ── Curation ──────────────────────────────────────────────────────
+CURATE="—"
+CORE_K=0
+latest_curate=$(ls -t "$BRAIN"/work/inbox/curate-reports/*-curate.md 2>/dev/null | head -1)
+if [[ -n "$latest_curate" ]]; then
+  c_promos=$(grep '^promotions:' "$latest_curate" | head -1 | sed 's/promotions: *//')
+  c_archives=$(grep '^archives:' "$latest_curate" | head -1 | sed 's/archives: *//')
+  c_date=$(grep '^date:' "$latest_curate" | head -1 | sed 's/date: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  CURATE="${c_promos} promote, ${c_archives} archive ($c_date)"
+fi
+CORE_K=$(ls "$BRAIN"/brain/core-knowledge/*.md 2>/dev/null | wc -l | tr -d ' ')
+
+# ── Context health ────────────────────────────────────────────────
+CTX_HEALTH="—"
+search_idx="$BRAIN/work/exports/brain-knowledge-search.json"
+if [[ -f "$search_idx" ]]; then
+  CTX_HEALTH=$(python3 -c "
+import json, os
+si = json.load(open('$search_idx'))
+tiers = {}
+for e in si['entries']:
+    t = e.get('tier', '?')
+    sub = e.get('tier_sub', '')
+    key = f'{t}-{sub}' if sub else t
+    sz = sum(len(s.get('content','')) for s in e.get('sections',[]))
+    tiers[key] = tiers.get(key, 0) + sz
+parts = []
+for t in ('T1','T2','T3'):
+    kb = tiers.get(t, 0) / 1024
+    parts.append(f'{t} {kb:.1f}KB')
+print(' | '.join(parts))
+" 2>/dev/null || echo "—")
+fi
+
+# ── P1/P2 ────────────────────────────────────────────────────────
+P1=0; P2=0
+pq="$BRAIN/work/logs/priority-queue.md"
+if [[ -f "$pq" ]]; then
+  P1=$(sed -n '/^## P1/,/^##/{/^- /p;}' "$pq" | wc -l | tr -d ' ')
+  P2=$(sed -n '/^## P2/,/^##/{/^- /p;}' "$pq" | wc -l | tr -d ' ')
+fi
+
+# ── Ollama Triage ────────────────────────────────────────────────
+TRIAGE="—"
+TRIAGE_STATS="$BRAIN/work/inbox/ollama-reviewed/.last-triage-stats.json"
+RAW_COUNT=$(find "$BRAIN/work/inbox/ollama-suggestions" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+if [[ -f "$TRIAGE_STATS" ]]; then
+  t_date=$(python3 -c "import json; print(json.load(open('$TRIAGE_STATS')).get('date','?'))" 2>/dev/null)
+  t_act=$(python3 -c "import json; print(json.load(open('$TRIAGE_STATS')).get('actionable',0))" 2>/dev/null)
+  TRIAGE="last $t_date, $t_act actionable, $RAW_COUNT raw pending"
+else
+  [[ $RAW_COUNT -gt 0 ]] && TRIAGE="$RAW_COUNT raw (never triaged)" || TRIAGE="no data"
+fi
+
+# ── Print ────────────────────────────────────────────────────────
+echo ""
+echo "  Brain Status"
+echo "  ────────────────────────────────"
+[[ $P1 -gt 0 ]] && echo "  P1 BLOCKING:   $P1 item(s)"
+[[ $P2 -gt 0 ]] && echo "  P2 Important:  $P2 item(s)"
+echo "  Snapshot:      ${SNAPSHOT:-none}"
+echo "  Tasks:         $ACTIVE active, $BLOCKED blocked"
+echo "  Seeds:         $SEEDS digest(s)"
+echo "  Spotcheck:     $SC_SCORE"
+echo "  Drift score:   $DRIFT"
+echo "  Export size:   $EXPORT"
+echo "  Context tiers: $CTX_HEALTH"
+echo "  Search index:  $INDEX"
+echo "  Curation:      $CURATE"
+echo "  Core knowledge: $CORE_K file(s)"
+echo "  Ollama triage: $TRIAGE"
+echo ""

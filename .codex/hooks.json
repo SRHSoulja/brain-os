@@ -1,0 +1,20 @@
+{
+  "PreToolUse": [
+    {
+      "_brain_managed": true,
+      "_brain_hook": "agent-agnostic-gate",
+      "matcher": "Edit|Write",
+      "command": "$HOME/brain/scripts/hooks/adapters/codex-pretooluse.sh agent-agnostic-gate",
+      "type": "command",
+      "timeout": 10
+    },
+    {
+      "_brain_managed": true,
+      "_brain_hook": "reddit-fetch-guard",
+      "matcher": "WebFetch",
+      "command": "$HOME/brain/scripts/hooks/adapters/codex-pretooluse.sh reddit-fetch-guard",
+      "type": "command",
+      "timeout": 5
+    }
+  ]
+}

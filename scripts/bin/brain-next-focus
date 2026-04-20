@@ -1,0 +1,709 @@
+#!/bin/bash
+# brain-next-focus — Advisory recommendation for what the Brain should focus on next
+# Usage: brain-next-focus [--json]
+#
+# Reads current Brain state and produces a practical focus recommendation.
+# Fits into the operating sequence: resume → state check → next-focus → human authorization → execution
+#
+# ADVISORY ONLY — no queue mutation, no task admission, no auto-execution.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+# Resolve through symlinks so ~/bin wrappers can source libs reliably.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+. "$_SELF_DIR/../lib/brain-paths.sh"
+TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+JSON_OUTPUT=false
+PERSIST=false
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_OUTPUT=true ;;
+    --persist) PERSIST=true ;;
+  esac
+done
+
+python3 - "$BRAIN" "$JSON_OUTPUT" "$PERSIST" "$_VERDICT_JSON" <<'PYEOF'
+import json, os, re, sys
+from datetime import datetime, timezone
+
+brain = sys.argv[1]
+json_output = sys.argv[2] == "true"
+persist = sys.argv[3] == "true"
+verdict_json_path = sys.argv[4]
+now = datetime.now(timezone.utc)
+
+# ── Read execution plan (operator-approved ordering) ─────────────
+exec_plan_path = os.path.join(brain, "brain/ops/queue-execution-plan.md")
+exec_plan_active = False
+exec_plan_next = []  # list of {task_id, title, tier, order, depends_on}
+
+if os.path.exists(exec_plan_path):
+    with open(exec_plan_path) as f:
+        plan_content = f.read()
+    # Check if plan has active status
+    if re.search(r'^status:\s*"?active"?', plan_content, re.MULTILINE):
+        exec_plan_active = True
+        current_tier = ''
+        for line in plan_content.split('\n'):
+            # Track tier headings
+            tier_match = re.match(r'^## (Tier \d+.*)', line)
+            if tier_match:
+                current_tier = tier_match.group(1)
+                continue
+            # Skip non-table rows, headers, separators
+            if not line.startswith('|') or '---' in line:
+                continue
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            if len(cells) < 4:
+                continue
+            # Skip header rows
+            if cells[0] in ('Order', ''):
+                continue
+            # Parse: Order | Task | Title | [Depends On |] Status
+            order_str = cells[0]
+            task_id = cells[1]
+            title = cells[2]
+            if not task_id.startswith('TASK-'):
+                continue
+            # Status is always last column, Depends On is second-to-last if 5+ cols
+            status = cells[-1].strip().lower()
+            depends_on = cells[-2].strip() if len(cells) >= 5 else ''
+            if depends_on == '--':
+                depends_on = ''
+            # Only include queued tasks
+            if 'done' in status or 'cancel' in status or 'subsumed' in status:
+                continue
+            if 'queued' in status:
+                exec_plan_next.append({
+                    'task_id': task_id,
+                    'title': title,
+                    'tier': current_tier,
+                    'order': order_str,
+                    'depends_on': depends_on,
+                })
+
+# ── Read signals ──────────────────────────────────────────────────
+
+# Priority queue
+p1_count = 0
+p2_count = 0
+pq_path = os.path.join(brain, "work/logs/priority-queue.md")
+if os.path.exists(pq_path):
+    with open(pq_path) as f:
+        content = f.read()
+    p1_block = re.search(r'## P1.*?(?=## |$)', content, re.DOTALL)
+    p2_block = re.search(r'## P2.*?(?=## |$)', content, re.DOTALL)
+    if p1_block:
+        p1_count = len([l for l in p1_block.group().split('\n') if l.strip().startswith('- ') and 'None' not in l])
+    if p2_block:
+        p2_count = len([l for l in p2_block.group().split('\n') if l.strip().startswith('- ') and 'None' not in l])
+
+# Verdict
+verdict_status = "unknown"
+verdict_path = verdict_json_path
+if os.path.exists(verdict_path):
+    try:
+        vd = json.load(open(verdict_path))
+        verdict_status = vd.get("status", "unknown")
+    except:
+        pass
+
+# Review state — prefer JSON sidecar, fall back to markdown regex
+review_json_path = os.path.join(brain, "brain/ops/review-state.json")
+review_md_path = os.path.join(brain, "brain/ops/review-state.md")
+weekly_overdue = False
+triage_stale = False
+_review_loaded = False
+
+if os.path.exists(review_json_path):
+    try:
+        with open(review_json_path) as f:
+            rj = json.load(f)
+        next_due_str = rj.get('weekly', {}).get('next_due', '')
+        if next_due_str and not next_due_str.startswith('_'):
+            due = datetime.strptime(next_due_str[:10], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            if now > due:
+                weekly_overdue = True
+        triage_date_str = rj.get('triage', {}).get('date', '')
+        if not triage_date_str or triage_date_str.startswith('_') or triage_date_str == 'never':
+            triage_stale = True
+        else:
+            tdt = datetime.strptime(triage_date_str[:10], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            if (now - tdt).total_seconds() > 48 * 3600:
+                triage_stale = True
+        _review_loaded = True
+    except:
+        pass
+
+# Fallback: parse markdown if JSON missing or failed
+if not _review_loaded and os.path.exists(review_md_path):
+    with open(review_md_path) as f:
+        rc = f.read()
+    nd = re.search(r'\*\*next_due:\*\* (\S+)', rc)
+    if nd and not nd.group(1).startswith('_'):
+        try:
+            due = datetime.strptime(nd.group(1)[:10], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            if now > due:
+                weekly_overdue = True
+        except:
+            pass
+    td = re.search(r'## Last Inbox Triage\n\n- \*\*date:\*\* (.+)', rc)
+    if td:
+        tdate = td.group(1).strip()
+        if tdate.startswith('_') or tdate == 'never':
+            triage_stale = True
+        else:
+            try:
+                tdt = datetime.strptime(tdate[:10], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                if (now - tdt).total_seconds() > 48 * 3600:
+                    triage_stale = True
+            except:
+                pass
+
+# Chain depth
+chain_depth = 0
+cd_path = os.path.join(brain, "brain/ops/.chain-depth")
+if os.path.exists(cd_path):
+    try:
+        chain_depth = int(open(cd_path).read().strip())
+    except:
+        pass
+
+# Queue composition
+queue_dir = os.path.join(brain, "brain/ops/tasks/queue")
+queue_tasks = []
+if os.path.isdir(queue_dir):
+    for fname in sorted(os.listdir(queue_dir)):
+        if not fname.startswith("TASK-") or not fname.endswith(".md"):
+            continue
+        fpath = os.path.join(queue_dir, fname)
+        with open(fpath) as f:
+            content = f.read()
+        def fm(key):
+            m = re.search(rf'^{key}:\s*"?([^"\n]+)"?', content, re.MULTILINE)
+            return m.group(1).strip() if m else ''
+        has_contract = '## Execution Contract' in content
+        task_status = fm('status')
+
+        # Skip parked tasks — they are explicitly held and not actionable
+        if task_status == 'parked':
+            continue
+
+        # Execution readiness classification
+        auth_owner = ''
+        surfaces = ''
+        production_touching = False
+        autonomous_ready = False
+
+        if has_contract:
+            am = re.search(r'\*\*authority_owner:\*\*\s*(\S+)', content)
+            auth_owner = am.group(1) if am else ''
+            sm = re.search(r'\*\*allowed_write_surfaces:\*\*\s*(.+)', content)
+            surfaces = sm.group(1).strip() if sm else ''
+            prod_patterns = ['/mnt/c/', '/www/', 'railway', 'production']
+            production_touching = any(p in surfaces.lower() for p in prod_patterns)
+            gov_patterns = ['governance', 'safety', 'CLAUDE.md', 'state-verdict']
+            governance_touching = any(p in surfaces for p in gov_patterns)
+            has_admitted = 'admitted_at:' in content and 'admitted_at: "' in content
+            autonomous_ready = (
+                fm('priority') == 'P3' and
+                auth_owner == 'claude-code' and
+                not production_touching and
+                not governance_touching and
+                has_admitted and
+                verdict_status == 'OK' and
+                not weekly_overdue and
+                chain_depth < 4
+            )
+
+        # Extract contract fields for readiness verification
+        depends_on = fm('depends_on')
+        contract_fields = {}
+        if has_contract:
+            for field in ['authority_owner', 'allowed_write_surfaces', 'rollback_reference']:
+                fm_match = re.search(rf'\*\*{field}:\*\*\s*(.+)', content)
+                contract_fields[field] = fm_match.group(1).strip() if fm_match else ''
+
+        queue_tasks.append({
+            'id': fname.replace('.md', ''),
+            'priority': fm('priority'),
+            'node': fm('node'),
+            'type': fm('type'),
+            'has_contract': has_contract,
+            'auth_owner': auth_owner,
+            'production_touching': production_touching,
+            'autonomous_ready': autonomous_ready,
+            'depends_on': depends_on,
+            'surfaces_raw': surfaces,
+            'contract_fields': contract_fields,
+            'title': (re.search(r'^# (.+)$', content, re.MULTILINE) or type('', (), {'group': lambda s, x: '?'})()).group(1),
+            'execution_profile': fm('execution_profile'),
+        })
+
+by_priority = {}
+by_node = {}
+contract_ready = 0
+autonomous_count = 0
+human_only = 0
+needs_contract = 0
+for t in queue_tasks:
+    by_priority[t['priority']] = by_priority.get(t['priority'], 0) + 1
+    by_node[t['node']] = by_node.get(t['node'], 0) + 1
+    if t['has_contract']:
+        contract_ready += 1
+    else:
+        needs_contract += 1
+    if t['autonomous_ready']:
+        autonomous_count += 1
+    elif t['has_contract'] and not t['autonomous_ready']:
+        human_only += 1
+
+# Recent completions (last 5)
+completed_dir = os.path.join(brain, "brain/ops/tasks/completed")
+recent_nodes = []
+if os.path.isdir(completed_dir):
+    comp_files = sorted(
+        [f for f in os.listdir(completed_dir) if f.endswith('.completion.json')],
+        key=lambda f: os.path.getmtime(os.path.join(completed_dir, f)),
+        reverse=True
+    )[:5]
+    for cf in comp_files:
+        try:
+            cd = json.load(open(os.path.join(completed_dir, cf)))
+            tid = cd.get('task_id', '')
+            md_path = os.path.join(completed_dir, tid + '.md')
+            if os.path.exists(md_path):
+                with open(md_path) as f:
+                    mc = f.read()
+                nm = re.search(r'^node:\s*"?([^"\n]+)"?', mc, re.MULTILINE)
+                if nm:
+                    recent_nodes.append(nm.group(1).strip())
+        except:
+            pass
+
+# ── Resource pressure (from authoritative usage-snapshot.json) ───
+# Thresholds and per-model-class guidance loaded from resource-pressure-policy.json.
+# Hard boundaries (1M, bypass scope) live in MANUAL §9.14/§9.13 and are not configurable here.
+# This signal is claude-code-only (statusline path). Codex/Gemini have separate snapshots.
+_rp_policy_path = os.path.join(brain, 'brain/ops/resource-pressure-policy.json')
+_rp_policy = {}
+_warn_pct = 70   # safe defaults if policy file missing
+_high_pct = 85
+_profile_to_class = {}
+_class_guidance = {}
+try:
+    with open(_rp_policy_path) as f:
+        _rp_policy = json.load(f)
+    _warn_pct = _rp_policy.get('thresholds', {}).get('warn_pct', 70)
+    _high_pct = _rp_policy.get('thresholds', {}).get('high_pct', 85)
+    _profile_to_class = _rp_policy.get('model_class_guidance', {}).get('profile_to_class_map', {})
+    _class_guidance = _rp_policy.get('model_class_guidance', {}).get('classes', {})
+except Exception:
+    pass  # policy unavailable — use hardcoded defaults, still functional
+
+resource_pressure = {
+    'agent': 'claude-code',
+    'five_hour_pct': None,
+    'seven_day_pct': None,
+    'ctx_pct': None,
+    'cost_usd': None,
+    'level': 'ok',        # ok | warn | high
+    'source': None,
+    'note': None,
+    'policy_source': _rp_policy_path if _rp_policy else 'defaults',
+}
+_usage_path = os.path.join(brain, 'work/logs/usage-snapshot.json')
+try:
+    with open(_usage_path) as f:
+        _usage = json.load(f)
+    _5h = (_usage.get('rate_limits') or {}).get('five_hour') or {}
+    _7d = (_usage.get('rate_limits') or {}).get('seven_day') or {}
+    _ctx = (_usage.get('context_window') or {})
+    resource_pressure['five_hour_pct'] = _5h.get('used_percentage')
+    resource_pressure['seven_day_pct'] = _7d.get('used_percentage')
+    resource_pressure['ctx_pct'] = _ctx.get('used_percentage')
+    resource_pressure['cost_usd'] = (_usage.get('cost') or {}).get('total_cost_usd')
+    resource_pressure['source'] = 'usage-snapshot.json'
+    pcts = [p for p in [resource_pressure['five_hour_pct'], resource_pressure['seven_day_pct']] if p is not None]
+    if pcts:
+        worst = max(pcts)
+        if worst >= _high_pct:
+            resource_pressure['level'] = 'high'
+            resource_pressure['note'] = f"claude-code at {worst:.0f}% (high) — Haiku/Sonnet proceed normally; Opus needs explicit authorization"
+        elif worst >= _warn_pct:
+            resource_pressure['level'] = 'warn'
+            resource_pressure['note'] = f"claude-code at {worst:.0f}% (warn) — Haiku/Sonnet viable; Opus advisory (operator authorization satisfies)"
+except Exception:
+    resource_pressure['source'] = 'unavailable'
+
+# ── Resolve execution plan short IDs to full queue IDs ────────────
+# Plan uses short IDs like TASK-101, queue uses TASK-2026-04-10-101
+if exec_plan_active and exec_plan_next:
+    queue_id_map = {}  # short suffix -> full ID
+    for t in queue_tasks:
+        # Extract the numeric suffix (e.g., "101" from "TASK-2026-04-10-101")
+        parts = t['id'].rsplit('-', 1)
+        if len(parts) == 2:
+            queue_id_map[f"TASK-{parts[1]}"] = t['id']
+    for entry in exec_plan_next:
+        resolved = queue_id_map.get(entry['task_id'])
+        if resolved:
+            entry['task_id'] = resolved
+
+# ── Build recommendation ──────────────────────────────────────────
+blockers = []
+recommendations = []
+focus_type = "autonomous_batch"
+
+# Blockers first
+if verdict_status in ("DRIFT", "CONFLICT"):
+    blockers.append(f"Brain verdict is {verdict_status} — fix state before any work")
+    focus_type = "maintenance"
+
+if p1_count > 0:
+    blockers.append(f"{p1_count} P1 item(s) in priority queue — address immediately")
+    focus_type = "human_directed"
+
+if weekly_overdue:
+    blockers.append("Weekly review is overdue — complete before auto-generated work can proceed")
+    focus_type = "maintenance"
+
+# Recommendations
+# Execution plan takes priority when active — it defines operator-approved ordering
+if exec_plan_active and exec_plan_next:
+    # Group by tier for context
+    first_tier = exec_plan_next[0]['tier']
+    tier_tasks = [t for t in exec_plan_next if t['tier'] == first_tier]
+    next_task = exec_plan_next[0]
+    dep_note = f" (depends on {next_task['depends_on']})" if next_task.get('depends_on') else ""
+    recommendations.append({
+        'action': f"Execute {next_task['task_id']}: {next_task['title']}",
+        'reason': f"Next in operator-approved execution plan — {first_tier}, order {next_task['order']}{dep_note}",
+        'type': 'human_directed',
+        'tasks': [t['task_id'] for t in tier_tasks[:3]],
+        'plan_driven': True,
+        'plan_tier': first_tier,
+        'plan_remaining': len(exec_plan_next),
+    })
+    focus_type = "human_directed"
+
+# P2 from actual queue (secondary when plan is active)
+queued_p2 = [t for t in queue_tasks if t['priority'] == 'P2']
+if queued_p2:
+    recommendations.append({
+        'action': f"Execute {len(queued_p2)} queued P2 task(s) with human approval",
+        'reason': "P2 tasks in queue require human direction before execution" + (" (execution plan ordering takes precedence)" if exec_plan_active else ""),
+        'type': 'human_directed',
+        'tasks': [t['id'] for t in queued_p2[:3]],
+    })
+
+# Autonomous-ready tasks (highest actionability)
+auto_ready = [t for t in queue_tasks if t['autonomous_ready']]
+if auto_ready:
+    recommendations.append({
+        'action': f"Run autonomous batch: {len(auto_ready)} task(s) ready now",
+        'reason': "P3, claude-code authority, non-production, contracts complete — can execute immediately",
+        'type': 'autonomous_batch',
+        'tasks': [t['id'] for t in auto_ready[:4]],
+    })
+
+# Human-only tasks (have contracts but need human approval)
+human_tasks = [t for t in queue_tasks if t['has_contract'] and not t['autonomous_ready']]
+if human_tasks:
+    prod_tasks = [t for t in human_tasks if t['production_touching']]
+    other_tasks = [t for t in human_tasks if not t['production_touching']]
+    if prod_tasks:
+        recommendations.append({
+            'action': f"Execute {len(prod_tasks)} production-touching task(s) with human approval",
+            'reason': "These have contracts but touch production — require explicit authorization",
+            'type': 'human_directed',
+            'tasks': [t['id'] for t in prod_tasks[:3]],
+        })
+    if other_tasks:
+        recommendations.append({
+            'action': f"Execute {len(other_tasks)} human-directed task(s)",
+            'reason': f"Contract-ready but authority_owner is not claude-code or priority > P3",
+            'type': 'human_directed',
+            'tasks': [t['id'] for t in other_tasks[:3]],
+        })
+
+# Tasks needing contracts (prep work)
+no_contract = [t for t in queue_tasks if not t['has_contract'] and t['priority'] == 'P3']
+if no_contract:
+    recommendations.append({
+        'action': f"Prep {len(no_contract)} P3 task(s) with execution contracts",
+        'reason': "Need contracts before they're eligible for autonomous batching",
+        'type': 'prep',
+        'tasks': [t['id'] for t in no_contract[:4]],
+    })
+
+if triage_stale:
+    recommendations.append({
+        'action': "Run inbox triage (brain-inbox-triage + brain-review triage)",
+        'reason': "Inbox triage is stale (>48h) — review before seeding new work",
+        'type': 'maintenance',
+    })
+
+# Avoid repeating the same node
+if recent_nodes:
+    most_recent = recent_nodes[0] if recent_nodes else ''
+    other_node_tasks = [t for t in queue_tasks if t['node'] != most_recent and t['priority'] == 'P3']
+    if other_node_tasks and len(recent_nodes) >= 3 and len(set(recent_nodes[:3])) == 1:
+        # Only label as autonomous_batch if tasks are actually autonomous-ready
+        diversify_ready = [t for t in other_node_tasks if t['autonomous_ready']]
+        diversify_prep = [t for t in other_node_tasks if not t['autonomous_ready']]
+        if diversify_ready:
+            recommendations.append({
+                'action': f"Switch focus to {diversify_ready[0]['node']} node ({len(diversify_ready)} autonomous-ready)",
+                'reason': f"Last 3 completions were all in {most_recent} — diversify",
+                'type': 'autonomous_batch',
+                'tasks': [t['id'] for t in diversify_ready[:4]],
+            })
+        elif diversify_prep:
+            recommendations.append({
+                'action': f"Prep tasks in {diversify_prep[0]['node']} node for diversification",
+                'reason': f"Last 3 completions were all in {most_recent} — diversify, but tasks need contracts first",
+                'type': 'prep',
+                'tasks': [t['id'] for t in diversify_prep[:4]],
+            })
+
+# Summary — focus_type must match the top recommendation
+if blockers:
+    summary = f"BLOCKED: {blockers[0]}"
+    # focus_type already set by blocker logic above
+elif recommendations:
+    summary = recommendations[0]['action']
+    focus_type = recommendations[0]['type']
+else:
+    summary = "Queue is empty or no actionable work identified."
+    focus_type = "idle"
+
+# ── Readiness verification ────────────────────────────────────────
+
+def verify_readiness(task_id):
+    """Check if a task is actually executable. Returns {executable, checks, block_reason}."""
+    task = next((t for t in queue_tasks if t['id'] == task_id), None)
+    if not task:
+        return {'executable': False, 'checks': {}, 'block_reason': f'Task {task_id} not found in queue'}
+
+    checks = {}
+
+    # 1. Dependencies met — if depends_on is set, that task must be in completed/
+    dep = task.get('depends_on', '')
+    if dep:
+        dep_completed = os.path.exists(os.path.join(completed_dir, dep + '.md'))
+        checks['dependencies'] = 'pass' if dep_completed else f'fail:{dep} not completed'
+    else:
+        checks['dependencies'] = 'pass'
+
+    # 2. Contract complete — must have authority_owner, allowed_write_surfaces, rollback_reference
+    if task['has_contract']:
+        cf = task.get('contract_fields', {})
+        missing = [f for f in ['authority_owner', 'allowed_write_surfaces', 'rollback_reference'] if not cf.get(f)]
+        checks['contract'] = 'pass' if not missing else f'fail:missing {",".join(missing)}'
+    else:
+        checks['contract'] = 'fail:no execution contract'
+
+    # 3. Write surfaces exist — parse paths and check parent directories
+    surfaces_raw = task.get('surfaces_raw', '')
+    if surfaces_raw:
+        # Strip list brackets before splitting ([tools/, codex-lab/...] form)
+        cleaned = surfaces_raw.strip().lstrip('[').rstrip(']')
+        paths = [p.strip().rstrip(',').lstrip('[').rstrip(']')
+                 for p in re.split(r'[,\s]+', cleaned) if '/' in p]
+        missing_paths = []
+        home = os.path.expanduser('~')
+        for p in paths:
+            if p.startswith('~'):
+                # Explicit home-relative: ~/codex-lab/...
+                expanded = os.path.expanduser(p)
+                parent = os.path.dirname(expanded.rstrip('/'))
+                if parent and not os.path.exists(parent):
+                    missing_paths.append(p)
+            elif p.startswith('/'):
+                # Absolute path: use as-is
+                parent = os.path.dirname(p.rstrip('/'))
+                if parent and not os.path.exists(parent):
+                    missing_paths.append(p)
+            else:
+                # Bare relative path — try multiple bases in priority order:
+                #   1. ~/gmgn-brain   (brain-repo-local: brain/, work/)
+                #   2. ~/2026Projects (tools namespace: tools/bin/)
+                #   3. ~/             (home-level: codex-lab/, 2026Projects/ itself)
+                # Pass if ANY base yields an existing parent directory.
+                bases = [brain, os.path.join(home, '2026Projects'), home]
+                found = any(
+                    os.path.exists(os.path.dirname(os.path.join(b, p).rstrip('/')) or b)
+                    for b in bases
+                )
+                if not found:
+                    missing_paths.append(p)
+        checks['write_surfaces'] = 'pass' if not missing_paths else f'fail:path not found {missing_paths[0]}'
+    else:
+        checks['write_surfaces'] = 'fail:no write surfaces declared'
+
+    # Determine overall status
+    failed = [k for k, v in checks.items() if v.startswith('fail')]
+    if failed:
+        # Use the first failure as the block reason
+        first_fail = checks[failed[0]]
+        block_reason = first_fail.replace('fail:', '')
+        return {'executable': False, 'checks': checks, 'block_reason': block_reason}
+    else:
+        return {'executable': True, 'checks': checks, 'block_reason': None}
+
+# Attach readiness to each recommended task
+for rec in recommendations:
+    if 'tasks' in rec:
+        rec['readiness'] = {}
+        for tid in rec['tasks']:
+            rec['readiness'][tid] = verify_readiness(tid)
+
+# ── Queue fingerprint (for staleness detection) ──────────────────
+# Fingerprint = sorted task IDs + priorities. If this changes, the recommendation is stale.
+queue_fingerprint = ','.join(sorted(f"{t['id']}:{t['priority']}" for t in queue_tasks))
+
+# ── Output ────────────────────────────────────────────────────────
+result = {
+    'generated_at': now.isoformat(),
+    'summary': summary,
+    'focus_type': focus_type,
+    'blockers': blockers,
+    'recommendations': recommendations,
+    'queue_fingerprint': queue_fingerprint,
+    'execution_plan': {
+        'active': exec_plan_active,
+        'remaining': len(exec_plan_next),
+        'next_tier': exec_plan_next[0]['tier'] if exec_plan_next else None,
+        'next_task': exec_plan_next[0]['task_id'] if exec_plan_next else None,
+    },
+    'state': {
+        'verdict': verdict_status,
+        'chain_depth': chain_depth,
+        'weekly_review_overdue': weekly_overdue,
+        'triage_stale': triage_stale,
+        'queue_total': len(queue_tasks),
+        'queue_by_priority': by_priority,
+        'queue_by_node': by_node,
+        'contract_ready': contract_ready,
+        'autonomous_ready': autonomous_count,
+        'human_only': human_only,
+        'needs_contract': needs_contract,
+        'p1_count': p1_count,
+        'p2_count': p2_count,
+    },
+    'resource_pressure': resource_pressure,
+}
+
+# ── Persist if requested ─────────────────────────────────────────
+if persist:
+    persist_path = os.path.join(brain, "work/logs/next-focus-latest.json")
+    try:
+        with open(persist_path, 'w') as f:
+            json.dump(result, f, indent=2)
+            f.write('\n')
+    except Exception as e:
+        print(f"[brain-next-focus] Failed to persist: {e}", file=sys.stderr)
+
+if json_output:
+    print(json.dumps(result, indent=2))
+else:
+    print("=== Brain Next Focus ===\n")
+
+    if blockers:
+        print("BLOCKERS:")
+        for b in blockers:
+            print(f"  !! {b}")
+        print()
+
+    print(f"Recommendation: {summary}")
+    print(f"Focus type: {focus_type}")
+    print()
+
+    # Resource pressure line — shown when warn or high
+    _rp = resource_pressure
+    if _rp['level'] in ('warn', 'high'):
+        _5h = f"5h:{_rp['five_hour_pct']:.0f}%" if _rp['five_hour_pct'] is not None else ""
+        _7d = f"7d:{_rp['seven_day_pct']:.0f}%" if _rp['seven_day_pct'] is not None else ""
+        _usage_parts = " | ".join(p for p in [_5h, _7d] if p)
+        _prefix = "WARN" if _rp['level'] == 'warn' else "HIGH"
+        print(f"Resource: [{_prefix}] {_usage_parts} — {_rp['note']}")
+        print()
+    elif _rp['five_hour_pct'] is not None or _rp['seven_day_pct'] is not None:
+        _5h = f"5h:{_rp['five_hour_pct']:.0f}%" if _rp['five_hour_pct'] is not None else ""
+        _7d = f"7d:{_rp['seven_day_pct']:.0f}%" if _rp['seven_day_pct'] is not None else ""
+        _usage_parts = " | ".join(p for p in [_5h, _7d] if p)
+        print(f"Resource: [ok] {_usage_parts}")
+        print()
+
+    if exec_plan_active:
+        print(f"Execution plan: ACTIVE ({len(exec_plan_next)} task(s) remaining)")
+        if exec_plan_next:
+            print(f"  Next tier: {exec_plan_next[0]['tier']}")
+        print()
+
+    if recommendations:
+        # Build task_id → execution_profile lookup for annotation
+        _profile_map = {t['id']: t.get('execution_profile', '') for t in queue_tasks}
+        # Profile → model class + display hint (from policy file, fallback to hardcoded)
+        _fallback_hint = {
+            'careful-refactorer': ('opus',   'Opus'),
+            'rapid-implementer':  ('sonnet', 'Sonnet'),
+            'repo-auditor':       ('sonnet', 'Codex/Gemini'),
+            'long-context-analysis': ('1m',  'Gemini'),
+            'light-automation':   ('haiku',  'Haiku'),
+            'frontend-designer':  ('sonnet', 'Sonnet'),
+            'discord-systems':    ('sonnet', 'Sonnet'),
+        }
+        _cur_level = resource_pressure.get('level', 'ok')
+
+        def _task_annotation(prof):
+            """Return 'profile → Model [advisory]' string for a task."""
+            if not prof:
+                return ''
+            model_class, display = _fallback_hint.get(prof, ('', prof))
+            # Override display from policy if available
+            if _profile_to_class:
+                model_class = _profile_to_class.get(prof, model_class)
+            guidance = (_class_guidance.get(model_class) or {}).get(_cur_level, {})
+            action = guidance.get('action', 'proceed')
+            advisory = guidance.get('note', '')
+            tag = f"{prof} → {display or model_class}"
+            if action == 'hard_boundary':
+                tag += ' [HARD BOUNDARY]'
+            elif action == 'defer':
+                tag += ' [defer advised]'
+            elif action == 'advisory' and advisory:
+                tag += ' [advisory]'
+            return tag
+
+        print("Top actions:")
+        for i, r in enumerate(recommendations[:3], 1):
+            prefix = ">> " if r.get('plan_driven') else "   "
+            label = "PLAN" if r.get('plan_driven') else r['type']
+            print(f"  {i}. [{label}] {r['action']}")
+            print(f"     Why: {r['reason']}")
+            if 'tasks' in r:
+                task_notes = []
+                for tid in r['tasks'][:4]:
+                    prof = _profile_map.get(tid, '')
+                    ann = _task_annotation(prof)
+                    note = f"{tid}"
+                    if ann:
+                        note += f" [{ann}]"
+                    task_notes.append(note)
+                print(f"     Tasks: {', '.join(task_notes)}")
+        print()
+
+    print("State:")
+    print(f"  Verdict: {verdict_status} | Chain: {chain_depth} | Queue: {len(queue_tasks)}")
+    print(f"  P1: {p1_count} | P2: {p2_count} | Autonomous-ready: {autonomous_count} | Human-only: {human_only} | Needs contract: {needs_contract}")
+    print(f"  Review: {'OVERDUE' if weekly_overdue else 'ok'} | Triage: {'STALE' if triage_stale else 'ok'}")
+PYEOF

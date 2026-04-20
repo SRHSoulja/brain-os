@@ -1,0 +1,968 @@
+#!/bin/bash
+# brain-task-execute — Primary autonomous execution gate: enforces authority, confidence, plan-order, and contract checks before launching a task
+# Usage:
+#   brain-task-execute <TASK-ID> [--by <agent>] [--dry-run] [--force]
+#   brain-task-execute --next [--by <agent>] [--dry-run] [--force]
+#
+# Claims the task, compiles the execution pack, writes a run record,
+# logs a TASK_EXECUTE event, and prints execution instructions.
+#
+# Does NOT auto-complete. The agent must produce a completion payload
+# and call brain-task-complete separately.
+#
+# Run record: brain/ops/tasks/active/TASK-ID.run.json
+# Event: TASK_EXECUTE TASK-ID agent
+#
+# Safety:
+# - Per-task lock held from duplicate check through TASK_EXECUTE event
+# - Blocks duplicate launches unless --force is used
+# - Run record includes hostname, pid, pack fingerprint for audit
+# - Stale runs detectable via launched_at + hostname + pid
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+. "$TOOLS/lib/frontmatter.sh"
+. "$TOOLS/lib/verdict-gate.sh"
+
+TASK_ID=""
+AGENT="${BRAIN_AGENT:-claude-code}"
+DRY_RUN=false
+NEXT_MODE=false
+FORCE=false
+FORENSIC_BASELINE=false
+AUDIT_DONE=false
+SKIP_PLAN=false
+TASK_BRANCH=false
+WITH_CONTEXT_PACK="${BRAIN_CONTEXT_PACK:-false}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by)      AGENT="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --next)    NEXT_MODE=true; shift ;;
+    --force)   FORCE=true; shift ;;
+    --forensic-baseline) FORENSIC_BASELINE=true; shift ;;
+    --audit-done) AUDIT_DONE=true; shift ;;
+    --skip-plan-check) SKIP_PLAN=true; shift ;;
+    --task-branch) TASK_BRANCH=true; shift ;;
+    --with-context-pack) WITH_CONTEXT_PACK=true; shift ;;
+    -*)        echo "Unknown flag: $1"; exit 1 ;;
+    *)         TASK_ID="$1"; shift ;;
+  esac
+done
+
+AGENT="$(canonical_agent "$AGENT")"
+
+# Seat-vs-agent reconciliation: warn if claiming agent doesn't match active seat
+if ! seat_agent_check "$AGENT" "brain-task-execute"; then
+  echo "WARNING: Claiming as '$AGENT' but active seat has a different agent."
+  echo "  Task will proceed but attribution may be incorrect."
+  echo "  To fix: pass correct --by <agent> or reclaim seat with brain-seat-claim."
+fi
+
+# ── Pending audit gate ────────────────────────────────────────────
+# ── Pending audit gate ────────────────────────────────────────────
+# Block execution if a previous task's post-task audit hasn't been confirmed.
+_AUDIT_MARKER="$BRAIN/brain/ops/tasks/.pending-audit.$AGENT"
+if [[ -f "$_AUDIT_MARKER" ]]; then
+  if [[ "$AUDIT_DONE" == "true" ]]; then
+    "$TOOLS/bin/brain-task-confirm" "$TASK_ID" --by "$AGENT"
+    if [[ -n "${TASK_ID:-}" && -f "$OPS_DIR/completed/${TASK_ID}.md" ]]; then
+      exit 0
+    fi
+  else
+    _PENDING_TASK=$(python3 -c "import json; print(json.load(open('$_AUDIT_MARKER')).get('task_id','unknown'))" 2>/dev/null || echo "unknown")
+    echo "BLOCKED: Post-task audit pending from task ${_PENDING_TASK}."
+    echo "  Complete the audit checklist (wiki, learnings, structural checks), then:"
+    echo "  brain-task-confirm ${_PENDING_TASK}"
+    echo ""
+    echo "  (Or clear and continue with: brain-task-execute <TASK-ID> --audit-done)"
+    exit 1
+  fi
+fi
+
+# Also honor env var for forensic mode
+[[ "${BRAIN_TASK_FORENSIC:-}" == "1" ]] && FORENSIC_BASELINE=true
+
+# ── Resolve task ID ───────────────────────────────────────────────
+if $NEXT_MODE; then
+  NEXT_OUTPUT=$("$TOOLS/bin/brain-next-task" "$AGENT" --dry-run --json 2>/dev/null) || {
+    echo "No tasks available or verdict blocked."
+    exit 1
+  }
+  TASK_ID=$(echo "$NEXT_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('task_id',''))" 2>/dev/null)
+  _NEXT_TITLE=$(echo "$NEXT_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('title',''))" 2>/dev/null)
+  _NEXT_PRIORITY=$(echo "$NEXT_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('priority',''))" 2>/dev/null)
+  if [[ -z "$TASK_ID" ]]; then
+    echo "No tasks in queue."
+    exit 0
+  fi
+  echo "Selected: $TASK_ID [$_NEXT_PRIORITY] $_NEXT_TITLE"
+  # Check chain depth
+  CHAIN_DEPTH_FILE="$BRAIN/brain/ops/.chain-depth"
+  CHAIN_LIMIT="${BRAIN_CHAIN_LIMIT:-4}"
+  if [[ -f "$CHAIN_DEPTH_FILE" ]]; then
+    _CHAIN=$(cat "$CHAIN_DEPTH_FILE" 2>/dev/null || echo 0)
+    if [[ "$_CHAIN" -ge "$CHAIN_LIMIT" ]]; then
+      echo ""
+      echo "  STOP (escalation policy): Chain depth $_CHAIN >= $CHAIN_LIMIT."
+      echo "  $_CHAIN autonomous continuations without human go-ahead."
+      echo "  Check in with human before continuing."
+      exit 1
+    fi
+  fi
+  echo ""
+fi
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Usage:"
+  echo "  brain-task-execute <TASK-ID> [--by <agent>] [--dry-run] [--force]"
+  echo "  brain-task-execute --next [--by <agent>] [--dry-run] [--force]"
+  echo ""
+  echo "Launches controlled execution of a Brain task."
+  echo "Claims the task, compiles the pack, writes a run record, prints instructions."
+  echo "Does NOT auto-complete. Agent must call brain-task-complete when done."
+  echo ""
+  echo "Flags:"
+  echo "  --next     Auto-select highest-priority task from queue"
+  echo "  --dry-run  Preview without mutating"
+  echo "  --force    Override existing run record (re-launch)"
+  echo "  --by       Specify agent identity (default: BRAIN_AGENT or claude-code)"
+  exit 1
+fi
+
+# ── Determine task location (pre-lock, for dry-run) ──────────────
+TASK_FILE=""
+NEEDS_CLAIM=false
+CURRENT_OWNER=""
+if [[ -f "$OPS_DIR/active/${TASK_ID}.md" ]]; then
+  TASK_FILE="$OPS_DIR/active/${TASK_ID}.md"
+  CURRENT_OWNER=$(grep '^owner:' "$TASK_FILE" | head -1 | sed 's/owner: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  if [[ "$CURRENT_OWNER" != "$AGENT" && "$CURRENT_OWNER" != "unassigned" ]]; then
+    echo "Error: $TASK_ID is active but owned by $CURRENT_OWNER (not $AGENT)"
+    exit 1
+  fi
+elif [[ -f "$OPS_DIR/queue/${TASK_ID}.md" ]]; then
+  TASK_FILE="$OPS_DIR/queue/${TASK_ID}.md"
+  NEEDS_CLAIM=true
+else
+  echo "Error: $TASK_ID not found in queue/ or active/"
+  exit 1
+fi
+
+# ── Dry run (no lock needed) ─────────────────────────────────────
+RUN_RECORD="$OPS_DIR/active/${TASK_ID}.run.json"
+if $DRY_RUN; then
+  echo "Dry run — would execute:"
+  echo "  Task: $TASK_ID"
+  echo "  Agent: $AGENT"
+  echo "  Location: $(basename $(dirname "$TASK_FILE"))/"
+  echo "  Needs claim: $NEEDS_CLAIM"
+  [[ -f "$RUN_RECORD" ]] && echo "  Existing run record: YES (would require --force)" || echo "  Existing run record: none"
+  echo ""
+  echo "Execution pack preview:"
+  "$TOOLS/bin/brain-task-pack" "$TASK_ID" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f\"  Goal: {d.get('goal','?')}\")
+print(f\"  Summary: {d.get('summary','?')[:100]}\")
+print(f\"  Criteria: {len(d.get('completion_criteria',[]))} items\")
+print(f\"  Impact suggestion: {d.get('impact_suggestion','none')}\")
+print(f\"  Node: {d.get('node','(none)')}\")
+" 2>/dev/null
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# ATOMIC LAUNCH BOUNDARY — per-task lock held from here
+# through duplicate check, claim, pack, run record, and event.
+# ══════════════════════════════════════════════════════════════════
+
+. "$TOOLS/lib/task-lock.sh"
+
+if ! task_lock_acquire "$TASK_ID" "execute" "$AGENT"; then
+  exit 1
+fi
+
+cleanup() { task_lock_cleanup; }
+trap cleanup EXIT
+
+# ── Duplicate launch guard (inside lock — no race possible) ──────
+if [[ -f "$RUN_RECORD" ]] && ! $FORCE; then
+  _existing=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(f\"{d.get('status','?')}\t{d.get('agent','?')}\t{d.get('launched_at','?')}\t{d.get('hostname','?')}\t{d.get('pid','?')}\")
+except:
+    print('?\t?\t?\t?\t?')
+" "$RUN_RECORD" 2>/dev/null)
+  IFS=$'\t' read -r _ex_status _ex_agent _ex_time _ex_host _ex_pid <<< "$_existing"
+
+  if [[ "$_ex_status" == "executing" ]]; then
+    echo "Error: $TASK_ID has an active execution in progress."
+    echo "  Status: $_ex_status"
+    echo "  Agent: $_ex_agent"
+    echo "  Launched: $_ex_time"
+    echo "  Host: $_ex_host (pid: $_ex_pid)"
+    echo ""
+    echo "If the previous run is stale or abandoned, re-launch with --force:"
+    echo "  brain-task-execute $TASK_ID --force"
+    exit 1
+  fi
+  echo "Note: existing run record has status=$_ex_status — proceeding with new launch."
+fi
+
+# ── Re-verify task location inside lock ──────────────────────────
+# Another agent may have claimed or moved the task between our
+# pre-lock check and lock acquisition
+if $NEEDS_CLAIM; then
+  if [[ ! -f "$OPS_DIR/queue/${TASK_ID}.md" ]]; then
+    echo "Error: $TASK_ID was claimed by another agent (queue file gone)"
+    exit 1
+  fi
+else
+  if [[ ! -f "$OPS_DIR/active/${TASK_ID}.md" ]]; then
+    echo "Error: $TASK_ID is no longer in active/"
+    exit 1
+  fi
+fi
+
+# ── Phase 1: Compile pack + enforce contract (BEFORE claim) ──────
+echo "[1/5] Compiling execution pack..."
+PACK_JSON=$("$TOOLS/bin/brain-task-pack" "$TASK_ID" 2>/dev/null) || {
+  echo "Error: failed to compile execution pack"
+  exit 1
+}
+
+PACK_FINGERPRINT=$(echo "$PACK_JSON" | sha256sum | cut -d' ' -f1)
+echo "  Pack compiled (fingerprint: ${PACK_FINGERPRINT:0:12}...)"
+
+# ── Confidence gate (before any state mutation) ───────────────────
+# Deterministic field-based triggers — no agent judgment.
+# STOP in --next mode blocks via _BATCH_BLOCK (set below).
+# STOP in explicit mode prints warning only (human is directing).
+_CONFIDENCE_JSON=$(echo "$PACK_JSON" | python3 "$TOOLS/lib/confidence-check.py" "$TASK_ID" 2>/dev/null || echo '{"verdict":"WARN","reason":"confidence-check failed to run","signals":[]}')
+_CONFIDENCE_VERDICT=$(echo "$_CONFIDENCE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('verdict','WARN'))" 2>/dev/null)
+_CONFIDENCE_REASON=$(echo "$_CONFIDENCE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason',''))" 2>/dev/null)
+
+if [[ "$_CONFIDENCE_VERDICT" == "STOP" ]]; then
+  if $NEXT_MODE; then
+    # Handled below in the batch eligibility block — store for _BATCH_BLOCK
+    _CONFIDENCE_BLOCK="confidence gate: $_CONFIDENCE_REASON"
+  else
+    echo ""
+    echo "  CONFIDENCE WARNING: $_CONFIDENCE_REASON"
+    echo "  Proceeding (human-directed execution — override is implicit)."
+    echo ""
+  fi
+elif [[ "$_CONFIDENCE_VERDICT" == "WARN" ]]; then
+  echo "  CONFIDENCE WARN: $_CONFIDENCE_REASON"
+fi
+
+# ── Contract enforcement (before any state mutation) ─────────────
+# Enforcement classification for all six declared contract fields:
+#
+#   HARD-REQUIRED (P1/P2 block, P3 warn):
+#     authority_owner, allowed_write_surfaces, rollback_reference
+#
+#   CONFIDENCE-GATE ONLY (not a contract block — handled by confidence-check.py):
+#     required_review_inputs — gate warns for P1/P2 with empty/absent list
+#
+#   IN-EXECUTION GUIDANCE (not a pre-execution contract requirement):
+#     stop_and_ask_conditions — evaluated by the agent during the task, not here
+#
+#   ADVISORY / DEFAULTED (always present in pack; not a useful presence check):
+#     may_spawn_tasks — defaults to false in compile-execution-pack; pack always has value
+#
+TASK_PRIORITY=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('priority',''))" 2>/dev/null)
+CONTRACT_CHECK=$(echo "$PACK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d.get('execution_contract', {})
+missing = []
+if not c.get('authority_owner'):
+    missing.append('authority_owner')
+if not c.get('allowed_write_surfaces'):
+    missing.append('allowed_write_surfaces')
+if not c.get('rollback_reference'):
+    missing.append('rollback_reference')
+print(f'{len(missing)}\t{bool(c.get(\"authority_owner\"))}\t{\", \".join(missing)}')
+" 2>/dev/null)
+IFS=$'\t' read -r _CONTRACT_MISSING _CONTRACT_EXISTS _CONTRACT_FIELDS <<< "$CONTRACT_CHECK"
+
+if [[ "$_CONTRACT_MISSING" -gt 0 ]]; then
+  if [[ "$TASK_PRIORITY" == "P1" || "$TASK_PRIORITY" == "P2" ]]; then
+    echo ""
+    echo "  BLOCKED: Execution contract incomplete for $TASK_PRIORITY task."
+    echo "  Missing hard-required fields: $_CONTRACT_FIELDS"
+    echo ""
+    echo "  Add an '## Execution Contract' section to the task file."
+    echo "  Hard-required for P1/P2:"
+    echo "    - **authority_owner:** human | claude-code | mixed"
+    echo "    - **allowed_write_surfaces:** paths this task may modify"
+    echo "    - **rollback_reference:** checkpoint or commit to recover from"
+    echo "  Handled by confidence gate (not a contract block):"
+    echo "    - **required_review_inputs:** review artifacts this task depends on"
+    echo "  In-execution guidance only (not required pre-execution):"
+    echo "    - **stop_and_ask_conditions:** when the agent should pause and ask"
+    echo "    - **may_spawn_tasks:** whether follow-up tasks can be created (default: false)"
+    exit 1
+  elif [[ "$TASK_PRIORITY" == "P3" ]]; then
+    echo "  WARNING: Execution contract incomplete for P3 task."
+    echo "  Missing fields: $_CONTRACT_FIELDS"
+    echo "  (Hard-required for P1/P2; advisory for P3. Add to avoid this warning.)"
+  fi
+fi
+
+# ── Escalation policy: authority_owner check (after pack, before claim) ──
+if $NEXT_MODE; then
+  _AUTH_OWNER=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('execution_contract',{}).get('authority_owner',''))" 2>/dev/null)
+  if [[ "$_AUTH_OWNER" == "human" || "$_AUTH_OWNER" == "mixed" ]]; then
+    echo ""
+    echo "  STOP (escalation policy): authority_owner=$_AUTH_OWNER requires human direction."
+    echo "  Run explicitly: brain-task-execute $TASK_ID --by $AGENT"
+    exit 1
+  fi
+fi
+
+# ── Batch eligibility enforcement (--next mode only) ─────────────
+# Enforces the full autonomous run policy batch entry checklist.
+# Explicit task IDs skip this — the human is directing.
+if $NEXT_MODE && ! $FORCE; then
+  _BATCH_BLOCK="${_CONFIDENCE_BLOCK:-}"
+
+  # Check: task status must be "queued" (not parked)
+  _TASK_STATUS=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" <<< "$PACK_JSON" 2>/dev/null)
+  [[ "$_TASK_STATUS" == "parked" ]] && _BATCH_BLOCK="${_BATCH_BLOCK}status=parked (task is intentionally parked); "
+
+  # Check: admitted_at must exist
+  _ADMITTED=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('admitted_at',''))" <<< "$PACK_JSON" 2>/dev/null)
+  [[ -z "$_ADMITTED" ]] && _BATCH_BLOCK="${_BATCH_BLOCK}no admitted_at stamp; "
+
+  # Check: depends_on must be completed
+  _DEPENDS=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('depends_on',''))" <<< "$PACK_JSON" 2>/dev/null)
+  if [[ -n "$_DEPENDS" && ! -f "$OPS_DIR/completed/${_DEPENDS}.md" ]]; then
+    _BATCH_BLOCK="${_BATCH_BLOCK}dependency $_DEPENDS not completed; "
+  fi
+
+  # Check: execution plan ordering (BLOCKING for --next; human-override via --skip-plan-check)
+  if $SKIP_PLAN; then _PLAN_CHECK='{"in_plan":false}'; else
+  _PLAN_CHECK=$(python3 "$TOOLS/lib/plan-order-check.py" "$TASK_ID" 2>/dev/null || echo '{"in_plan":false}')
+  fi
+  _IN_PLAN=$(echo "$_PLAN_CHECK" | python3 -c "import json,sys; print(json.load(sys.stdin).get('in_plan',False))" 2>/dev/null)
+  if [[ "$_IN_PLAN" == "True" ]]; then
+    _PRED_DONE=$(echo "$_PLAN_CHECK" | python3 -c "import json,sys; print(json.load(sys.stdin).get('predecessors_done',True))" 2>/dev/null)
+    if [[ "$_PRED_DONE" == "False" ]]; then
+      _BLOCKERS=$(echo "$_PLAN_CHECK" | python3 -c "import json,sys; print(', '.join(json.load(sys.stdin).get('blockers',[])))" 2>/dev/null)
+      _PLAN_TIER=$(echo "$_PLAN_CHECK" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tier',''))" 2>/dev/null)
+      _BATCH_BLOCK="${_BATCH_BLOCK}plan-order violation in $_PLAN_TIER (blockers: $_BLOCKERS) — use --skip-plan-check to override; "
+    fi
+  fi
+
+  # Check: write surfaces must not include production/governance
+  _SURFACES=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('execution_contract',{}).get('allowed_write_surfaces',''))" <<< "$PACK_JSON" 2>/dev/null)
+  if echo "$_SURFACES" | grep -qiE '/www/|railway|production'; then
+    _BATCH_BLOCK="${_BATCH_BLOCK}production-touching write surfaces; "
+  fi
+  if echo "$_SURFACES" | grep -qiE 'governance|safety|CLAUDE.md|state-verdict'; then
+    _BATCH_BLOCK="${_BATCH_BLOCK}governance/safety write surfaces; "
+  fi
+
+  if [[ -n "$_BATCH_BLOCK" ]]; then
+    echo ""
+    echo "  BLOCKED (batch eligibility): ${_BATCH_BLOCK}"
+    echo "  This task does not meet autonomous batch entry criteria."
+    echo "  Run explicitly with a task ID for human-directed execution."
+    exit 1
+  fi
+fi
+
+# ── Phase 2: Claim if needed (inline — we already hold the lock) ──
+if $NEEDS_CLAIM; then
+  echo "[2/5] Claiming $TASK_ID..."
+  QUEUE_FILE="$OPS_DIR/queue/${TASK_ID}.md"
+  ACTIVE_TARGET="$OPS_DIR/active/${TASK_ID}.md"
+  HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+  SRC_LANE_ID=$(fm_get "$QUEUE_FILE" "handoff_lane_id")
+
+  # ── One-active-task-per-agent enforcement ──────────────────────
+  # Prevents the double-claim pattern observed 2026-04-10 where a race
+  # inside the auto-continue path claimed two queue tasks in parallel.
+  # Rule: if this agent already owns any other TASK-*.md in active/,
+  # refuse the new claim. --force lets the operator override explicitly
+  # (e.g. for stale-claim recovery via handoff_run_all.sh).
+  if ! $FORCE; then
+    _EXISTING_ACTIVE=$(python3 - "$OPS_DIR/active" "$AGENT" "$TASK_ID" <<'PY'
+import re, sys
+from pathlib import Path
+active_dir = Path(sys.argv[1])
+agent = sys.argv[2]
+new_task_id = sys.argv[3]
+for md in sorted(active_dir.glob('TASK-*.md')):
+    if md.stem == new_task_id:
+        continue  # same task, not a conflict
+    try:
+        text = md.read_text(encoding='utf-8')
+    except Exception:
+        continue
+    # Parse owner from frontmatter (cheap: only need owner line).
+    owner = ''
+    for line in text.splitlines():
+        if line.startswith('---') and owner:
+            break
+        m = re.match(r'^owner:\s*["\x27]?([^"\x27\n]+)["\x27]?\s*$', line)
+        if m:
+            owner = m.group(1).strip()
+            break
+    if owner == agent:
+        print(md.stem)
+        break
+PY
+    )
+    if [[ -n "$_EXISTING_ACTIVE" ]]; then
+      echo "Error: agent '$AGENT' already owns active task: $_EXISTING_ACTIVE"
+      echo "  One-active-task-per-agent rule enforced."
+      echo "  Resolve the existing task first, or pass --force to override."
+      exit 1
+    fi
+  fi
+
+  # VERDICT_GATE enforcement (shared library -- same as brain-task-claim)
+  verdict_read
+  if ! verdict_gate_allow; then
+    echo ""
+    verdict_gate_message "task claim"
+    exit 1
+  fi
+  [[ "$_V_STATUS" == "STALE" ]] && verdict_gate_message "task claim"
+
+  # APPROVAL_CLASS gate (fail-closed for unknown class)
+  if [[ -f "$TOOLS/lib/approval-class.sh" ]]; then
+    . "$TOOLS/lib/approval-class.sh"
+    _is_autonomous="false"
+    # Detect autonomous mode from task metadata
+    if grep -q 'autonomous:.*true' "$QUEUE_FILE" 2>/dev/null; then
+      _is_autonomous="true"
+    fi
+    if ! approval_class_check "brain-task-execute" "$AGENT" "$_is_autonomous"; then
+      echo "BLOCKED: approval class '$APPROVAL_CLASS' not permitted for agent=$AGENT autonomous=$_is_autonomous"
+      exit 1
+    fi
+    echo "  Approval class: $APPROVAL_CLASS"
+  fi
+
+  # requires_agent advisory check (lane-29 / capability-aware routing)
+  _REQ_AGENT=$(fm_get "$QUEUE_FILE" "requires_agent" 2>/dev/null || true)
+  if [[ -n "$_REQ_AGENT" && "$_REQ_AGENT" != "any" ]]; then
+    if [[ "$_REQ_AGENT" == "human" ]]; then
+      echo "BLOCKED: requires_agent=human — this task requires a human decision."
+      echo "  Park it, resolve the human action, then re-admit."
+      exit 1
+    elif [[ "$_REQ_AGENT" != "$AGENT" ]]; then
+      echo "  WARN: requires_agent=$_REQ_AGENT but claiming agent=$AGENT"
+      echo "  Substitution in effect. Verify capability coverage before proceeding."
+    fi
+  fi
+
+  # Admission gate: must have been admitted through brain-task-admit
+  _ADMITTED=$(python3 - "$QUEUE_FILE" <<'ADMITEOF'
+import sys, re
+with open(sys.argv[1]) as f:
+    in_fm = False
+    for line in f:
+        if line.strip() == '---':
+            if in_fm:
+                break
+            in_fm = True
+            continue
+        if in_fm:
+            m = re.match(r'^admitted_at\s*:\s*["\x27]*(.*?)["\x27]*\s*$', line)
+            if m and m.group(1):
+                print(m.group(1))
+                break
+ADMITEOF
+  )
+  if [[ -z "$_ADMITTED" ]]; then
+    echo "Error: $TASK_ID has no admitted_at stamp — must enter queue through brain-task-admit"
+    exit 1
+  fi
+
+  # Destination guard
+  if [[ -f "$ACTIVE_TARGET" ]]; then
+    echo "Error: $TASK_ID already exists in active/"
+    exit 1
+  fi
+
+  # Write transformed version to temp, rename atomically
+  CLAIM_TMP=$(mktemp "$OPS_DIR/active/.${TASK_ID}.md.XXXXXX")
+  CLAIM_BRANCH="${CLAIM_BRANCH:-$(git -C "$BRAIN" branch --show-current 2>/dev/null || true)}"
+  [[ -z "$CLAIM_BRANCH" ]] && CLAIM_BRANCH="detached"
+  python3 - "$QUEUE_FILE" "$CLAIM_TMP" "$AGENT" "$CLAIM_BRANCH" <<'PYEOF'
+import re, sys
+task_file, out_file, agent, branch = sys.argv[1:5]
+with open(task_file, 'r') as f:
+    content = f.read()
+content = re.sub(r'^owner:.*$', 'owner: "' + agent + '"', content, flags=re.MULTILINE)
+content = re.sub(r'^status:.*$', 'status: "active"', content, flags=re.MULTILINE)
+lines = content.split("\n")
+new_lines = []
+fm_count = 0
+injected = False
+for line in lines:
+    if line.strip() == "---":
+        fm_count += 1
+        if fm_count == 2 and not injected:
+            new_lines.append(f'branch: "{branch}"')
+            injected = True
+    new_lines.append(line)
+content = "\n".join(new_lines)
+with open(out_file, 'w') as f:
+    f.write(content)
+PYEOF
+
+  if [[ ! -s "$CLAIM_TMP" ]]; then
+    rm -f "$CLAIM_TMP"
+    echo "Error: failed to write claimed task"
+    exit 1
+  fi
+
+  if [[ -n "$SRC_LANE_ID" && -f "$HANDOFF_REGISTRY" ]]; then
+    python3 - "$HANDOFF_REGISTRY" "$SRC_LANE_ID" "$AGENT" "$CLAIM_BRANCH" <<'PYEOF'
+import json
+import sys
+from datetime import date
+
+registry_path, lane_id, owner, branch = sys.argv[1:5]
+with open(registry_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+for lane in data.get('lanes', []):
+    if lane.get('id') == lane_id:
+        lane['owner'] = owner
+        lane['branch'] = branch
+        data['updated'] = date.today().isoformat()
+        with open(registry_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+        break
+else:
+    raise SystemExit(f'Error: lane_id not found in registry: {lane_id}')
+PYEOF
+  fi
+
+  mv "$CLAIM_TMP" "$ACTIVE_TARGET"
+  if [[ ! -f "$ACTIVE_TARGET" ]]; then
+    echo "Error: claim rename failed"
+    exit 1
+  fi
+  rm "$QUEUE_FILE"
+
+  # Task branch creation (opt-in via --task-branch)
+  # Creates agent-prefixed task branch: <agent>/task-<id>-<slug>
+  # Does NOT switch if repo is dirty. Advisory only -- does not block.
+  if $TASK_BRANCH; then
+    _TB_NAME=$("$TOOLS/bin/brain-task-branch-name" "$TASK_ID" --agent "$AGENT" 2>/dev/null || true)
+    if [[ -n "$_TB_NAME" ]]; then
+      if git -C "$BRAIN" diff --quiet 2>/dev/null && git -C "$BRAIN" diff --cached --quiet 2>/dev/null; then
+        if git -C "$BRAIN" checkout -b "$_TB_NAME" 2>/dev/null; then
+          echo "  Task branch created: $_TB_NAME"
+          CLAIM_BRANCH="$_TB_NAME"
+        elif git -C "$BRAIN" checkout "$_TB_NAME" 2>/dev/null; then
+          echo "  Task branch (existing): $_TB_NAME"
+          CLAIM_BRANCH="$_TB_NAME"
+        else
+          echo "  WARN: could not create/switch to task branch $_TB_NAME (continuing on current branch)"
+        fi
+      else
+        echo "  WARN: repo has uncommitted changes -- task branch creation skipped"
+        echo "  To use task branches, commit or stash changes first"
+      fi
+    fi
+  fi
+
+  . "$TOOLS/lib/brain-event.sh"
+  brain_event TASK_CLAIM "$TASK_ID $AGENT"
+  echo "  Claimed by $AGENT on $CLAIM_BRANCH"
+
+  # Refresh all state surfaces after claim mutation
+  # (sync-task-counts retired in 0f — brain-resume generates system-state.md directly)
+  BRAIN_SKIP_CHAIN_RESET=1 "$TOOLS/bin/brain-resume" > /dev/null 2>&1 || true
+  "$TOOLS/bin/brain-state-check" --quiet > /dev/null 2>&1 || true
+else
+  echo "[2/5] Task already active (owner: $CURRENT_OWNER)"
+fi
+
+# ── Phase 3: Write run record ────────────────────────────────────
+echo "[3/5] Writing run record..."
+
+if [[ -f "$RUN_RECORD" ]] && $FORCE; then
+  echo "  Overwriting existing run record (--force)"
+fi
+
+# Ensure requires_agent is available regardless of claim path (may already be
+# set by Phase 2 claim block; read from active file if not).
+: "${_REQ_AGENT:=$(fm_get "$OPS_DIR/active/${TASK_ID}.md" "requires_agent" 2>/dev/null || true)}"
+
+# Task-level context-pack opt-in: use_context_pack: true in frontmatter enables
+# --with-context-pack without requiring the operator to pass the flag manually.
+# Does not override an explicit --with-context-pack=false (env var takes precedence).
+_TASK_USE_CTX=$(fm_get "$OPS_DIR/active/${TASK_ID}.md" "use_context_pack" 2>/dev/null || true)
+if [[ "$_TASK_USE_CTX" == "true" && "$WITH_CONTEXT_PACK" != "true" && "$WITH_CONTEXT_PACK" != "1" ]]; then
+  WITH_CONTEXT_PACK=true
+  echo "  [context-pack] enabled via task frontmatter (use_context_pack: true)"
+fi
+
+# Runtime model attribution (agent-agnostic).
+_RUN_MODEL="${BRAIN_MODEL:-}"
+_RUN_MODEL_SOURCE="env:BRAIN_MODEL"
+if [[ -z "$_RUN_MODEL" ]]; then
+  _CAPS_FILE="$BRAIN/brain/governance/capability-profiles/${AGENT}.json"
+  if [[ -f "$_CAPS_FILE" ]]; then
+    _RUN_MODEL=$(python3 -c "import json; print(json.load(open('$_CAPS_FILE')).get('model',''))" 2>/dev/null || echo "")
+    [[ -n "$_RUN_MODEL" ]] && _RUN_MODEL_SOURCE="capability-profile:${AGENT}"
+  fi
+fi
+[[ -z "$_RUN_MODEL" ]] && _RUN_MODEL="unresolved"
+[[ -z "$_RUN_MODEL_SOURCE" ]] && _RUN_MODEL_SOURCE="unresolved"
+
+python3 - "$RUN_RECORD" "$TASK_ID" "$AGENT" "$PACK_JSON" "$PACK_FINGERPRINT" "$$" "$(hostname)" "${_REQ_AGENT:-}" "$_RUN_MODEL" "$_RUN_MODEL_SOURCE" "$_CONFIDENCE_JSON" <<'PYEOF'
+import json, sys
+from datetime import datetime, timezone
+
+run_file, task_id, agent, pack_str, fingerprint, pid, hostname, requires_agent, model_used, model_source, confidence_str = sys.argv[1:12]
+
+try:
+    pack = json.loads(pack_str)
+except json.JSONDecodeError:
+    pack = {}
+
+requested = pack.get("execution_profile", "") or ""
+
+# Resolve execution profile if not explicitly set at creation time.
+# Boundary: creation fills durable fields; execute resolves fresh fit.
+# Do NOT rewrite task frontmatter — resolved value lives in run.json only.
+def _resolve_profile(pack, requires_agent, requested):
+    if requested:
+        return requested  # explicit creation-time choice wins
+    # Agent-specific default
+    agent_defaults = {
+        "gemini":      "long-context-analysis",
+        "codex":       "careful-refactorer",
+        "claude-code": "rapid-implementer",
+    }
+    if requires_agent and requires_agent not in ("any", ""):
+        return agent_defaults.get(requires_agent, "rapid-implementer")
+    # Scope + priority heuristics
+    scope = pack.get("architecture_scope", "")
+    priority = pack.get("priority", "P3")
+    p_rank = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(priority, 3)
+    if scope == "shared-infra" and p_rank <= 2:
+        return "careful-refactorer"
+    if p_rank >= 4:
+        return "light-automation"
+    return "rapid-implementer"
+
+resolved = _resolve_profile(pack, requires_agent, requested)
+
+record = {
+    "task_id": task_id,
+    "agent": agent,
+    "launched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "status": "executing",
+    "hostname": hostname,
+    "pid": int(pid),
+    "pack_fingerprint": fingerprint,
+    "execution_pack": pack,
+    "execution_profile_requested": requested,
+    "execution_profile_resolved": resolved,
+    "executor_model": model_used,
+    "executor_model_source": model_source,
+    "invocation_path": "brain-task-execute",
+    "confidence": json.loads(confidence_str) if confidence_str else {"verdict": "UNKNOWN"},
+}
+
+with open(run_file, 'w') as f:
+    json.dump(record, f, indent=2)
+    f.write("\n")
+PYEOF
+
+echo "  Run record: active/${TASK_ID}.run.json"
+
+# ── Phase 3b: Capture working-tree baseline for artifact tracking ──
+_FORENSIC_FLAG=""
+[[ "$FORENSIC_BASELINE" == "true" ]] && _FORENSIC_FLAG="--forensic"
+_BASELINE_PATH=$(python3 "$TOOLS/lib/task-snapshot.py" capture "$TASK_ID" $_FORENSIC_FLAG 2>/dev/null) || true
+if [[ -n "$_BASELINE_PATH" ]]; then
+  _BL_MODE="compact"
+  [[ "$FORENSIC_BASELINE" == "true" ]] && _BL_MODE="forensic"
+  echo "  Baseline:    .baseline-${TASK_ID}.json (mode: $_BL_MODE)"
+fi
+
+# ── Phase 3c: Start proof-of-execution run ───────────────────────
+PROOF_RUN_ID=""
+if command -v brain-proof-start >/dev/null 2>&1; then
+  PROOF_RUN_ID=$(brain-proof-start --task "$TASK_ID" --executor "$AGENT" 2>/dev/null) || true
+  if [[ -n "$PROOF_RUN_ID" ]]; then
+    echo "  Proof run:   $PROOF_RUN_ID"
+    export BRAIN_ACTIVE_RUN_ID="$PROOF_RUN_ID"
+    # Persist proof run ID on the run record
+    python3 -c "
+import json, sys
+rf = sys.argv[1]
+with open(rf) as f: d = json.load(f)
+d['proof_run_id'] = sys.argv[2]
+with open(rf, 'w') as f: json.dump(d, f, indent=2); f.write('\n')
+" "$RUN_RECORD" "$PROOF_RUN_ID"
+  fi
+fi
+
+# ── Phase 4: Log event ───────────────────────────────────────────
+echo "[4/5] Logging execution event..."
+. "$TOOLS/lib/brain-event.sh"
+brain_event TASK_EXECUTE "$TASK_ID $AGENT"
+echo "  Event logged"
+
+# ══════════════════════════════════════════════════════════════════
+# END ATOMIC BOUNDARY — release lock
+# ══════════════════════════════════════════════════════════════════
+task_lock_release "$TASK_ID"
+trap - EXIT
+
+# ── Phase 5: Print execution instructions ─────────────────────────
+COMPLETION_CMD=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('completion_command',''))" 2>/dev/null)
+
+echo "[5/5] Execution context:"
+echo ""
+echo "================================================================"
+echo ""
+
+echo "$PACK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('execution_instructions', ''))
+" 2>/dev/null
+
+# ── Premise verification reminder (advisory) ─────────────────────
+_PREMISES=$(fm_get "$ACTIVE_TARGET" "premises_to_verify" 2>/dev/null || true)
+if [[ -n "$_PREMISES" && "$_PREMISES" != '""' && "$_PREMISES" != "''" ]]; then
+  echo ""
+  echo "PREMISE CHECK: Before implementing, verify this is still true:"
+  echo "  $_PREMISES"
+fi
+
+# ── Node context injection (read-only) ───────────────────────────
+_NODE=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('node',''))" 2>/dev/null)
+if [[ -n "$_NODE" && "$_NODE" != "(none)" ]]; then
+  _NODE_INDEX="$BRAIN/nodes/$_NODE/INDEX.md"
+  if [[ -f "$_NODE_INDEX" ]]; then
+    echo ""
+    echo "--- Node context: $_NODE ---"
+    # Print a compact version: skip frontmatter, cap at 60 lines
+    python3 -c "
+import sys
+content = open(sys.argv[1]).read()
+# Strip frontmatter
+if content.startswith('---'):
+    end = content.find('---', 3)
+    if end > 0:
+        content = content[end+3:].lstrip()
+lines = content.split('\n')[:60]
+print('\n'.join(lines))
+if len(content.split('\n')) > 60:
+    print('... (truncated, see full INDEX.md)')
+" "$_NODE_INDEX" 2>/dev/null
+    echo "--- end node context ---"
+  fi
+  # Append relationship summary if index exists
+  _CONNECTIONS=$("$TOOLS/bin/brain-connections" "$_NODE" 2>/dev/null)
+  if [[ -n "$_CONNECTIONS" ]]; then
+    echo ""
+    echo "--- Connections: $_NODE ---"
+    echo "$_CONNECTIONS"
+    echo "--- end connections ---"
+  fi
+
+  # ── Extended context bundle (read-only, compact) ──────────────
+  # Surfaces relevant Brain knowledge beyond INDEX.md + connections.
+  # Each section is capped and silently omitted if empty.
+
+  python3 - "$BRAIN" "$_NODE" <<'CTXEOF'
+import os, sys, re, json, glob
+
+brain = sys.argv[1]
+node = sys.argv[2]
+sections = []
+
+# 1. Recent devlogs mentioning this node (last 3, title + date)
+devlog_dir = os.path.join(brain, "work/logs/devlog")
+if os.path.isdir(devlog_dir):
+    hits = []
+    for f in sorted(os.listdir(devlog_dir), reverse=True):
+        if not f.endswith(".md") or f == "README.md":
+            continue
+        path = os.path.join(devlog_dir, f)
+        try:
+            content = open(path).read(2000).lower()
+            if node.lower() in content:
+                # Extract date from filename and title from frontmatter
+                dm = re.match(r"(\d{4}-\d{2}-\d{2})", f)
+                date = dm.group(1) if dm else "?"
+                tm = re.search(r'title:\s*"?([^"\n]+)"?', open(path).read(500))
+                title = tm.group(1).strip() if tm else f
+                hits.append(f"  {date}: {title}")
+        except:
+            pass
+        if len(hits) >= 3:
+            break
+    if hits:
+        sections.append("Recent devlogs:\n" + "\n".join(hits))
+
+# 2. Open questions mentioning this node
+oq_path = os.path.join(brain, "work/open-questions.md")
+if os.path.isfile(oq_path):
+    oq_hits = []
+    try:
+        for line in open(oq_path):
+            if line.startswith("- [ ]") and node.lower() in line.lower():
+                # Trim to question text only
+                q = line.strip()[6:].split(" — ")[0].strip()
+                oq_hits.append(f"  - {q}")
+    except:
+        pass
+    if oq_hits:
+        sections.append("Open questions:\n" + "\n".join(oq_hits[:3]))
+
+# 3. Recent completed tasks for this node (last 5, title only)
+completed_dir = os.path.join(brain, "brain/ops/tasks/completed")
+if os.path.isdir(completed_dir):
+    task_hits = []
+    for f in sorted(os.listdir(completed_dir), reverse=True):
+        if not f.startswith("TASK-") or not f.endswith(".md"):
+            continue
+        path = os.path.join(completed_dir, f)
+        try:
+            content = open(path).read(500)
+            if re.search(r'^node:.*' + re.escape(node), content, re.MULTILINE):
+                tm = re.search(r'title:\s*"?([^"\n]+)"?', content)
+                title = tm.group(1).strip() if tm else f
+                task_hits.append(f"  {f[:19]}: {title}")
+        except:
+            pass
+        if len(task_hits) >= 5:
+            break
+    if task_hits:
+        sections.append("Recent completed tasks:\n" + "\n".join(task_hits))
+
+# 4. Active expectations related to this node's signals
+exp_path = os.path.join(brain, "brain/ops/derived/expectations.jsonl")
+if os.path.isfile(exp_path):
+    exp_hits = []
+    try:
+        for line in open(exp_path):
+            line = line.strip()
+            if not line:
+                continue
+            e = json.loads(line)
+            if e.get("status") != "pending":
+                continue
+            # Match if source or note mentions the node
+            source = e.get("source", "").lower()
+            note = e.get("note", "").lower()
+            if node.lower() in source or node.lower() in note:
+                exp_hits.append(f"  {e['id']}: {e['signal']} {e['op']} {e['value']} by {e['by']} ({e.get('note','')})")
+    except:
+        pass
+    if exp_hits:
+        sections.append("Active expectations:\n" + "\n".join(exp_hits[:3]))
+
+if sections:
+    print("")
+    print(f"--- Extended context: {node} ---")
+    print("\n\n".join(sections))
+    print(f"--- end extended context ---")
+CTXEOF
+
+fi
+
+# ── brain-context-pack retrieval (opt-in: --with-context-pack or BRAIN_CONTEXT_PACK=1) ──
+if [[ "$WITH_CONTEXT_PACK" == "true" || "$WITH_CONTEXT_PACK" == "1" ]]; then
+  if command -v brain-context-pack >/dev/null 2>&1; then
+    _CTX_PACK_OUTPUT=$(brain-context-pack --task "$TASK_ID" 2>/dev/null) || true
+    if [[ -n "$_CTX_PACK_OUTPUT" ]]; then
+      # Extract retrieved_context sections from JSON manifest and print
+      echo ""
+      echo "--- Context pack: $TASK_ID ---"
+      echo "$_CTX_PACK_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    manifest = d.get('manifest', {})
+    retrieved = d.get('retrieved_context', [])
+    inc = manifest.get('items_included', 0)
+    tok = manifest.get('total_tokens', 0)
+    bud = manifest.get('budget', 0)
+    sta = manifest.get('budget_status', '?')
+    task_id_val = d.get('task_id', '')
+    print(f'Retrieval: {inc} sources, {tok}/{bud} tok ({sta})')
+    for item in retrieved[:5]:
+        if item.get('source') == 'task' and item.get('key') == task_id_val:
+            continue
+        label = f\"{item.get('source','?')}:{item.get('key','?')}\"
+        reason = item.get('reason', '')
+        content = item.get('content', '').strip()
+        if content:
+            print(f'')
+            print(f'[{label}] ({reason})')
+            print(content[:800])
+except Exception as e:
+    print(f'(context pack parse error: {e})')
+" 2>/dev/null || true
+      echo "--- end context pack ---"
+    fi
+  fi
+fi
+
+echo ""
+echo "================================================================"
+echo ""
+# ── Pre-flight tool detection ─────────────────────────────────────
+# Surface tool wiki/MAP requirements BEFORE work starts if possible.
+python3 "$TOOLS/lib/post-task-audit.py" --preflight > /tmp/preflight_audit.txt 2>/dev/null || true
+if [[ -s /tmp/preflight_audit.txt ]]; then
+  echo "PRE-FLIGHT MUST-FIX: Undocumented tool changes detected in environment."
+  echo "  Task completion will be BLOCKED until documentation is added."
+  grep -E "Needs|needs|wiki|MAP" /tmp/preflight_audit.txt | head -n 5 || true
+fi
+rm -f /tmp/preflight_audit.txt
+
+echo "Execution launched."
+echo "  Task:        $TASK_ID"
+echo "  Agent:       $AGENT"
+echo "  Node:        $(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('node','(none)'))" 2>/dev/null)"
+echo "  Fingerprint: ${PACK_FINGERPRINT:0:12}"
+echo "  Run record:  active/${TASK_ID}.run.json"
+
+# ── Knowledge access indicator (pilot) ──────────────────────────
+if grep -qi 'knowledge_access:.*true' "$OPS_DIR/active/${TASK_ID}.md" 2>/dev/null; then
+  echo "  Knowledge:   ENABLED (pilot) — 3 queries available"
+  echo "    Usage:     brain-task-search $TASK_ID \"query\""
+  echo "    Surfaces:  nodes/*/INDEX,docs,CHANGELOG + devlogs + tools docs"
+  echo "    Budget:    3 queries, logged to run record"
+fi
+
+echo ""
+echo "When done:"
+echo "  $COMPLETION_CMD"
+echo ""
+echo "Or with payload:"
+echo "  brain-task-complete --payload <completion.json>"
+echo ""
+echo "Review dispatch (after completion):"
+echo "  brain-task-handoff $TASK_ID --type verification"
+echo "  # default path routes through brain-review-dispatch → brain-subagent-dispatch"
+echo "  # legacy Codex sidecar path retired; --legacy-sidecar flag still exists for transition only"

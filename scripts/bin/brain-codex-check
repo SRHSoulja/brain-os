@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# brain-codex-check — Read the newest Codex result from outbox/audits
+# See also: brain-codex-history (browse all handoffs), brain-verify-check (which tasks need verification)
+set -euo pipefail
+
+LAB_ROOT="${CODEX_LAB_ROOT:-${CODEX_LAB_PATH:-$HOME/codex-lab}}"
+OUTBOX="$LAB_ROOT/outbox"
+AUDITS="$LAB_ROOT/audits"
+ARCHIVE="$LAB_ROOT/archive"
+
+usage() {
+  cat <<'EOF'
+Usage: brain-codex-check [--archive]
+
+Reads the newest markdown file from:
+  - $LAB_ROOT/outbox/
+  - $LAB_ROOT/audits/
+
+Prints the file contents to stdout.
+
+Options:
+  --archive   Move the file into $LAB_ROOT/archive/ after reading
+  -h, --help  Show this help text
+EOF
+}
+
+archive_after=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --archive)
+      archive_after=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -d "$OUTBOX" && ! -d "$AUDITS" ]]; then
+  echo "codex-lab sources not found under $LAB_ROOT" >&2
+  exit 1
+fi
+
+newest_file="$(
+  find "$OUTBOX" "$AUDITS" -maxdepth 1 -type f -name '*.md' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | awk 'NR==1 { $1=""; sub(/^ /,""); print; exit }'
+)"
+
+if [[ -z "$newest_file" ]]; then
+  echo "No markdown files found in $OUTBOX or $AUDITS" >&2
+  exit 1
+fi
+
+cat "$newest_file"
+
+if [[ "$archive_after" == true ]]; then
+  mkdir -p "$ARCHIVE"
+  base_name="$(basename "$newest_file")"
+  target="$ARCHIVE/$base_name"
+  if [[ -e "$target" ]]; then
+    stem="${base_name%.md}"
+    target="$ARCHIVE/${stem}-$(date -u +%Y%m%dT%H%M%SZ).md"
+  fi
+  mv "$newest_file" "$target"
+  echo >&2
+  echo "Archived to $target" >&2
+fi

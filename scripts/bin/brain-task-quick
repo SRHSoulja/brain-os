@@ -1,0 +1,443 @@
+#!/bin/bash
+# brain-task-quick — Fast task creation from minimal input
+# Usage:
+#   brain-task-quick "Deploy the new blog post" --node content-and-docs
+#   brain-task-quick "Fix Clip factual responses" --node clip-the-intern --p2
+#   brain-task-quick "Audit cron schedule" --node automation-builds --steps "1. Check crontab;2. List schedule;3. Compare against expected"
+#   brain-task-quick "Title" --why "reason" --owner human --steps "1. Do X;2. Do Y"
+#
+# Generates a full task file with sensible defaults, then admits it to queue.
+# Reduces task creation from ~5 minutes of manual writing to ~10 seconds.
+#
+# Defaults:
+#   priority: P3
+#   owner: claude-code
+#   created_by: claude-code
+#   creation_mode: manual
+#   authority_basis: human-directed
+#   authority_owner: claude-code
+#   may_spawn_tasks: true
+#
+# Flags:
+#   --node <node>      Brain node (auto-detected from title if omitted)
+#   --p1/--p2/--p3/--p4  Priority (default: P3)
+#   --owner <owner>    authority_owner in execution contract (default: claude-code)
+#   --why <reason>     why_now field (default: derived from context)
+#   --steps <steps>    Semicolon-separated steps (e.g. "Do X;Do Y;Do Z")
+#   --depends <id>     depends_on task ID
+#   --related <ids>    Comma-separated related task IDs (informational)
+#   --surfaces <s>     Comma-separated allowed write surfaces
+#   --scope <scope>    architecture_scope (brain-core|brain-module|shared-infra|governance-doc|external-build|experimental|deprecation)
+#   --tags <tags>      scope_tags — optional comma-separated nuance (adapter|integration|migration|maintenance|audit|customer|prototype)
+#   --no-spawn         Set may_spawn_tasks: false
+#   --dry-run          Generate file but don't admit
+#   --from <file>      Read loose notes from file as task description
+#   --model <model>    Explicit creator model attribution override
+#   --allow-unresolved-model --reason "<why>"  Emergency bypass for missing model attribution
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+
+# Self-dispatch: route through brain-dispatch if not already dispatched.
+# brain-dispatch sets BRAIN_DISPATCH_ACTIVE=1 before calling this tool.
+if [[ -z "${BRAIN_DISPATCH_ACTIVE:-}" ]]; then
+  exec "$TOOLS/bin/brain-dispatch" "brain-task-quick" "$@"
+fi
+
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+
+TITLE=""
+NODE=""
+PRIORITY="P3"
+OWNER="claude-code"
+WHY=""
+STEPS=""
+DEPENDS=""
+RELATED=""
+SURFACES=""
+MAY_SPAWN="true"
+DRY_RUN=false
+FROM_FILE=""
+EXEC_PROFILE=""
+ARCH_SCOPE=""
+SCOPE_TAGS=""
+MODEL_OVERRIDE=""
+ALLOW_UNRESOLVED_MODEL=false
+UNRESOLVED_MODEL_REASON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --node)     NODE="$2"; shift 2 ;;
+    --p1)       PRIORITY="P1"; shift ;;
+    --p2)       PRIORITY="P2"; shift ;;
+    --p3)       PRIORITY="P3"; shift ;;
+    --p4)       PRIORITY="P4"; shift ;;
+    --owner)    OWNER="$2"; shift 2 ;;
+    --why)      WHY="$2"; shift 2 ;;
+    --steps)    STEPS="$2"; shift 2 ;;
+    --depends)  DEPENDS="$2"; shift 2 ;;
+    --related)  RELATED="$2"; shift 2 ;;
+    --surfaces) SURFACES="$2"; shift 2 ;;
+    --profile)  EXEC_PROFILE="$2"; shift 2 ;;
+    --scope)    ARCH_SCOPE="$2"; shift 2 ;;
+    --tags)     SCOPE_TAGS="$2"; shift 2 ;;
+    --model)    MODEL_OVERRIDE="$2"; shift 2 ;;
+    --allow-unresolved-model) ALLOW_UNRESOLVED_MODEL=true; shift ;;
+    --reason)   UNRESOLVED_MODEL_REASON="$2"; shift 2 ;;
+    --no-spawn) MAY_SPAWN="false"; shift ;;
+    --dry-run)  DRY_RUN=true; shift ;;
+    --from)     FROM_FILE="$2"; shift 2 ;;
+    -*)         echo "Unknown flag: $1" >&2; exit 1 ;;
+    *)
+      if [[ -z "$TITLE" ]]; then
+        TITLE="$1"
+      else
+        echo "Error: unexpected argument '$1' (title already set to '$TITLE')"
+        echo "Use flags for other options: --node, --p2, --why, --steps"
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if $ALLOW_UNRESOLVED_MODEL && [[ -z "$UNRESOLVED_MODEL_REASON" ]]; then
+  echo "Error: --reason is required with --allow-unresolved-model" >&2
+  exit 1
+fi
+
+# ── Extract priority from title prefix if no explicit --pN flag was used ──
+# Supports: "P1: title", "P2: title", etc. Explicit --pN flag takes precedence.
+# (TASK-110, 2026-04-12)
+if [[ "$PRIORITY" == "P3" ]] && [[ "$TITLE" =~ ^P([1-4]):\ (.+) ]]; then
+  PRIORITY="P${BASH_REMATCH[1]}"
+fi
+
+if [[ -z "$TITLE" ]]; then
+  echo "Usage: brain-task-quick \"Task title\" [--node <node>] [--p2] [--steps \"1;2;3\"]" >&2
+  echo "" >&2
+  echo "Creates a full task and admits it to queue in one step." >&2
+  echo "" >&2
+  echo "Examples:" >&2
+  echo "  brain-task-quick \"Deploy the new blog post\" --node content-and-docs" >&2
+  echo "  brain-task-quick \"Fix Clip factual responses\" --node clip-the-intern --p2" >&2
+  echo "  brain-task-quick \"Audit cron schedule\" --steps \"SSH to production;List crontab;Compare expected\"" >&2
+  echo "  brain-task-quick \"Review draft\" --owner human --why \"Needs human judgment\"" >&2
+  exit 1
+fi
+
+# ── Generate task ID ─────────────────────────────────────────────
+DATE=$(date +%Y-%m-%d)
+DATE_PREFIX="TASK-${DATE}"
+
+# Find next sequence number for today
+SEQ=1
+for f in "$_OPS_TASKS_DIR"/queue/${DATE_PREFIX}-*.md \
+         "$_OPS_TASKS_DIR"/active/${DATE_PREFIX}-*.md \
+         "$_OPS_TASKS_DIR"/completed/${DATE_PREFIX}-*.md; do
+  [[ -f "$f" ]] || continue
+  fname=$(basename "$f" .md)
+  num="${fname##*-}"
+  num=$((10#$num))
+  [[ $num -ge $SEQ ]] && SEQ=$((num + 1))
+done
+
+TASK_ID=$(printf "%s-%03d" "$DATE_PREFIX" "$SEQ")
+CREATED_BY="${BRAIN_AGENT:-claude-code}"
+CREATED_BY="$(canonical_agent "$CREATED_BY")"
+
+# ── Auto-detect node from title ──────────────────────────────────
+if [[ -z "$NODE" ]]; then
+  NODE=$(python3 -c "
+import os, sys
+title = sys.argv[1].lower()
+nodes_dir = os.path.join(os.environ['HOME'], 'gmgn-brain', 'nodes')
+best = ''
+best_score = 0
+for d in os.listdir(nodes_dir):
+    full = os.path.join(nodes_dir, d)
+    if not os.path.isdir(full) or d.startswith('_') or d.startswith('example'):
+        continue
+    # Check if node name (with hyphens as spaces) appears in title
+    readable = d.replace('-', ' ')
+    # Also check common aliases
+    aliases = {
+        'clip-the-intern': ['clip', 'clip factual', 'discord bot'],
+        'gmgnrepeat-website': ['website', 'blog', 'deploy page', 'landing page'],
+        'content-and-docs': ['blog post', 'content', 'article', 'writing'],
+        'devops-tools': ['tool', 'brain-', 'cli', 'script'],
+        'coaching': ['guide', 'coaching', 'course', 'gumroad'],
+        'strikes': ['strikes', 'crypto', 'trading'],
+        'cliptv': ['cliptv', 'clips', 'streamer'],
+        'interactive-streams': ['stream', 'overlay', 'obs'],
+        'automation-builds': ['cron', 'automation', 'xbot', 'scheduled'],
+        'the-lab': ['lab', 'client', 'custom build'],
+    }
+    candidates = [readable] + aliases.get(d, [])
+    for alias in candidates:
+        if alias in title and len(alias) > best_score:
+            best = d
+            best_score = len(alias)
+print(best)
+" "$TITLE" 2>/dev/null || echo "")
+fi
+
+# ── Infer architecture_scope from node when --scope not provided ─────────
+# Low-ambiguity mappings only. Nodes not listed here remain unset (admission
+# warning still fires, operator sets --scope explicitly for those cases).
+if [[ -z "$ARCH_SCOPE" && -n "$NODE" ]]; then
+  case "$NODE" in
+    devops-tools|brain-ops|multi-agent-infra) ARCH_SCOPE="shared-infra" ;;
+    brain-core)                               ARCH_SCOPE="brain-core" ;;
+    content-and-docs)                         ARCH_SCOPE="governance-doc" ;;
+    automation-builds)                        ARCH_SCOPE="brain-module" ;;
+    coaching)                                 ARCH_SCOPE="external-build" ;;
+  esac
+fi
+
+# ── Default why_now ──────────────────────────────────────────────
+if [[ -z "$WHY" ]]; then
+  WHY="Identified during active session as next actionable work"
+fi
+
+# ── Read description from file if --from ─────────────────────────
+DESCRIPTION=""
+if [[ -n "$FROM_FILE" && -f "$FROM_FILE" ]]; then
+  DESCRIPTION=$(cat "$FROM_FILE")
+fi
+
+# ── Default write surfaces ───────────────────────────────────────
+if [[ -z "$SURFACES" ]]; then
+  case "$NODE" in
+    gmgnrepeat-website) SURFACES="gmgnrepeat-website, work/drafts" ;;
+    clip-the-intern)    SURFACES="clip-the-intern/" ;;
+    content-and-docs)   SURFACES="work/drafts, gmgnrepeat-website" ;;
+    devops-tools)       SURFACES="tools/" ;;
+    strikes)            SURFACES="strikes/" ;;
+    cliptv)             SURFACES="cliptv/" ;;
+    *)                  SURFACES="work/" ;;
+  esac
+fi
+
+# ── Creator model attribution (agent-agnostic) ───────────────────
+CREATED_MODEL="${MODEL_OVERRIDE:-${BRAIN_MODEL:-}}"
+CREATED_MODEL_SOURCE="env:BRAIN_MODEL"
+if [[ -n "$MODEL_OVERRIDE" ]]; then
+  CREATED_MODEL_SOURCE="flag:--model"
+fi
+if [[ -z "$CREATED_MODEL" ]]; then
+  _CAPS_FILE="$BRAIN/brain/governance/capability-profiles/${CREATED_BY}.json"
+  if [[ -f "$_CAPS_FILE" ]]; then
+    CREATED_MODEL=$(python3 -c "import json; print(json.load(open('$_CAPS_FILE')).get('model',''))" 2>/dev/null || echo "")
+    [[ -n "$CREATED_MODEL" ]] && CREATED_MODEL_SOURCE="capability-profile:${CREATED_BY}"
+  fi
+fi
+if [[ -z "$CREATED_MODEL" && "$ALLOW_UNRESOLVED_MODEL" != "true" ]]; then
+  echo "Error: creator model unresolved for $CREATED_BY." >&2
+  echo "  Set BRAIN_MODEL, or pass --model <model>." >&2
+  echo "  Emergency bypass: --allow-unresolved-model --reason \"<why>\"" >&2
+  exit 1
+fi
+[[ -z "$CREATED_MODEL" ]] && CREATED_MODEL="unresolved"
+
+# ── Build task file ──────────────────────────────────────────────
+STAGING_DIR="$BRAIN/work/inbox"
+TASK_FILE="$STAGING_DIR/${TASK_ID}.md"
+
+python3 - "$TASK_FILE" "$TASK_ID" "$TITLE" "$NODE" "$PRIORITY" "$OWNER" \
+  "$WHY" "$STEPS" "$DEPENDS" "$RELATED" "$SURFACES" "$MAY_SPAWN" "$DATE" "$DESCRIPTION" \
+  "$EXEC_PROFILE" "$ARCH_SCOPE" "$SCOPE_TAGS" "$CREATED_BY" "$CREATED_MODEL" "$CREATED_MODEL_SOURCE" "$UNRESOLVED_MODEL_REASON" <<'PYEOF'
+import sys
+
+(out_file, task_id, title, node, priority, owner,
+ why, steps_raw, depends, related, surfaces, may_spawn, date, description,
+ exec_profile, arch_scope, scope_tags, created_by, created_model, created_model_source,
+ unresolved_model_reason) = sys.argv[1:22]
+
+VALID_SCOPE_TAGS = {
+    "adapter", "integration", "migration", "maintenance",
+    "audit", "customer", "prototype",
+}
+
+def parse_scope_tags(raw):
+    if not raw:
+        return []
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1].strip()
+    if not cleaned:
+        return []
+    tags = []
+    for part in cleaned.split(","):
+        tag = part.strip().strip("'").strip('"')
+        if tag:
+            tags.append(tag)
+    return tags
+
+# Build frontmatter
+fm = []
+fm.append("---")
+fm.append(f'task_id: {task_id}')
+fm.append(f'title: "{title}"')
+if node:
+    fm.append(f'node: "{node}"')
+fm.append(f'status: queued')
+fm.append(f'priority: {priority}')
+fm.append(f'owner: "unassigned"')
+fm.append(f'created: "{date}"')
+fm.append(f'created_by: {created_by}')
+fm.append(f'created_model: "{created_model}"')
+fm.append(f'created_model_source: "{created_model_source}"')
+if unresolved_model_reason:
+    fm.append(f'created_model_override_reason: "{unresolved_model_reason}"')
+fm.append(f'creation_mode: manual')
+fm.append(f'authority_basis: human-directed')
+fm.append(f'why_now: "{why}"')
+if depends:
+    fm.append(f'depends_on: "{depends}"')
+if related:
+    fm.append(f'related: "{related}"')
+if exec_profile:
+    fm.append(f'execution_profile: "{exec_profile}"')
+if arch_scope:
+    fm.append(f'architecture_scope: {arch_scope}')
+if scope_tags:
+    tags = parse_scope_tags(scope_tags)
+    invalid = [t for t in tags if t not in VALID_SCOPE_TAGS]
+    if invalid:
+        print(
+            f"Error: invalid --tags values: {invalid} "
+            f"(allowed: {sorted(VALID_SCOPE_TAGS)})",
+            file=sys.stderr
+        )
+        sys.exit(2)
+    if tags:
+        fm.append(f'scope_tags: {", ".join(tags)}')
+fm.append('premises_to_verify: ""')
+fm.append("---")
+
+# Build body
+body = []
+body.append(f"# {title}")
+body.append("")
+
+# Objective
+if description:
+    body.append("## Objective")
+    body.append("")
+    body.append(description)
+    body.append("")
+
+# Steps
+if steps_raw:
+    import re as _re
+    # Strip any pre-existing leading step marker (e.g. "1.", "2)", "3:")
+    # so callers can pass either "Do X;Do Y" or "1. Do X;2. Do Y" without
+    # producing doubled "1. 1. Do X" output.
+    _marker = _re.compile(r'^\s*\d+[.):]\s*')
+    steps = [_marker.sub('', s.strip()) for s in steps_raw.split(";") if s.strip()]
+    if steps:
+        body.append("## Steps")
+        body.append("")
+        for i, step in enumerate(steps, 1):
+            body.append(f"{i}. {step}")
+        body.append("")
+
+# Execution Contract
+body.append("## Execution Contract")
+body.append("")
+body.append(f"- **authority_owner:** {owner}")
+surfaces_formatted = ", ".join(s.strip() for s in surfaces.split(",")) if surfaces else "work/"
+body.append(f"- **allowed_write_surfaces:** [{surfaces_formatted}]")
+body.append(f"- **rollback_reference:** git revert or safe-rm artifacts")
+body.append(f"- **may_spawn_tasks:** {'true' if may_spawn == 'true' else 'false'}")
+body.append("")
+
+# Results placeholder
+body.append("## Results")
+body.append("")
+body.append("- **Completed by:** _Filled in by the completing agent._")
+body.append("- **Completed on:** _Filled in by the completing agent._")
+body.append("- **Output:** _Filled in by the completing agent._")
+body.append("")
+
+content = "\n".join(fm) + "\n\n" + "\n".join(body)
+
+with open(out_file, 'w') as f:
+    f.write(content)
+PYEOF
+
+if [[ ! -s "$TASK_FILE" ]]; then
+  echo "Error: failed to generate task file" >&2
+  exit 1
+fi
+
+echo "Generated: $TASK_FILE"
+echo "  ID: $TASK_ID"
+echo "  Title: $TITLE"
+echo "  Node: ${NODE:-'(none - set with --node)'}"
+echo "  Priority: $PRIORITY"
+echo "  Authority: $OWNER"
+
+if $DRY_RUN; then
+  echo ""
+  echo "--- Preview ---"
+  cat "$TASK_FILE"
+  echo "--- End preview ---"
+  echo ""
+  echo "Dry run complete. File at: $TASK_FILE"
+  echo "To admit: brain-task-admit $TASK_FILE"
+  exit 0
+fi
+
+# ── Auto-admit ───────────────────────────────────────────────────
+echo ""
+ADMIT_OUTPUT=$("$TOOLS/bin/brain-task-admit" "$TASK_FILE" 2>&1) || {
+  echo "Admission failed:" >&2
+  echo "$ADMIT_OUTPUT" >&2
+  echo "" >&2
+  echo "Task file preserved at: $TASK_FILE" >&2
+  echo "Fix issues and run: brain-task-admit $TASK_FILE" >&2
+  exit 1
+}
+
+echo "$ADMIT_OUTPUT"
+
+# Clean up staging file (admit moved it to queue)
+[[ -f "$TASK_FILE" ]] && rm -f "$TASK_FILE"
+
+# ── Auto-create wiki page (non-blocking) ────────────────────────
+# Wiki digest architecture: tasks get wiki pages in systems/ category.
+# Slug: task ID with hyphens replaced by underscores (brain-wiki convention).
+_WIKI_SLUG=$(echo "$TASK_ID" | tr '-' '_' | tr '[:upper:]' '[:lower:]')
+_WIKI_PAGE="$BRAIN/brain/wiki/systems/${_WIKI_SLUG}.md"
+if [[ ! -f "$_WIKI_PAGE" ]]; then
+  if "$TOOLS/bin/brain-wiki" create "$_WIKI_SLUG" --cat systems >/dev/null 2>&1; then
+    # Populate with task metadata
+    _WIKI_TITLE="${TASK_ID}: $(echo "$TITLE" | head -c 80)"
+    _WIKI_BODY="$PRIORITY | Created $DATE | Node: ${NODE:-unset}\n\n$(echo "$TITLE" | head -c 200)"
+    python3 -c "
+import sys
+path, title, body, task_id, date = sys.argv[1:6]
+with open(path) as f: content = f.read()
+content = content.replace('title: \"$_WIKI_SLUG\"', f'title: \"{title}\"')
+# Replace body
+import re
+content = re.sub(r'# .*\n\n> Created.*\n\n\n\n## Related\n\n<!-- .* -->',
+    f'# {title}\n\n> {body}\n\n## Related\n\n<!-- wiki auto-created by brain-task-quick -->', content)
+with open(path, 'w') as f: f.write(content)
+" "$_WIKI_PAGE" "$_WIKI_TITLE" "$_WIKI_BODY" "$TASK_ID" "$DATE" 2>/dev/null || true
+    echo ""
+    echo "Wiki page created: brain/wiki/systems/${_WIKI_SLUG}.md"
+  else
+    echo ""
+    echo "WARN: wiki auto-creation failed for ${_WIKI_SLUG} (non-blocking)"
+  fi
+fi
+
+echo ""
+echo "Task ready for execution:"
+echo "  brain-task-execute $TASK_ID"

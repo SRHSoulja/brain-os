@@ -1,0 +1,343 @@
+#!/bin/bash
+# brain-next-task — Autonomous task selector: returns highest-priority runnable task for an agent, respecting priority, dependencies, and deferred-lane filters
+# Usage: brain-next-task <agent> [--dry-run] [--json] [--prompt]
+#
+# Selects the highest-priority, oldest task from brain/ops/tasks/queue/
+# and claims it via brain-task-claim. Does not complete tasks.
+# Respects VERDICT_GATE via brain-task-claim (not duplicated here).
+#
+# --prompt: generate a ready-to-paste execution prompt for Claude
+# --dry-run --prompt: show selection + prompt without mutating
+# --execute: claim, show prompt, ask confirmation before proceeding
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+OPS_DIR="$BRAIN/brain/ops/tasks"
+. "$TOOLS/lib/frontmatter.sh"
+
+HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+MAX_PRIORITY="${BRAIN_NEXT_TASK_MAX_PRIORITY:-}"
+declare -a ONLY_PRIORITIES=()
+if [[ -n "${BRAIN_NEXT_TASK_PRIORITIES:-}" ]]; then
+  read -r -a ONLY_PRIORITIES <<< "${BRAIN_NEXT_TASK_PRIORITIES}"
+fi
+
+declare -A DEFERRED_LANES=()
+if [[ -f "$HANDOFF_REGISTRY" ]]; then
+  while IFS= read -r lane_id; do
+    [[ -n "$lane_id" ]] && DEFERRED_LANES["$lane_id"]=1
+  done < <(python3 - "$HANDOFF_REGISTRY" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+for lane in data.get('lanes', []):
+    if lane.get('status') == 'deferred':
+        lane_id = lane.get('id', '')
+        if lane_id:
+            print(lane_id)
+PYEOF
+  )
+fi
+
+AGENT=""
+DRY_RUN=false
+JSON_MODE=false
+PROMPT_MODE=false
+EXECUTE_MODE=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --json)    JSON_MODE=true ;;
+    --prompt)  PROMPT_MODE=true ;;
+    --execute) EXECUTE_MODE=true; PROMPT_MODE=true ;;
+    -*)        echo "Unknown flag: $arg"; exit 1 ;;
+    *)         [[ -z "$AGENT" ]] && AGENT="$arg" ;;
+  esac
+done
+
+if [[ -z "$AGENT" ]]; then
+  echo "Usage: brain-next-task <agent> [--dry-run] [--json] [--prompt]"
+  echo "Example: brain-next-task claude-code"
+  echo "         brain-next-task claude-code --dry-run --prompt"
+  exit 1
+fi
+
+agent_alias() {
+  case "$1" in
+    claude-code|claude) echo "claude" ;;
+    codex) echo "codex" ;;
+    gemini) echo "gemini" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+title_target_agent() {
+  local title="${1:-}"
+  local head="${title:0:80}"
+  case "$head" in
+    *Gemini*|*gemini*) echo "gemini" ;;
+    *Codex*|*codex*) echo "codex" ;;
+    *Claude*|*claude*) echo "claude" ;;
+    *) echo "" ;;
+  esac
+}
+
+priority_rank() {
+  case "${1:-P2}" in
+    P0) echo 0 ;;
+    P1) echo 1 ;;
+    P2) echo 2 ;;
+    P3) echo 3 ;;
+    *) echo 2 ;;
+  esac
+}
+
+priority_allowed() {
+  local priority="$1"
+  if [[ ${#ONLY_PRIORITIES[@]} -gt 0 ]]; then
+    local want
+    for want in "${ONLY_PRIORITIES[@]}"; do
+      [[ "$priority" == "$want" ]] && return 0
+    done
+    return 1
+  fi
+  if [[ -n "$MAX_PRIORITY" ]]; then
+    local pr_rank max_rank
+    pr_rank=$(priority_rank "$priority")
+    max_rank=$(priority_rank "$MAX_PRIORITY")
+    (( pr_rank <= max_rank ))
+    return
+  fi
+  return 0
+}
+
+# ── Scan queue and rank by priority then age ──────────────────────
+CANDIDATES=()
+SKIPPED_REASONS=()
+
+for f in "$OPS_DIR"/queue/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  fname=$(basename "$f" .md)
+
+  tid=$(fm_get "$f" "task_id")
+  priority=$(fm_get "$f" "priority")
+  created=$(fm_get "$f" "created")
+  title=$(grep '^# ' "$f" 2>/dev/null | head -1 | sed 's/^# //')
+  depends_on=$(fm_get "$f" "depends_on")
+  lane_id=$(fm_get "$f" "handoff_lane_id")
+
+  if [[ -n "$tid" && "$tid" != "$fname" ]]; then
+    echo "Warning: skipping $fname (task_id mismatch: $tid)" >&2
+    continue
+  fi
+
+  # ── Eligibility checks ─────────────────────────────────────
+  # 0. Status — only "queued" tasks are claimable. "parked" tasks stay in queue/ but are not eligible.
+  task_status=$(fm_get "$f" "status")
+  if [[ -n "$task_status" && "$task_status" != "queued" ]]; then
+    SKIPPED_REASONS+=("$fname: status=$task_status (not queued)")
+    continue
+  fi
+
+  # 1. Authority owner — skip human-owned tasks
+  auth_owner=$(grep '\*\*authority_owner:\*\*' "$f" 2>/dev/null | head -1 | sed 's/.*\*\*authority_owner:\*\* *//' || true)
+  if [[ -n "$auth_owner" && "$auth_owner" != "claude-code" && "$auth_owner" != "$AGENT" ]]; then
+    SKIPPED_REASONS+=("$fname: authority_owner=$auth_owner (requires human)")
+    continue
+  fi
+
+  # 1b. Agent routing — skip tasks explicitly targeted at another agent
+  target_agent=$(title_target_agent "$title")
+  if [[ -n "$target_agent" ]]; then
+    my_agent=$(agent_alias "$AGENT")
+    if [[ "$target_agent" != "$my_agent" ]]; then
+      SKIPPED_REASONS+=("$fname: routed to $target_agent (current agent=$AGENT)")
+      continue
+    fi
+  fi
+
+  # 2. Dependency check — skip if depends_on task is not completed
+  if [[ -n "$depends_on" && "$depends_on" != '""' ]]; then
+    if [[ ! -f "$OPS_DIR/completed/${depends_on}.md" ]]; then
+      SKIPPED_REASONS+=("$fname: depends on $depends_on (not completed)")
+      continue
+    fi
+  fi
+
+  # 2b. Deferred-lane seed filtering — skip tasks seeded from deferred lanes
+  if [[ -n "$lane_id" && -n "${DEFERRED_LANES[$lane_id]:-}" ]]; then
+    SKIPPED_REASONS+=("$fname: seeded from deferred lane $lane_id")
+    continue
+  fi
+
+  # 2c. Priority filters from the caller
+  if ! priority_allowed "$priority"; then
+    if [[ ${#ONLY_PRIORITIES[@]} -gt 0 ]]; then
+      SKIPPED_REASONS+=("$fname: priority=$priority not in explicit filter")
+    else
+      SKIPPED_REASONS+=("$fname: priority=$priority exceeds max-priority=$MAX_PRIORITY")
+    fi
+    continue
+  fi
+
+  # ── Ranking ─────────────────────────────────────────────────
+  case "$priority" in
+    P1) rank=1 ;;
+    P2) rank=2 ;;
+    P3) rank=3 ;;
+    *)  rank=9; echo "Warning: $fname has unknown priority '$priority' — treated as lowest" >&2 ;;
+  esac
+
+  [[ -z "$created" ]] && created="9999-99-99"
+  CANDIDATES+=("${rank}|${created}|${fname}|${title}|${priority}")
+done
+
+# ── Empty queue or no eligible tasks ──────────────────────────────
+if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+  if $JSON_MODE; then
+    echo '{"status":"empty","message":"No eligible tasks in queue"}'
+  else
+    if [[ ${#SKIPPED_REASONS[@]} -gt 0 ]]; then
+      echo "No eligible tasks in queue. Skipped:"
+      for reason in "${SKIPPED_REASONS[@]}"; do
+        echo "  - $reason"
+      done
+    else
+      echo "No tasks in queue."
+    fi
+  fi
+  exit 0
+fi
+
+# ── Sort and select ───────────────────────────────────────────────
+SORTED=$(printf '%s
+' "${CANDIDATES[@]}" | sort -t'|' -k1,1n -k2,2 -k3,3)
+BEST=$(echo "$SORTED" | head -1)
+IFS='|' read -r _rank _created BEST_ID BEST_TITLE BEST_PRIORITY <<< "$BEST"
+
+# ── Build execution prompt ────────────────────────────────────────
+_build_prompt() {
+  local task_id="$1" task_file="$2"
+  cat <<PROMPT_EOF
+Read the task file at \`$task_file\` and execute it.
+
+Task: $task_id
+
+Rules:
+- Follow the Description, Inputs, and Success Criteria exactly
+- Respect all Brain safety and lifecycle rules (VERDICT_GATE, atomic writes, locking)
+- Do not modify files outside the task scope without asking
+- When finished, complete the task with:
+  brain-task-complete $task_id --by $AGENT --output "<summary>" --notes "<notes>" --impact "<metric>:<before>:<after>"
+
+Return:
+1. Files changed
+2. Implementation summary
+3. Validation results
+4. Completion output
+PROMPT_EOF
+}
+
+# ── Dry run ───────────────────────────────────────────────────────
+if $DRY_RUN; then
+  TASK_FILE="brain/ops/tasks/queue/$BEST_ID.md"
+  if $JSON_MODE; then
+    PROMPT_TEXT=$(_build_prompt "$BEST_ID" "$TASK_FILE")
+    python3 - "$BEST_ID" "$BEST_TITLE" "$BEST_PRIORITY" "$TASK_FILE" "${#CANDIDATES[@]}" "$PROMPT_TEXT" <<'PYEOF'
+import json, sys
+tid, title, priority, qf, qs, prompt = sys.argv[1:7]
+print(json.dumps({
+    "status": "dry-run",
+    "task_id": tid,
+    "title": title,
+    "priority": priority,
+    "queue_file": qf,
+    "queue_size": int(qs),
+    "generated_prompt": prompt
+}, indent=2))
+PYEOF
+  else
+    echo "Dry run — would claim:"
+    echo "  Task: $BEST_ID"
+    echo "  Title: $BEST_TITLE"
+    echo "  Priority: $BEST_PRIORITY"
+    echo "  Queue size: ${#CANDIDATES[@]}"
+    if $PROMPT_MODE; then
+      echo ""
+      echo "Execution prompt:"
+      echo "---"
+      _build_prompt "$BEST_ID" "$TASK_FILE"
+      echo "---"
+    fi
+  fi
+  exit 0
+fi
+
+# ── Claim via brain-task-claim ────────────────────────────────────
+CLAIM_OUTPUT=$("$TOOLS/bin/brain-task-claim" "$BEST_ID" "$AGENT" 2>&1) || {
+  CLAIM_RC=$?
+  if $JSON_MODE; then
+    ESCAPED=$(echo "$CLAIM_OUTPUT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")
+    echo "{"status":"blocked","task_id":"$BEST_ID","reason":$ESCAPED}"
+  else
+    echo "$CLAIM_OUTPUT"
+  fi
+  exit $CLAIM_RC
+}
+
+# ── Success output ────────────────────────────────────────────────
+ACTIVE_FILE="brain/ops/tasks/active/$BEST_ID.md"
+if $JSON_MODE; then
+  if $PROMPT_MODE; then
+    PROMPT_TEXT=$(_build_prompt "$BEST_ID" "$ACTIVE_FILE")
+  else
+    PROMPT_TEXT=""
+  fi
+  python3 - "$BEST_ID" "$BEST_TITLE" "$BEST_PRIORITY" "$ACTIVE_FILE" "$AGENT" "$((${#CANDIDATES[@]} - 1))" "$PROMPT_TEXT" <<'PYEOF'
+import json, sys
+tid, title, priority, af, agent, rq, prompt = sys.argv[1:8]
+d = {
+    "status": "claimed",
+    "task_id": tid,
+    "title": title,
+    "priority": priority,
+    "active_file": af,
+    "agent": agent,
+    "remaining_queue": int(rq)
+}
+if prompt:
+    d["generated_prompt"] = prompt
+print(json.dumps(d, indent=2))
+PYEOF
+else
+  echo "Claimed next task:"
+  echo "  $BEST_ID"
+  echo "  Title: $BEST_TITLE"
+  echo "  Priority: $BEST_PRIORITY"
+  echo "  Active file: $ACTIVE_FILE"
+  echo "  Remaining in queue: $((${#CANDIDATES[@]} - 1))"
+  echo "  Next: Open and execute $BEST_ID"
+  if $PROMPT_MODE; then
+    echo ""
+    echo "Execution prompt:"
+    echo "---"
+    _build_prompt "$BEST_ID" "$ACTIVE_FILE"
+    echo "---"
+    if $EXECUTE_MODE; then
+      echo ""
+      read -rp "Execute this task? [y/N] " confirm
+      if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "Proceeding with $BEST_ID..."
+        echo "Paste the prompt above into Claude, or read the task file to begin."
+      else
+        echo "Aborted. Task remains claimed in active/."
+      fi
+    fi
+  fi
+fi

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# codex wrapper: in gmgn-brain, launch with bypass mode + codex seat claim
+set -euo pipefail
+
+# WSLg clipboard workaround (see memory: reference_wslg_x11_clipboard_broken.md)
+unset DISPLAY
+
+# Resolve the real codex binary dynamically via PATH.
+REAL_CODEX="$(PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$HOME/bin\$" | paste -sd:)" command -v codex || true)"
+if [[ -z "$REAL_CODEX" ]]; then
+  echo "codex binary not found" >&2
+  exit 127
+fi
+
+if [[ "${CODEX_NO_WRAP:-0}" == "1" ]]; then
+  exec "$REAL_CODEX" "$@"
+fi
+
+# Pass-through for non-interactive flags
+case "${1:-}" in
+  --version|--help|-h|update)
+    exec "$REAL_CODEX" "$@"
+    ;;
+esac
+
+if [[ "$PWD" == ${BRAIN_DIR:-$HOME/brain}* ]]; then
+  # Skip entry/bootstrap if called via brain-subagent-dispatch
+  if [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]]; then
+    exec "$REAL_CODEX" "$@"
+  fi
+
+  HUD_TTY="$(tty 2>/dev/null || true)"
+  
+  if [[ -z "${BRAIN_SESSION_PID:-}" ]]; then
+    if command -v brain-codex-enter >/dev/null 2>&1; then
+      brain-codex-enter >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if command -v brain-codex-progress-checkpoint >/dev/null 2>&1; then
+    brain-codex-progress-checkpoint --watch --pid $$ --interval 300 --quiet >/dev/null 2>&1 &
+  fi
+  if command -v brain-codex-hud-watch >/dev/null 2>&1; then
+    brain-codex-hud-watch --pid $$ --cwd-prefix "$PWD" --interval 15 --tty "$HUD_TTY" --quiet >/dev/null 2>&1 &
+  fi
+  exec "$REAL_CODEX" --yolo "$@"
+fi
+
+exec "$REAL_CODEX" "$@"

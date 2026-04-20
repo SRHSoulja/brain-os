@@ -1,0 +1,186 @@
+#!/bin/bash
+# brain-sandbox — Run scripts with outbound HTTP intercepted and logged
+# NEVER silently falls back to live mode. Exit nonzero on any interception failure.
+#
+# Usage:
+#   brain-sandbox php <script> [args...]     — run PHP with HTTP intercepted
+#   brain-sandbox node <script> [args...]    — run Node.js with HTTP intercepted
+#   brain-sandbox cron                       — run full cron suite in sandbox
+#
+# All intercepted requests are logged to:
+#   - Per-run log: /tmp/brain-sandbox-run.log (reset each run)
+#   - Master log:  work/logs/sandbox-log.md (append-only)
+
+set -euo pipefail
+
+TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LIB_DIR="$TOOLS_DIR/lib"
+BRAIN="$HOME/gmgn-brain"
+MASTER_LOG="$BRAIN/work/logs/sandbox-log.md"
+RUN_LOG="/tmp/brain-sandbox-run.log"
+NOW_DISPLAY=$(date '+%Y-%m-%d %I:%M %p %Z')
+
+PHP_PREPEND="$LIB_DIR/sandbox-php-prepend.php"
+NODE_PRELOAD="$LIB_DIR/sandbox-node-preload.mjs"
+
+# ── Init ─────────────────────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+  echo "Usage:"
+  echo "  brain-sandbox php <script> [args...]     — PHP with HTTP intercepted"
+  echo "  brain-sandbox node <script> [args...]    — Node.js with HTTP intercepted"
+  echo "  brain-sandbox cron                       — full cron suite in sandbox"
+  exit 1
+fi
+
+RUNTIME="$1"
+shift
+
+# Reset per-run log
+> "$RUN_LOG"
+
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║  SANDBOX MODE ACTIVE — No real HTTP requests will send  ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+
+# ── Init master log ─────────────────────────────────────────────────
+mkdir -p "$(dirname "$MASTER_LOG")"
+if [[ ! -f "$MASTER_LOG" ]]; then
+  cat > "$MASTER_LOG" << 'EOF'
+---
+title: "Sandbox Log"
+type: "reference"
+status: "active"
+---
+
+# Sandbox Log
+
+Append-only log of brain-sandbox runs. Each entry shows what was intercepted.
+
+EOF
+fi
+
+# ── Append to master log ────────────────────────────────────────────
+append_master_log() {
+  local script="$1"
+  local exit_code="$2"
+
+  {
+    echo "## $NOW_DISPLAY — $RUNTIME $script"
+    echo ""
+    if [[ "$exit_code" -eq 0 ]]; then
+      echo "**Result:** SUCCESS (exit 0)"
+    else
+      echo "**Result:** EXIT $exit_code"
+    fi
+    echo ""
+    local intercept_count
+    intercept_count=$(grep -c 'INTERCEPTED' "$RUN_LOG" 2>/dev/null || true)
+    intercept_count=$(echo "$intercept_count" | tr -d '[:space:]')
+    intercept_count=${intercept_count:-0}
+    echo "**Intercepted requests:** $intercept_count"
+    echo ""
+    if [[ "$intercept_count" -gt 0 ]]; then
+      echo '```'
+      cat "$RUN_LOG"
+      echo '```'
+    fi
+    echo ""
+  } >> "$MASTER_LOG"
+}
+
+# ── PHP sandbox ─────────────────────────────────────────────────────
+run_php() {
+  local script="$1"
+  shift
+
+  if [[ ! -f "$script" ]]; then
+    echo "Error: PHP script not found: $script"
+    exit 1
+  fi
+
+  if [[ ! -f "$PHP_PREPEND" ]]; then
+    echo "Error: PHP prepend file not found: $PHP_PREPEND"
+    exit 1
+  fi
+
+  echo "[SANDBOX] Running: php $script $*"
+  echo "[SANDBOX] Prepend: $PHP_PREPEND"
+  echo "[SANDBOX] curl functions disabled, HTTP streams intercepted"
+  echo ""
+
+  local exit_code=0
+  BRAIN_SANDBOX=1 BRAIN_SANDBOX_LOG="$RUN_LOG" \
+    php \
+    -d "auto_prepend_file=$PHP_PREPEND" \
+    -d "disable_functions=curl_init,curl_exec,curl_multi_exec,curl_multi_init" \
+    "$script" "$@" || exit_code=$?
+
+  echo ""
+  echo "[SANDBOX] PHP script exited with code $exit_code"
+  local intercept_count
+  intercept_count=$(grep -c 'INTERCEPTED' "$RUN_LOG" 2>/dev/null || true)
+  intercept_count=${intercept_count:-0}
+  echo "[SANDBOX] Intercepted $intercept_count request(s)"
+
+  append_master_log "$script" "$exit_code"
+  return $exit_code
+}
+
+# ── Node.js sandbox ─────────────────────────────────────────────────
+run_node() {
+  local script="$1"
+  shift
+
+  if [[ ! -f "$script" ]]; then
+    echo "Error: Node script not found: $script"
+    exit 1
+  fi
+
+  if [[ ! -f "$NODE_PRELOAD" ]]; then
+    echo "Error: Node preload file not found: $NODE_PRELOAD"
+    exit 1
+  fi
+
+  echo "[SANDBOX] Running: node $script $*"
+  echo "[SANDBOX] Preload: $NODE_PRELOAD"
+  echo "[SANDBOX] fetch + http/https intercepted"
+  echo ""
+
+  local exit_code=0
+  BRAIN_SANDBOX=1 BRAIN_SANDBOX_LOG="$RUN_LOG" \
+    node --import "$NODE_PRELOAD" "$script" "$@" || exit_code=$?
+
+  echo ""
+  echo "[SANDBOX] Node script exited with code $exit_code"
+  local intercept_count
+  intercept_count=$(grep -c 'INTERCEPTED' "$RUN_LOG" 2>/dev/null || true)
+  intercept_count=${intercept_count:-0}
+  echo "[SANDBOX] Intercepted $intercept_count request(s)"
+
+  append_master_log "$script" "$exit_code"
+  return $exit_code
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────
+case "$RUNTIME" in
+  php)
+    if [[ $# -lt 1 ]]; then
+      echo "Usage: brain-sandbox php <script.php> [args...]"
+      exit 1
+    fi
+    run_php "$@"
+    ;;
+  node)
+    if [[ $# -lt 1 ]]; then
+      echo "Usage: brain-sandbox node <script.js> [args...]"
+      exit 1
+    fi
+    run_node "$@"
+    ;;
+  *)
+    echo "Unknown runtime: $RUNTIME"
+    echo "Supported: php, node"
+    exit 1
+    ;;
+esac

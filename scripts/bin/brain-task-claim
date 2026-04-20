@@ -1,0 +1,278 @@
+#!/bin/bash
+# brain-task-claim — Claim a task from the ops queue with verdict gate + lock
+# Usage: brain-task-claim <TASK-ID> <agent-name> [estimate-minutes] [branch]
+#
+# Reads task from queue/, writes modified version to active/ atomically.
+# Queue files are NEVER modified in place.
+# Enforces: VERDICT_GATE, per-task lock, source/destination guards.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+. "$TOOLS/lib/frontmatter.sh"
+
+# ── Parse arguments ───────────────────────────────────────────────
+# Canonical style: positional for TASK-ID, --by for agent (flag or positional).
+# Positional agent is supported for backward compat.
+# Both invocation styles are equivalent:
+#   brain-task-claim TASK-ID agent-name [estimate-minutes] [branch]
+#   brain-task-claim TASK-ID --by agent-name [--estimate N] [--branch name]
+TASK_ID=""
+AGENT=""
+ESTIMATE_FLAG=""
+BRANCH_FLAG=""
+_POSITIONALS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by)       AGENT="$2"; shift 2 ;;
+    --estimate) ESTIMATE_FLAG="$2"; shift 2 ;;
+    --branch)   BRANCH_FLAG="$2"; shift 2 ;;
+    -*)         echo "Error: unknown flag: $1"; echo "Usage: brain-task-claim <TASK-ID> [--by <agent>] [--estimate <minutes>] [--branch <name>]"; exit 1 ;;
+    *)          _POSITIONALS+=("$1"); shift ;;
+  esac
+done
+
+TASK_ID="${_POSITIONALS[0]:-}"
+# Positional agent only if --by not given
+[[ -z "$AGENT" ]] && AGENT="${_POSITIONALS[1]:-}"
+
+if [[ -z "$TASK_ID" || -z "$AGENT" ]]; then
+  echo "Usage: brain-task-claim <TASK-ID> <agent-name> [estimate-minutes] [branch]"
+  echo "       brain-task-claim <TASK-ID> --by <agent-name> [--estimate <minutes>] [--branch <name>]"
+  echo "Example: brain-task-claim TASK-2026-03-15-002 claude-code 30"
+  echo "         brain-task-claim TASK-2026-03-15-002 --by claude-code --estimate 30"
+  exit 1
+fi
+
+# Validate estimate early (before filesystem checks) so bad args fail fast
+_EARLY_ESTIMATE="${ESTIMATE_FLAG:-${_POSITIONALS[2]:-}}"
+if [[ -n "$_EARLY_ESTIMATE" ]] && ! [[ "$_EARLY_ESTIMATE" =~ ^[0-9]+$ ]]; then
+  echo "Error: estimate-minutes must be numeric, got: '$_EARLY_ESTIMATE'"
+  echo "Usage: brain-task-claim <TASK-ID> <agent-name> [estimate-minutes] [branch]"
+  exit 1
+fi
+
+# ── Early existence check (before gate, to fail fast) ─────────────
+TASK_FILE="$OPS_DIR/queue/${TASK_ID}.md"
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID not found in queue/"
+  echo "Available tasks:"
+  ls "$OPS_DIR/queue/"TASK-*.md 2>/dev/null | xargs -I{} basename {} .md || echo "  (none)"
+  exit 1
+fi
+
+# ── VERDICT GATE ──────────────────────────────────────────────────
+. "$TOOLS/lib/verdict-gate.sh"
+verdict_read
+
+if ! verdict_gate_allow; then
+  echo ""
+  verdict_gate_message "task claim"
+  exit 1
+fi
+[[ "$_V_STATUS" == "STALE" ]] && verdict_gate_message "task claim"
+
+# ── ACQUIRE LOCK ──────────────────────────────────────────────────
+. "$TOOLS/lib/task-lock.sh"
+
+if ! task_lock_acquire "$TASK_ID" "claim" "$AGENT"; then
+  exit 1
+fi
+
+# Cleanup trap: release lock + remove temp on any failure
+ACTIVE_TMP=""
+cleanup() {
+  [[ -n "$ACTIVE_TMP" ]] && rm -f "$ACTIVE_TMP"
+  task_lock_cleanup
+}
+trap cleanup EXIT
+
+# ── SOURCE GUARDS (inside lock) ───────────────────────────────────
+# Re-check source — another agent may have claimed it between our
+# early check and lock acquisition
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID was claimed by another agent (queue file gone)"
+  exit 1
+fi
+
+# Destination must not exist
+ACTIVE_TARGET="$OPS_DIR/active/${TASK_ID}.md"
+if [[ -f "$ACTIVE_TARGET" ]]; then
+  echo "Error: $TASK_ID already exists in active/ — cannot claim"
+  exit 1
+fi
+
+# Validate source frontmatter
+SRC_TASK_ID=$(fm_get "$TASK_FILE" "task_id")
+SRC_STATUS=$(fm_get "$TASK_FILE" "status")
+SRC_OWNER=$(fm_get "$TASK_FILE" "owner")
+SRC_LANE_ID=$(fm_get "$TASK_FILE" "handoff_lane_id")
+
+# Frontmatter existence
+if ! fm_has_frontmatter "$TASK_FILE"; then
+  echo "Error: $TASK_ID has no frontmatter (missing opening ---)"
+  exit 1
+fi
+
+# task_id matches filename
+if [[ "$SRC_TASK_ID" != "$TASK_ID" ]]; then
+  echo "Error: task_id in file ($SRC_TASK_ID) does not match filename ($TASK_ID)"
+  exit 1
+fi
+
+# Status must be queued
+if [[ "$SRC_STATUS" != "queued" ]]; then
+  echo "Error: $TASK_ID has status=$SRC_STATUS (must be queued)"
+  exit 1
+fi
+
+# Owner must be unassigned
+if [[ "$SRC_OWNER" != "unassigned" ]]; then
+  echo "Error: $TASK_ID has owner=$SRC_OWNER (must be unassigned)"
+  exit 1
+fi
+
+# Must have been admitted through brain-task-admit (has admitted_at stamp)
+SRC_ADMITTED=$(fm_get "$TASK_FILE" "admitted_at")
+if [[ -z "$SRC_ADMITTED" ]]; then
+  echo "Error: $TASK_ID has no admitted_at stamp — must enter queue through brain-task-admit"
+  echo "Direct writes to queue/ without admission metadata are noncompliant drift."
+  exit 1
+fi
+
+# ── WRITE TEMP + VALIDATE ─────────────────────────────────────────
+ACTIVE_TMP=$(mktemp "$OPS_DIR/active/.${TASK_ID}.md.XXXXXX")
+
+CLAIMED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# --estimate flag takes precedence over positional [2]
+ESTIMATE="${ESTIMATE_FLAG:-${_POSITIONALS[2]:-}}"
+# Validate estimate is numeric if provided (TASK-111 defense-in-depth)
+if [[ -n "$ESTIMATE" ]] && ! [[ "$ESTIMATE" =~ ^[0-9]+$ ]]; then
+  echo "Error: estimate-minutes must be numeric, got: '$ESTIMATE'"
+  echo "Usage: brain-task-claim <TASK-ID> <agent-name> [estimate-minutes] [branch]"
+  exit 1
+fi
+# --branch flag takes precedence over positional [3]
+CLAIM_BRANCH="${BRANCH_FLAG:-${_POSITIONALS[3]:-$(git -C "$BRAIN" branch --show-current 2>/dev/null || true)}}"
+[[ -z "$CLAIM_BRANCH" ]] && CLAIM_BRANCH="detached"
+
+python3 - "$TASK_FILE" "$ACTIVE_TMP" "$AGENT" "$CLAIMED_AT" "$ESTIMATE" "$CLAIM_BRANCH" <<'PYEOF'
+import re, sys
+
+task_file, out_file, agent, claimed_at, estimate, branch = sys.argv[1:7]
+
+with open(task_file, 'r') as f:
+    content = f.read()
+
+content = re.sub(r'^owner:.*$', 'owner: "' + agent + '"', content, flags=re.MULTILINE)
+content = re.sub(r'^status:.*$', 'status: "active"', content, flags=re.MULTILINE)
+
+# Inject claimed_at timestamp into frontmatter (before closing ---)
+lines = content.split('\n')
+new_lines = []
+in_fm = False
+fm_count = 0
+injected = False
+for line in lines:
+    if line.strip() == '---':
+        fm_count += 1
+        if fm_count == 2 and not injected:
+            new_lines.append(f'claimed_at: "{claimed_at}"')
+            if estimate:
+                new_lines.append(f'estimate_minutes: {estimate}')
+            if branch:
+                new_lines.append(f'branch: "{branch}"')
+            injected = True
+    new_lines.append(line)
+content = '\n'.join(new_lines)
+
+with open(out_file, 'w') as f:
+    f.write(content)
+PYEOF
+
+if [[ ! -s "$ACTIVE_TMP" ]]; then
+  echo "Error: failed to write modified task to active/"
+  exit 1
+fi
+
+# ── UPDATE LANE METADATA (best effort before final claim) ─────────
+if [[ -n "$SRC_LANE_ID" && -f "$HANDOFF_REGISTRY" ]]; then
+  python3 - "$HANDOFF_REGISTRY" "$SRC_LANE_ID" "$AGENT" "$CLAIM_BRANCH" <<'PYEOF'
+import json
+import sys
+from datetime import date
+
+registry_path, lane_id, owner, branch = sys.argv[1:5]
+with open(registry_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+for lane in data.get('lanes', []):
+    if lane.get('id') == lane_id:
+        lane['owner'] = owner
+        lane['branch'] = branch
+        data['updated'] = date.today().isoformat()
+        with open(registry_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+        break
+else:
+    raise SystemExit(f'Error: lane_id not found in registry: {lane_id}')
+PYEOF
+fi
+
+# Validate transformed output
+TMP_STATUS=$(fm_get "$ACTIVE_TMP" "status")
+TMP_OWNER=$(fm_get "$ACTIVE_TMP" "owner")
+TMP_TASK_ID=$(fm_get "$ACTIVE_TMP" "task_id")
+
+if [[ "$TMP_STATUS" != "active" ]]; then
+  echo "Error: transformed task has status=$TMP_STATUS (expected active)"
+  exit 1
+fi
+if [[ "$TMP_OWNER" != "$AGENT" ]]; then
+  echo "Error: transformed task has owner=$TMP_OWNER (expected $AGENT)"
+  exit 1
+fi
+if [[ "$TMP_TASK_ID" != "$TASK_ID" ]]; then
+  echo "Error: task_id changed during transform ($TMP_TASK_ID != $TASK_ID)"
+  exit 1
+fi
+
+# ── ATOMIC RENAME + SOURCE DELETE ─────────────────────────────────
+mv "$ACTIVE_TMP" "$ACTIVE_TARGET"
+ACTIVE_TMP=""  # prevent cleanup from deleting renamed file
+
+# Verify destination exists before removing source
+if [[ ! -f "$ACTIVE_TARGET" ]]; then
+  echo "Error: destination file missing after rename — aborting source deletion"
+  exit 1
+fi
+
+# Use git rm if inside a git repo so the deletion is tracked in version control.
+# Plain rm leaves the file in git history, and syncs/merges can resurrect it.
+if git -C "$(dirname "$TASK_FILE")" rev-parse --is-inside-work-tree &>/dev/null; then
+  git -C "$BRAIN" rm -qf "$TASK_FILE" 2>/dev/null || rm "$TASK_FILE"
+else
+  rm "$TASK_FILE"
+fi
+
+# ── RELEASE LOCK + EVENT + OUTPUT ──────────────────────────────────
+task_lock_release "$TASK_ID"
+trap - EXIT
+
+. "$TOOLS/lib/brain-event.sh"
+brain_event TASK_CLAIM "$TASK_ID $AGENT"
+
+TITLE=$(grep '^# ' "$ACTIVE_TARGET" | head -1 | sed 's/^# //' || true)
+
+echo "Task claimed: $TASK_ID"
+echo "  Title: $TITLE"
+echo "  Owner: $AGENT"
+echo "  Branch: $CLAIM_BRANCH"
+echo "  Status: active"
+echo "  Verdict: $_V_STATUS"

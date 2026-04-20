@@ -1,0 +1,289 @@
+#!/bin/bash
+# brain-checkpoint — Capture mid-session working state to survive compaction
+# Usage:
+#   brain-checkpoint "about to do risky migration"
+#   brain-checkpoint auto    — silent, time-based or context-aware
+#   brain-checkpoint watch   — monitor context usage and auto-checkpoint
+#
+# Output: work/inbox/checkpoints/YYYY-MM-DD-HHMMSS.md
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+CHECKPOINT_DIR="$BRAIN/work/inbox/checkpoints"
+TIMESTAMP=$(date +%Y-%m-%d-%H%M%S)
+DISPLAY_TIME=$(date '+%Y-%m-%d %I:%M %p %Z')
+OUTPUT="$CHECKPOINT_DIR/${TIMESTAMP}.md"
+LOCKFILE="/tmp/brain-checkpoint.lock"
+CONTEXT_THRESHOLD=80  # percent of context window that triggers checkpoint
+
+mkdir -p "$CHECKPOINT_DIR"
+
+# ── Context awareness helpers ─────────────────────────────────────────
+context_pct() {
+  # Returns context usage percentage, or empty string if unavailable
+  if [[ -n "${CLAUDE_CONTEXT_TOKENS:-}" ]]; then
+    local limit="${CLAUDE_CONTEXT_WINDOW:-200000}"
+    echo $(( CLAUDE_CONTEXT_TOKENS * 100 / limit ))
+  fi
+}
+
+should_checkpoint_by_context() {
+  local pct
+  pct=$(context_pct)
+  [[ -n "$pct" ]] && (( pct >= CONTEXT_THRESHOLD ))
+}
+
+# ── Args ─────────────────────────────────────────────────────────────
+MODE="manual"
+NOTE=""
+case "${1:-}" in
+  auto)
+    MODE="auto"
+    # Context-aware: checkpoint immediately if context > 80%, skip time throttle
+    if should_checkpoint_by_context 2>/dev/null; then
+      NOTE="auto: context at $(context_pct)%"
+    else
+      # Fall back to time-based throttle: skip if last checkpoint < 30 minutes old
+      if compgen -G "$CHECKPOINT_DIR/*.md" > /dev/null 2>&1; then
+        latest=$(ls -t "$CHECKPOINT_DIR"/*.md 2>/dev/null | head -1 || true)
+        if [[ -n "$latest" ]]; then
+          age=$(( $(date +%s) - $(stat -c %Y "$latest") ))
+          if (( age < 1800 )); then
+            exit 0  # Silent skip — too recent
+          fi
+        fi
+      fi
+    fi
+    ;;
+  watch)
+    # Monitor context and checkpoint when it gets large
+    # Runs in a loop, checks every 60s, exits after checkpoint or 4h
+    echo "[brain-checkpoint watch] Monitoring context usage (threshold: ${CONTEXT_THRESHOLD}%)"
+    MAX_ITERATIONS=240  # 4 hours at 60s intervals
+    for (( i=1; i<=MAX_ITERATIONS; i++ )); do
+      pct=$(context_pct)
+      if [[ -n "$pct" ]]; then
+        if (( pct >= CONTEXT_THRESHOLD )); then
+          echo "[brain-checkpoint watch] Context at ${pct}% — triggering checkpoint"
+          exec "$0" "auto-watch: context at ${pct}%"
+        fi
+        # Log every 10 minutes
+        if (( i % 10 == 0 )); then
+          echo "[brain-checkpoint watch] Context at ${pct}% (${i}m elapsed)"
+        fi
+      else
+        # No context info available — fall back to time-based auto
+        if (( i % 30 == 0 )); then
+          echo "[brain-checkpoint watch] No context data — running time-based checkpoint"
+          "$0" auto
+        fi
+      fi
+      sleep 60
+    done
+    echo "[brain-checkpoint watch] Max duration reached, exiting"
+    exit 0
+    ;;
+  "")
+    echo "Usage: brain-checkpoint \"reason for checkpoint\""
+    echo "       brain-checkpoint auto       Time-based or context-aware"
+    echo "       brain-checkpoint watch      Monitor context and auto-checkpoint"
+    exit 1
+    ;;
+  *)
+    NOTE="$1"
+    ;;
+esac
+
+# ── Use flock to prevent overlapping runs ────────────────────────────
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  [[ "$MODE" == "auto" ]] && exit 0
+  echo "[brain-checkpoint] Another checkpoint is already running."
+  exit 1
+fi
+
+# ── Helpers ──────────────────────────────────────────────────────────
+repo_status() {
+  local repo_path="$1"
+  local repo_name="$2"
+
+  if [[ ! -d "$repo_path/.git" ]]; then
+    echo "### $repo_name"
+    echo "_Not a git repo or not found._"
+    echo ""
+    return
+  fi
+
+  local branch changed untracked last_commit ahead
+  branch=$(cd "$repo_path" && git branch --show-current 2>/dev/null || echo "detached")
+  changed=$(cd "$repo_path" && git diff --stat 2>/dev/null | tail -1)
+  untracked=$(cd "$repo_path" && git ls-files --others --exclude-standard 2>/dev/null | head -10)
+  last_commit=$(cd "$repo_path" && git log --oneline -1 2>/dev/null || echo "none")
+
+  # Check if ahead of remote
+  ahead=""
+  local tracking
+  tracking=$(cd "$repo_path" && git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || echo "")
+  if [[ -n "$tracking" ]]; then
+    local ahead_count
+    ahead_count=$(cd "$repo_path" && git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo "0")
+    if [[ "$ahead_count" -gt 0 ]]; then
+      ahead="**$ahead_count commit(s) ahead of remote**"
+    fi
+  fi
+
+  echo "### $repo_name"
+  echo "- **Branch:** $branch"
+  echo "- **Last commit:** $last_commit"
+  [[ -n "$changed" ]] && echo "- **Changed:** $changed" || echo "- **Changed:** none"
+  if [[ -n "$untracked" ]]; then
+    echo "- **Untracked:**"
+    echo "$untracked" | sed 's/^/  - /'
+  fi
+  [[ -n "$ahead" ]] && echo "- $ahead"
+  echo ""
+}
+
+# ── Session pace ────────────────────────────────────────────────────
+SESSION_FILE="$HOME/.brain-session-start"
+PACE="unknown"
+ELAPSED_DISPLAY="unknown"
+if [[ -f "$SESSION_FILE" ]]; then
+  start=$(cat "$SESSION_FILE")
+  elapsed=$(( $(date +%s) - start ))
+  hours=$(( elapsed / 3600 ))
+  mins=$(( (elapsed % 3600) / 60 ))
+  ELAPSED_DISPLAY="${hours}h ${mins}m"
+
+  if (( elapsed < 3600 )); then
+    PACE="Early session — exploring"
+  elif (( elapsed < 7200 )); then
+    PACE="Mid session — focused"
+  elif (( elapsed < 10800 )); then
+    PACE="Long session — be decisive"
+  else
+    PACE="Very long session — compaction risk"
+  fi
+fi
+
+# ── Active context snapshot ─────────────────────────────────────────
+FOCUS=""
+ACTIVE_CONTEXT="$BRAIN/brain/index/active-context.md"
+if [[ -f "$ACTIVE_CONTEXT" ]]; then
+  FOCUS=$(sed -n '/^## Current Focus Areas$/,/^##/{ /^##/d; p; }' "$ACTIVE_CONTEXT" | sed '/^$/d')
+fi
+
+# ── Priority queue snapshot ─────────────────────────────────────────
+PRIORITY=""
+PQUEUE="$BRAIN/work/logs/priority-queue.md"
+if [[ -f "$PQUEUE" ]]; then
+  p1=$(sed -n '/^## P1/,/^##/{/^##/d;/^_None_/d;/^$/d;p;}' "$PQUEUE")
+  p2=$(sed -n '/^## P2/,/^##/{/^##/d;/^_None_/d;/^$/d;p;}' "$PQUEUE")
+  if [[ -n "$p1" || -n "$p2" ]]; then
+    [[ -n "$p1" ]] && PRIORITY="**P1:** $p1"
+    [[ -n "$p2" ]] && PRIORITY="${PRIORITY:+$PRIORITY\n}**P2:** $p2"
+  fi
+fi
+
+# ── Repo states ─────────────────────────────────────────────────────
+REPO_STATES=""
+for repo_entry in \
+  "$HOME/gmgn-brain|gmgn-brain" \
+  "$HOME/gmgn-brain/scripts|tools" \
+  "$HOME/2026Projects/clip-the-intern|clip-the-intern" \
+  "$HOME/2026Projects/xbot|xbot" \
+  "$HOME/2026Projects/strikes|strikes" \
+  "$HOME/2026Projects/arcbot|arcbot" \
+; do
+  rpath="${repo_entry%%|*}"
+  rname="${repo_entry##*|}"
+  REPO_STATES+="$(repo_status "$rpath" "$rname")
+"
+done
+
+# ── Auto-detect active task ──────────────────────────────────────────
+ACTIVE_TASK_DIR="$BRAIN/brain/ops/tasks/active"
+ACTIVE_TASK="none"
+if compgen -G "$ACTIVE_TASK_DIR/TASK-*.md" > /dev/null 2>&1; then
+  latest_task=$(ls -t "$ACTIVE_TASK_DIR"/TASK-*.md 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_task" ]]; then
+    ACTIVE_TASK=$(basename "$latest_task" .md)
+  fi
+fi
+
+# ── Auto-detect active proof run ─────────────────────────────────────
+PROOF_RUN_DIR="$BRAIN/brain/ops/proof-execution/runs"
+ACTIVE_PROOF="none"
+if [[ -d "$PROOF_RUN_DIR" ]]; then
+  latest_proof=$(ls -t "$PROOF_RUN_DIR"/*.jsonl 2>/dev/null | head -1 || true)
+  if [[ -n "$latest_proof" ]]; then
+    ACTIVE_PROOF=$(basename "$latest_proof" .jsonl)
+  fi
+fi
+
+# ── Write checkpoint ────────────────────────────────────────────────
+cat > "$OUTPUT" << EOF
+---
+title: "Session Checkpoint"
+type: "auto-generated"
+generated: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mode: "$MODE"
+---
+
+# Session Checkpoint — $DISPLAY_TIME
+
+$(if [[ -n "$NOTE" ]]; then echo "**Reason:** $NOTE"; echo ""; fi)
+## Session State
+
+- **Elapsed:** $ELAPSED_DISPLAY
+- **Pace:** $PACE
+$(pct=$(context_pct); if [[ -n "$pct" ]]; then echo "- **Context:** ${pct}% used"; fi)
+$(if [[ -n "$PRIORITY" ]]; then echo -e "- $PRIORITY"; fi)
+
+## Current Focus
+
+$FOCUS
+
+## Repo States
+
+$REPO_STATES
+
+## Restore Contract
+
+> **Auto-detected fields** are read from live filesystem state at checkpoint time.
+> **Fill-in fields** are set by the agent before taking the checkpoint; auto-checkpoints
+> emit [unset — operator must confirm] when not supplied.
+
+- **active_task:** $ACTIVE_TASK
+- **active_proof_run:** $ACTIVE_PROOF
+- **active_lane:** [unset — operator must confirm]
+- **closed_lanes:** [unset — operator must confirm]
+- **pending_decisions:** [unset — operator must confirm]
+- **next_step:** [unset — operator must confirm]
+- **stop_conditions:** [unset — operator must confirm]
+
+### Restore Sequence (for post-/clear or post-compaction recovery)
+
+1. Read this checkpoint file (trust: git state, reason, all Restore Contract fields above)
+2. Read \`brain/index/session-resume.md\` live — never trust checkpoint focus as current
+3. Read \`brain/ops/derived/state-verdict.json\` live — if stale (>5 min), warn before any mutation
+4. Verify active task live: \`ls brain/ops/tasks/active/\` — checkpoint active_task may be stale
+5. Present restore briefing: \`Restored from [filename] | Lane: [active_lane] | Task: [active_task] | Next: [next_step] | Pending: [pending_decisions] | Verdict: [OK/WARN/DRIFT]\`
+6. Proceed with next_step unless operator corrects it
+
+**Do not** re-read \`claude-refresh-handoff.md\` on restore — that is SessionStart-only.
+
+---
+
+_This checkpoint captures git state at the moment it was taken. After compaction or /clear, read this file to recover what was in progress, what had uncommitted changes, and what was ahead of remote._
+EOF
+
+if [[ "$MODE" == "manual" ]]; then
+  echo "[brain-checkpoint] Saved to $OUTPUT"
+  echo "  Elapsed: $ELAPSED_DISPLAY | Pace: $PACE"
+  # Count repos with changes
+  changed_repos=$(grep -c '^\- \*\*Changed:\*\* [^n]' "$OUTPUT" 2>/dev/null || echo "0")
+  ahead_repos=$(grep -c 'ahead of remote' "$OUTPUT" 2>/dev/null || echo "0")
+  echo "  Repos with changes: $changed_repos | Ahead of remote: $ahead_repos"
+fi

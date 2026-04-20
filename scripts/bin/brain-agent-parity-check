@@ -1,0 +1,148 @@
+#!/bin/bash
+# brain-agent-parity-check — Detect drift in agent seat entry configuration
+# Usage: brain-agent-parity-check [--json]
+
+set -euo pipefail
+
+JSON_MODE=false
+[[ "${1:-}" == "--json" ]] && JSON_MODE=true
+
+ERRORS=()
+WARNINGS=()
+
+check_alias() {
+  local agent="$1"
+  local expected="$2"
+  if ! grep -q "alias ${agent}='${expected}'" ~/.bashrc; then
+    ERRORS+=("ALIAS_DRIFT|${agent}|Alias missing or incorrect in ~/.bashrc (expected: ${expected})")
+  fi
+}
+
+check_wrapper() {
+  local name="$1"
+  local path="$HOME/bin/${name}"
+  local pattern="$2"
+  if [[ ! -f "$path" ]]; then
+    ERRORS+=("WRAPPER_MISSING|${name}|Wrapper script missing at ${path}")
+  elif ! grep -q -e "$pattern" "$path"; then
+    ERRORS+=("WRAPPER_DRIFT|${name}|Wrapper at ${path} is missing required logic: ${pattern}")
+  fi
+}
+
+check_symlink_target() {
+  local path="$1"
+  local expected="$2"
+  if [[ ! -L "$path" ]]; then
+    ERRORS+=("LINK_DRIFT|$(basename "$path")|Expected symlink at $path -> $expected")
+    return
+  fi
+  local resolved
+  resolved="$(readlink -f "$path" 2>/dev/null || true)"
+  if [[ "$resolved" != "$expected" ]]; then
+    ERRORS+=("LINK_DRIFT|$(basename "$path")|Symlink target drift at $path (got: $resolved, want: $expected)")
+  fi
+}
+
+check_tool_mirror() {
+  local name="$1"
+  local tools_path="$HOME/bin/${name}"
+  local repo_path="${BRAIN_DIR:-$HOME/brain}/scripts/bin/${name}"
+  if [[ ! -f "$tools_path" || ! -f "$repo_path" ]]; then
+    ERRORS+=("MIRROR_MISSING|${name}|Missing mirrored tool copy (tools=$tools_path repo=$repo_path)")
+    return
+  fi
+  local tools_hash repo_hash
+  tools_hash="$(sha256sum "$tools_path" | awk '{print $1}')"
+  repo_hash="$(sha256sum "$repo_path" | awk '{print $1}')"
+  if [[ "$tools_hash" != "$repo_hash" ]]; then
+    ERRORS+=("MIRROR_DRIFT|${name}|tools/bin and scripts/bin differ for ${name}")
+  fi
+}
+
+check_tool_mirror_set() {
+  local mirrors=(
+    brain-agent-bootstrap
+    brain-agent-swap
+    brain-checksums
+    brain-closeout-gate
+    brain-content-brief
+    brain-content-pipeline
+    brain-dispatch
+    brain-fix-frontmatter
+    brain-memory-maintain
+    brain-next-focus
+    brain-post-preflight
+    brain-publish-gate
+    brain-resume
+    brain-seat-usage-snapshot
+    brain-session-digest
+    brain-secret
+    brain-secret-server
+    brain-state-check
+    brain-subagent-dispatch
+    brain-task-archive
+    brain-task-complete
+    brain-wiki
+  )
+  local t
+  for t in "${mirrors[@]}"; do
+    check_tool_mirror "$t"
+  done
+}
+
+check_symlink_exec() {
+  local name="$1"
+  shift
+  local path="$HOME/bin/${name}"
+  if [[ ! -x "$path" ]]; then
+    ERRORS+=("SYMLINK_EXEC_MISSING|${name}|Expected executable wrapper at ${path}")
+    return
+  fi
+  local _rc
+  timeout 10 "$path" "$@" >/dev/null 2>&1 || _rc=$?
+  if [[ "${_rc:-0}" -eq 124 ]]; then
+    ERRORS+=("SYMLINK_EXEC_TIMEOUT|${name}|Wrapper execution timed out via ${path} (args: $*)")
+  elif [[ "${_rc:-0}" -ne 0 ]]; then
+    ERRORS+=("SYMLINK_EXEC_FAIL|${name}|Wrapper execution failed via ${path} (args: $*)")
+  fi
+}
+
+# 1. Check .bashrc aliases — raw CLI names must NOT be aliased; brain-* names must exist
+check_alias "brain-claude" "brain-session --agent claude"
+check_alias "brain-codex" "brain-session --agent codex"
+check_alias "brain-gemini" "brain-session --agent gemini"
+
+# 2. Check brain-session bootstrap call
+if ! grep -q "brain-agent-bootstrap" $HOME/bin/brain-session; then
+  ERRORS+=("SESSION_DRIFT|brain-session|brain-session is missing universal bootstrap call")
+fi
+
+# 3. Check wrappers
+check_wrapper "codex" "--yolo"
+check_wrapper "codex" "brain-codex-enter"
+check_wrapper "gemini" "--approval-mode=yolo"
+check_wrapper "gemini" "brain-agent-bootstrap"
+check_wrapper "claude" "BRAIN_CLAUDE_PASSTHROUGH"
+check_symlink_target "$HOME/bin/codex" "${BRAIN_DIR:-$HOME/brain}/scripts/bin/codex-wrapper"
+check_symlink_target "$HOME/bin/gemini" "${BRAIN_DIR:-$HOME/brain}/scripts/bin/gemini-wrapper"
+check_tool_mirror_set
+check_symlink_exec "brain-next-focus" --json
+
+if $JSON_MODE; then
+  python3 -c "
+import json, sys
+errors = []
+for e in sys.argv[1:]:
+    level, code, msg = e.split('|', 2)
+    errors.append({'level': 'DRIFT', 'code': code, 'message': f'[{level}] {msg}'})
+print(json.dumps(errors))
+" "${ERRORS[@]+"${ERRORS[@]}"}"
+else
+  if [[ ${#ERRORS[@]} -eq 0 ]]; then
+    echo "OK|AGENT_PARITY|All agents match canonical entry contract"
+  else
+    for e in "${ERRORS[@]}"; do
+      echo "DRIFT|${e}"
+    done
+  fi
+fi
