@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# brain-jsonl-mutate -- Atomic JSONL queue operations: append, update, move
+# Usage:
+#   brain-jsonl-mutate --op append  --file <f> --entry '{"json":"object"}'
+#   brain-jsonl-mutate --op update  --file <f> --match-field <k> --match-value <v> --set '{"field":"val"}'
+#   brain-jsonl-mutate --op find    --file <f> --match-field <k> --match-value <v>
+#   brain-jsonl-mutate --op move    --file <f> --to <f2> --match-field <k> --match-value <v> [--set '{"updates"}']
+# Exit codes: 0=success, 1=usage error, 2=not found / file error
+set -euo pipefail
+
+OP=""
+FILE=""
+TO_FILE=""
+ENTRY=""
+MATCH_FIELD=""
+MATCH_VALUE=""
+SET_JSON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --op)           OP="$2";          shift 2 ;;
+    --file)         FILE="$2";        shift 2 ;;
+    --to)           TO_FILE="$2";     shift 2 ;;
+    --entry)        ENTRY="$2";       shift 2 ;;
+    --match-field)  MATCH_FIELD="$2"; shift 2 ;;
+    --match-value)  MATCH_VALUE="$2"; shift 2 ;;
+    --set)          SET_JSON="$2";    shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$OP" || -z "$FILE" ]]; then
+  echo "Usage: brain-jsonl-mutate --op <append|update|find|move> --file <f> [options]" >&2
+  exit 1
+fi
+
+case "$OP" in
+  append)
+    [[ -z "$ENTRY" ]] && { echo "--entry required for append" >&2; exit 1; }
+    python3 - "$FILE" "$ENTRY" <<'PY'
+import json, sys
+fpath, entry_raw = sys.argv[1:]
+entry = json.loads(entry_raw)
+with open(fpath, "a") as f:
+    f.write(json.dumps(entry) + "\n")
+print(entry.get("id", "appended"))
+PY
+    ;;
+
+  find)
+    [[ -z "$MATCH_FIELD" || -z "$MATCH_VALUE" ]] && { echo "--match-field and --match-value required for find" >&2; exit 1; }
+    python3 - "$FILE" "$MATCH_FIELD" "$MATCH_VALUE" <<'PY'
+import json, sys
+fpath, field, value = sys.argv[1:]
+try:
+    with open(fpath) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            entry = json.loads(line)
+            if str(entry.get(field, "")) == value:
+                print(json.dumps(entry))
+                sys.exit(0)
+except FileNotFoundError:
+    print(f"File not found: {fpath}", file=sys.stderr)
+    sys.exit(2)
+sys.exit(2)
+PY
+    ;;
+
+  update)
+    [[ -z "$MATCH_FIELD" || -z "$MATCH_VALUE" || -z "$SET_JSON" ]] && {
+      echo "--match-field, --match-value, --set required for update" >&2; exit 1
+    }
+    python3 - "$FILE" "$MATCH_FIELD" "$MATCH_VALUE" "$SET_JSON" <<'PY'
+import json, sys
+fpath, field, value, set_raw = sys.argv[1:]
+updates = json.loads(set_raw)
+lines_out = []
+matched = False
+try:
+    with open(fpath) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            entry = json.loads(line)
+            if not matched and str(entry.get(field, "")) == value:
+                entry.update(updates)
+                matched = True
+            lines_out.append(json.dumps(entry))
+except FileNotFoundError:
+    print(f"File not found: {fpath}", file=sys.stderr)
+    sys.exit(2)
+if not matched:
+    print(f"No entry with {field}={value}", file=sys.stderr)
+    sys.exit(2)
+with open(fpath, "w") as f:
+    for l in lines_out:
+        f.write(l + "\n")
+print(f"updated {value}")
+PY
+    ;;
+
+  move)
+    [[ -z "$MATCH_FIELD" || -z "$MATCH_VALUE" || -z "$TO_FILE" ]] && {
+      echo "--match-field, --match-value, --to required for move" >&2; exit 1
+    }
+    python3 - "$FILE" "$TO_FILE" "$MATCH_FIELD" "$MATCH_VALUE" "${SET_JSON:-{\}}" <<'PY'
+import json, sys
+src, dst, field, value, set_raw = sys.argv[1:]
+updates = json.loads(set_raw)
+remaining = []
+moved = None
+try:
+    with open(src) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            entry = json.loads(line)
+            if moved is None and str(entry.get(field, "")) == value:
+                moved = entry
+            else:
+                remaining.append(json.dumps(entry))
+except FileNotFoundError:
+    print(f"Source file not found: {src}", file=sys.stderr)
+    sys.exit(2)
+if moved is None:
+    print(f"No entry with {field}={value}", file=sys.stderr)
+    sys.exit(2)
+moved.update(updates)
+with open(src, "w") as f:
+    for l in remaining:
+        f.write(l + "\n")
+with open(dst, "a") as f:
+    f.write(json.dumps(moved) + "\n")
+print(f"moved {value}")
+PY
+    ;;
+
+  *)
+    echo "Unknown op: $OP. Use: append, update, find, move" >&2
+    exit 1
+    ;;
+esac

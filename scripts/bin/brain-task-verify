@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# brain-task-verify — Automated post-task audit verification via summoned verifier
+# Usage: brain-task-verify <TASK-ID> [--by <agent>]
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+
+TASK_ID=""
+AGENT="${BRAIN_AGENT:-claude-code}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by) AGENT="$2"; shift 2 ;;
+    *)    TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: TASK-ID required" >&2
+  exit 1
+fi
+
+COMPLETED_FILE="$OPS_DIR/completed/${TASK_ID}.md"
+if [[ ! -f "$COMPLETED_FILE" ]]; then
+  echo "Error: Task $TASK_ID not found in completed/" >&2
+  exit 1
+fi
+
+# 1. Read coordination signal and dependencies from frontmatter
+FM_DATA=$(python3 -c "
+import sys, yaml, json
+try:
+    with open('$COMPLETED_FILE', 'r') as f:
+        content = f.read()
+        if '---' in content:
+            fm = yaml.safe_load(content.split('---')[1])
+            data = {
+                'coordination': fm.get('audit_coordination', 'independent'),
+                'depends_on': fm.get('depends_on', [])
+            }
+            if isinstance(data['depends_on'], str):
+                data['depends_on'] = [data['depends_on']]
+            print(json.dumps(data))
+except:
+    print(json.dumps({'coordination': 'independent', 'depends_on': []}))
+" 2>/dev/null || echo "{\"coordination\": \"independent\", \"depends_on\": []}")
+
+COORDINATION=$(echo "$FM_DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('coordination','independent'))")
+DEPENDS_ON=$(echo "$FM_DATA" | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin).get('depends_on',[])))")
+
+# 2. Check dependency status if coordination is not independent
+if [[ "$COORDINATION" != "independent" ]]; then
+  ALL_DEPS_DONE=true
+  for dep in $DEPENDS_ON; do
+    if [[ ! -f "$OPS_DIR/completed/${dep}.md" ]]; then
+      ALL_DEPS_DONE=false
+      break
+    fi
+  done
+
+  if [[ "$ALL_DEPS_DONE" == "false" ]]; then
+    if [[ "$COORDINATION" == "wait" ]]; then
+      echo "[verify] $TASK_ID set to 'wait' — skipping automated audit until dependencies ($DEPENDS_ON) are cleared."
+      exit 0
+    elif [[ "$COORDINATION" == "combined" ]]; then
+      echo "[verify] $TASK_ID requires 'combined' audit — waiting for dependencies ($DEPENDS_ON)."
+      exit 0
+    fi
+  fi
+fi
+
+# 3. Handle combined audit sequencing
+TARGET_IDS="$TASK_ID"
+if [[ "$COORDINATION" == "combined" ]]; then
+  echo "[verify] Performing COMBINED audit for $TASK_ID and its dependencies ($DEPENDS_ON)..."
+  TARGET_IDS="$TASK_ID $DEPENDS_ON"
+fi
+
+# 4. Summon verifier via repo-auditor profile
+echo "[verify] Summoning verifier for $TARGET_IDS (profile: repo-auditor)..."
+QUESTION="Please audit the completion of the following task(s): $TARGET_IDS. 
+- Verify that all criteria in each task file were met.
+- Confirm structural integrity of any artifacts touched.
+- Check if documentation (wiki, manifest) was updated.
+- For combined audits: verify the integrated behavior across all related tasks.
+- If everything looks correct, respond with 'VERIFIED'. 
+- If issues are found, list them clearly."
+
+VERIFICATION_RESULT=$("$BRAIN/scripts/bin/brain-subagent-dispatch" --profile repo-auditor --question "$QUESTION" 2>/dev/null || true)
+
+if echo "$VERIFICATION_RESULT" | grep -qi "VERIFIED"; then
+  echo "[verify] Automated audit passed for $TARGET_IDS."
+  # Clear the gate(s)
+  for tid in $TARGET_IDS; do
+    $BRAIN/scripts/bin/brain-task-confirm "$tid" --by "$AGENT" > /dev/null 2>&1 || true
+    echo "[verify] Audit gate cleared for $tid."
+  done
+else
+  echo "[verify] Automated audit FAILED or produced findings for $TARGET_IDS."
+  echo "--- VERIFIER OUTPUT ---"
+  echo "$VERIFICATION_RESULT" | jq -r '.result' 2>/dev/null || echo "$VERIFICATION_RESULT"
+  echo "--- END ---"
+  echo "Audit gate remains BLOCKED for $TASK_ID. Human review or manual confirm required."
+  exit 1
+fi

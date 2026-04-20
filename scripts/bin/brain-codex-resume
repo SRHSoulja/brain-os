@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# brain-codex-resume -- Codex startup ritual wrapper
+set -euo pipefail
+TOOLS="$HOME/bin"
+"$TOOLS/brain-codex-enter"
+"$TOOLS/brain-resume" "$@"

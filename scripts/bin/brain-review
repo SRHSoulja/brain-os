@@ -1,0 +1,364 @@
+#!/bin/bash
+# brain-review — Record inbox triage or weekly review completion
+# Usage:
+#   brain-review triage ["outcome notes"]
+#   brain-review weekly             # interactive: shows data, prompts for decisions
+#   brain-review weekly --auto "outcome"  # scripted: stamp directly (no review)
+#   brain-review status
+#
+# Updates brain/ops/review-state.md with current timestamp and optional outcome.
+# brain-review weekly without --auto requires operator to enter decisions before stamping.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+REVIEW_STATE="$BRAIN/brain/ops/review-state.md"
+REVIEW_JSON="$BRAIN/brain/ops/review-state.json"
+
+# Write/update JSON sidecar from current markdown state
+write_json_sidecar() {
+  python3 - "$REVIEW_STATE" "$REVIEW_JSON" <<'PYEOF'
+import json, re, sys
+from datetime import datetime, timezone
+
+md_path, json_path = sys.argv[1:3]
+try:
+    with open(md_path, 'r') as f:
+        content = f.read()
+except:
+    sys.exit(0)
+
+def extract(section, field):
+    pattern = rf'## {section}\n\n(?:.*\n)*?- \*\*{field}:\*\* (.*)'
+    m = re.search(pattern, content)
+    return m.group(1).strip() if m else ''
+
+data = {
+    "triage": {
+        "date": extract("Last Inbox Triage", "date"),
+        "outcome": extract("Last Inbox Triage", "outcome"),
+    },
+    "weekly": {
+        "date": extract("Last Weekly Review", "date"),
+        "outcome": extract("Last Weekly Review", "outcome"),
+        "next_due": extract("Last Weekly Review", "next_due"),
+    },
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+with open(json_path, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+}
+
+usage() {
+  echo "Usage: brain-review triage [\"outcome notes\"]"
+  echo "       brain-review weekly              # interactive structured review"
+  echo "       brain-review weekly --auto \"outcome\"  # scripted stamp (no review)"
+  echo "       brain-review status"
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+MODE="$1"
+shift
+AUTO=false
+OUTCOME=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto) AUTO=true; shift ;;
+    *)      OUTCOME="$1"; shift ;;
+  esac
+done
+NOW_DATE=$(date +%Y-%m-%d)
+NOW_DISPLAY=$(date '+%Y-%m-%d %I:%M %p %Z')
+
+# Ensure review-state file exists
+if [[ ! -f "$REVIEW_STATE" ]]; then
+  echo "Error: $REVIEW_STATE not found. Create it first."
+  exit 1
+fi
+
+case "$MODE" in
+  triage)
+    # Run inbox preprocessing first (advisory, non-blocking)
+    if command -v brain-inbox-triage &>/dev/null; then
+      echo "[brain-review] Running inbox triage..."
+      brain-inbox-triage 2>/dev/null || true
+    fi
+    [[ -z "$OUTCOME" ]] && OUTCOME="Inbox triaged"
+    # Update triage section
+    python3 - "$REVIEW_STATE" "$NOW_DISPLAY" "$OUTCOME" "$NOW_DATE" <<'PYEOF'
+import sys, re
+
+path, now, outcome, today = sys.argv[1:5]
+with open(path, 'r') as f:
+    content = f.read()
+
+# Update last_updated
+content = re.sub(r'^last_updated:.*$', f'last_updated: "{today}"', content, flags=re.MULTILINE)
+
+# Update triage date
+content = re.sub(
+    r'(## Last Inbox Triage\n\n- \*\*date:\*\* ).*',
+    r'\g<1>' + now,
+    content
+)
+# Update triage outcome
+content = re.sub(
+    r'(## Last Inbox Triage\n\n- \*\*date:\*\* .*\n- \*\*outcome:\*\* ).*',
+    r'\g<1>' + outcome,
+    content
+)
+
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+    write_json_sidecar
+    echo "[brain-review] Inbox triage recorded: $NOW_DISPLAY"
+    [[ -n "$OUTCOME" ]] && echo "  Outcome: $OUTCOME"
+    ;;
+
+  weekly)
+    # ── Interactive review when no --auto and no outcome given ──────
+    if [[ "$AUTO" == "false" && -z "$OUTCOME" ]] && [[ -t 0 ]]; then
+      echo "=== Weekly Review ==="
+      echo "Gathering data..."
+      echo ""
+
+      # Collect review data via Python
+      python3 - "$BRAIN" "$NOW_DATE" <<'PYEOF'
+import json, os, re, sys
+from datetime import datetime, timedelta, timezone
+
+brain, today_str = sys.argv[1:3]
+today = datetime.strptime(today_str, "%Y-%m-%d")
+week_ago = today - timedelta(days=7)
+
+# ── Velocity ──────────────────────────────────────────────────────
+completed_dir = os.path.join(brain, "brain/ops/tasks/completed")
+week_tasks = []
+all_completed = 0
+try:
+    for fname in os.listdir(completed_dir):
+        if not fname.endswith(".completion.json"):
+            continue
+        all_completed += 1
+        try:
+            with open(os.path.join(completed_dir, fname)) as f:
+                d = json.load(f)
+            done_on = d.get("completed_on", "")
+            if done_on >= today_str[:8].replace(today_str[5:7], "").replace("-","")[:4] + "-" + today_str[5:7] + "-" + str(week_ago.day).zfill(2):
+                if done_on >= week_ago.strftime("%Y-%m-%d"):
+                    week_tasks.append({
+                        "id": d.get("task_id", fname.replace(".completion.json","")),
+                        "summary": (d.get("completion_summary") or "")[:80],
+                        "node": d.get("node",""),
+                    })
+        except Exception:
+            pass
+except Exception:
+    pass
+
+# ── Queue health ─────────────────────────────────────────────────
+queue_dir = os.path.join(brain, "brain/ops/tasks/queue")
+active_dir = os.path.join(brain, "brain/ops/tasks/active")
+q_counts = {"P1":0,"P2":0,"P3":0,"P4":0,"total":0}
+try:
+    for fname in os.listdir(queue_dir):
+        if not fname.endswith(".md"):
+            continue
+        q_counts["total"] += 1
+        with open(os.path.join(queue_dir, fname)) as f:
+            for line in f:
+                m = re.match(r'^priority:\s*(P\d)', line)
+                if m:
+                    p = m.group(1)
+                    if p in q_counts:
+                        q_counts[p] += 1
+                    break
+except Exception:
+    pass
+active_count = 0
+try:
+    active_count = len([f for f in os.listdir(active_dir) if f.endswith(".md")])
+except Exception:
+    pass
+
+# ── Review state ─────────────────────────────────────────────────
+review_state = os.path.join(brain, "brain/ops/review-state.json")
+triage_last = "never"
+weekly_last = "never"
+try:
+    with open(review_state) as f:
+        rs = json.load(f)
+    triage_last = rs.get("triage",{}).get("date","never") or "never"
+    weekly_last = rs.get("weekly",{}).get("date","never") or "never"
+except Exception:
+    pass
+
+def age_label(date_str):
+    if date_str in ("never",""):
+        return "NEVER"
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        age = (today - d).days
+        return f"{age}d ago" if age > 0 else "today"
+    except Exception:
+        return date_str[:16]
+
+# ── Incidents ────────────────────────────────────────────────────
+incident_dir = os.path.join(brain, "work/logs/incidents")
+recent_incidents = []
+try:
+    for fname in sorted(os.listdir(incident_dir), reverse=True)[:5]:
+        if fname.endswith(".md") and fname >= week_ago.strftime("%Y-%m-%d"):
+            recent_incidents.append(fname)
+except Exception:
+    pass
+
+# ── Output ───────────────────────────────────────────────────────
+print(f"── VELOCITY (last 7 days) ──────────────────────────────")
+print(f"  Completed this week: {len(week_tasks)}  (total in system: {all_completed})")
+for t in sorted(week_tasks, key=lambda x: x["id"])[-10:]:
+    node = f" [{t['node']}]" if t['node'] else ""
+    print(f"  • {t['id']}{node}: {t['summary']}")
+print()
+print(f"── QUEUE HEALTH ────────────────────────────────────────")
+print(f"  Total queued: {q_counts['total']}  |  Active: {active_count}")
+print(f"  P1: {q_counts['P1']}  P2: {q_counts['P2']}  P3: {q_counts['P3']}  P4: {q_counts['P4']}")
+print()
+print(f"── REVIEW CADENCE ──────────────────────────────────────")
+print(f"  Last inbox triage: {age_label(triage_last)}  ({triage_last[:16]})")
+print(f"  Last weekly review: {age_label(weekly_last)}  ({weekly_last[:16]})")
+print()
+if recent_incidents:
+    print(f"── INCIDENTS (last 7 days) ──────────────────────────────")
+    for i in recent_incidents:
+        print(f"  • {i}")
+    print()
+PYEOF
+
+      echo "── STATE VERDICT ───────────────────────────────────────"
+      brain-state-check --quiet 2>/dev/null | head -5 || echo "  (state check unavailable)"
+      echo ""
+      echo "── OPERATOR DECISIONS REQUIRED ─────────────────────────"
+      echo "  Answer each before this review stamps:"
+      echo "  1. Anything on fire or overdue that needs attention this week?"
+      echo "  2. Any P2 tasks to promote or defer?"
+      echo "  3. Revenue / distribution actions needed?"
+      echo "  4. Any process gaps surfaced that need a task?"
+      echo "  5. What is the #1 focus for next week?"
+      echo ""
+      printf "Enter decisions/notes (required — cannot stamp blank):\n> "
+      read -r OUTCOME </dev/tty
+      if [[ -z "$OUTCOME" ]]; then
+        echo "Error: outcome required. Weekly review not stamped."
+        exit 1
+      fi
+    elif [[ "$AUTO" == "false" && -z "$OUTCOME" ]]; then
+      # Non-interactive (piped/scripted) with no outcome — require --auto flag
+      echo "Error: brain-review weekly requires operator input or --auto flag in non-interactive mode."
+      echo "  Interactive: brain-review weekly"
+      echo "  Scripted:    brain-review weekly --auto \"outcome\""
+      exit 1
+    fi
+
+    [[ -z "$OUTCOME" ]] && OUTCOME="Weekly review completed (scripted)"
+    NEXT_DUE=$(date -d "+7 days" +%Y-%m-%d)
+
+    python3 - "$REVIEW_STATE" "$NOW_DISPLAY" "$OUTCOME" "$NEXT_DUE" "$NOW_DATE" <<'PYEOF'
+import sys, re
+
+path, now, outcome, next_due, today = sys.argv[1:6]
+with open(path, 'r') as f:
+    content = f.read()
+
+content = re.sub(r'^last_updated:.*$', f'last_updated: "{today}"', content, flags=re.MULTILINE)
+content = re.sub(
+    r'(## Last Weekly Review\n\n- \*\*date:\*\* ).*',
+    r'\g<1>' + now,
+    content
+)
+content = re.sub(
+    r'(## Last Weekly Review\n\n- \*\*date:\*\* .*\n- \*\*outcome:\*\* ).*',
+    r'\g<1>' + outcome,
+    content
+)
+content = re.sub(
+    r'(- \*\*next_due:\*\* ).*',
+    r'\g<1>' + next_due,
+    content
+)
+
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+    write_json_sidecar
+    echo "[brain-review] Weekly review recorded: $NOW_DISPLAY"
+    echo "  Outcome: $OUTCOME"
+    echo "  Next due: $NEXT_DUE"
+    ;;
+
+  status)
+    # Ensure JSON sidecar exists (create from markdown if missing)
+    [[ ! -f "$REVIEW_JSON" ]] && write_json_sidecar
+    echo "=== Review State ==="
+    # Parse and display
+    python3 - "$REVIEW_STATE" <<'PYEOF'
+import sys, re
+from datetime import datetime, timedelta
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+def extract(section, field):
+    pattern = rf'## {section}\n\n(?:.*\n)*?- \*\*{field}:\*\* (.*)'
+    m = re.search(pattern, content)
+    return m.group(1) if m else '_unknown_'
+
+def freshness(date_str):
+    if date_str.startswith('_') or date_str == 'never':
+        return 'NEVER'
+    try:
+        # Parse the display format: 2026-03-16 10:30 AM EDT
+        dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
+        age = (datetime.now() - dt).days
+        if age == 0:
+            return 'TODAY'
+        elif age <= 1:
+            return f'{age}d ago'
+        elif age <= 7:
+            return f'{age}d ago'
+        else:
+            return f'{age}d ago — OVERDUE'
+    except:
+        return date_str
+
+triage_date = extract('Last Inbox Triage', 'date')
+triage_outcome = extract('Last Inbox Triage', 'outcome')
+weekly_date = extract('Last Weekly Review', 'date')
+weekly_outcome = extract('Last Weekly Review', 'outcome')
+next_due = extract('Last Weekly Review', 'next_due')
+
+print(f'Inbox Triage:  {freshness(triage_date)}')
+print(f'  Last: {triage_date}')
+print(f'  Outcome: {triage_outcome}')
+print()
+print(f'Weekly Review: {freshness(weekly_date)}')
+print(f'  Last: {weekly_date}')
+print(f'  Outcome: {weekly_outcome}')
+print(f'  Next due: {next_due}')
+PYEOF
+    ;;
+
+  *)
+    usage
+    ;;
+esac

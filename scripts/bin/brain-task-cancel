@@ -1,0 +1,147 @@
+#!/bin/bash
+# brain-task-cancel — Cancel a queued, active, or completed task
+# Usage: brain-task-cancel <TASK-ID> --by <agent> --reason <reason>
+#
+# Moves task to completed/ with status: cancelled. Fills Results section.
+# Emits TASK_CANCEL event. Writes amendment log if source was already in completed/.
+
+set -euo pipefail
+
+BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+TOOLS="$BRAIN/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+. "$TOOLS/lib/frontmatter.sh"
+. "$TOOLS/lib/brain-event.sh"
+
+TASK_ID=""
+CANCELLED_BY="${BRAIN_AGENT:-}"
+REASON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by)     CANCELLED_BY="$2"; shift 2 ;;
+    --reason) REASON="$2"; shift 2 ;;
+    *)
+      if [[ "$1" =~ ^TASK- ]]; then
+        TASK_ID="$1"; shift
+      else
+        echo "Error: unknown argument: $1"
+        echo "Usage: brain-task-cancel <TASK-ID> --by <agent> --reason <reason>"
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" || -z "$CANCELLED_BY" || -z "$REASON" ]]; then
+  echo "Error: TASK-ID, --by, and --reason are all required"
+  echo "Usage: brain-task-cancel <TASK-ID> --by <agent> --reason <reason>"
+  exit 1
+fi
+
+TODAY=$(date +%Y-%m-%d)
+COMPLETED_DIR="$OPS_DIR/completed"
+COMPLETED_TARGET="$COMPLETED_DIR/${TASK_ID}.md"
+AMENDMENT_DIR="$BRAIN/work/logs/post-completion-amendments"
+
+# ── Locate source file ─────────────────────────────────────────────
+SOURCE_FILE=""
+SOURCE_LOC=""
+for loc in queue active completed; do
+  candidate="$OPS_DIR/$loc/${TASK_ID}.md"
+  if [[ -f "$candidate" ]]; then
+    SOURCE_FILE="$candidate"
+    SOURCE_LOC="$loc"
+    break
+  fi
+done
+
+if [[ -z "$SOURCE_FILE" ]]; then
+  echo "Error: $TASK_ID not found in queue/, active/, or completed/"
+  exit 1
+fi
+
+echo "Cancelling $TASK_ID from $SOURCE_LOC/ ..."
+
+# ── Build cancelled version ────────────────────────────────────────
+CANCEL_TMP=$(mktemp "$COMPLETED_DIR/.${TASK_ID}.cancel.XXXXXX")
+python3 - "$SOURCE_FILE" "$CANCEL_TMP" "$CANCELLED_BY" "$TODAY" "$REASON" <<'PYEOF'
+import re, sys
+
+src, dst, agent, today, reason = sys.argv[1:6]
+with open(src, 'r') as f:
+    content = f.read()
+
+lines = content.split('\n')
+
+# Update status in frontmatter
+updated = []
+fm_end = -1
+found_first = False
+for i, line in enumerate(lines):
+    if line.strip() == '---':
+        if not found_first:
+            found_first = True
+        else:
+            fm_end = i
+    if fm_end < 0 and re.match(r'^status:', line):
+        updated.append('status: cancelled')
+        continue
+    updated.append(line)
+
+lines = updated
+
+# Fill Results section if present
+results_idx = next((i for i, l in enumerate(lines) if l.strip() == '## Results'), -1)
+if results_idx >= 0:
+    new_results = [
+        '## Results',
+        '',
+        f'- **Completed by:** {agent}',
+        f'- **Completed on:** {today}',
+        f'- **Output:** Cancelled: {reason}',
+    ]
+    # Find end of Results block (next ## or EOF)
+    end_idx = len(lines)
+    for j in range(results_idx + 1, len(lines)):
+        if lines[j].startswith('## ') and j > results_idx:
+            end_idx = j
+            break
+    lines = lines[:results_idx] + new_results + [''] + lines[end_idx:]
+
+with open(dst, 'w') as f:
+    f.write('\n'.join(lines))
+PYEOF
+
+if [[ ! -s "$CANCEL_TMP" ]]; then
+  rm -f "$CANCEL_TMP"
+  echo "Error: failed to write cancelled task"
+  exit 1
+fi
+
+# ── Amendment log if source was already in completed/ ─────────────
+if [[ "$SOURCE_LOC" == "completed" ]]; then
+  mkdir -p "$AMENDMENT_DIR"
+  cat >> "$AMENDMENT_DIR/${TASK_ID}.md" << AEOF
+
+## Cancel amendment — $TODAY
+
+- **Amended by:** $CANCELLED_BY
+- **Reason:** $REASON
+- **Previous status:** $(fm_get "$SOURCE_FILE" "status" 2>/dev/null || echo "unknown")
+AEOF
+  echo "  Amendment log: $AMENDMENT_DIR/${TASK_ID}.md"
+fi
+
+# ── Atomic move to completed/ ──────────────────────────────────────
+mv "$CANCEL_TMP" "$COMPLETED_TARGET"
+[[ "$SOURCE_LOC" != "completed" ]] && rm -f "$SOURCE_FILE"
+
+# ── Event ──────────────────────────────────────────────────────────
+brain_event "TASK_CANCEL" "$TASK_ID $CANCELLED_BY $REASON"
+
+echo "Cancelled: $TASK_ID → completed/ (status: cancelled)"
+echo "  Cancelled by: $CANCELLED_BY"
+echo "  Reason: $REASON"

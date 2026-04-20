@@ -1,0 +1,23 @@
+#!/bin/bash
+# brain-meditate-restart -- Seal session and signal auto-restart
+# Usage: brain-meditate-restart ["reason"]
+#
+# Use this when running inside a 'brain-session' wrapper to 
+# automate the restart after state is sealed.
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS_BIN="$HOME/bin"
+
+echo "=== Meditation Ritual (Automated) ==="
+
+# Step 1: Run the universal meditate seal first.
+echo "  [1/2] Running universal meditate seal..."
+"$TOOLS_BIN/brain-meditate" "$@"
+
+# Step 2: Signal restart
+touch "$BRAIN_DIR/brain/ops/.session-restart"
+
+echo ""
+echo "=== State sealed. Signal sent to brain-session. ==="
+echo "Exit now to trigger auto-restart."
+echo ""

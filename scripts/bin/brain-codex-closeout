@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# brain-codex-closeout -- Seal Codex session boundary with usage snapshot, progress checkpoint, parity close, and seat return.
+# Usage:
+#   brain-codex-closeout "reason"
+set -euo pipefail
+
+TOOLS="$HOME/bin"
+PARITY_CLOSE="$HOME/bin/brain-handoff-parity-gate"
+REASON="${*:-codex session closed}"
+
+"$TOOLS/brain-codex-usage-snapshot" --cwd-prefix "$HOME/gmgn-brain" --quiet >/dev/null
+"$TOOLS/brain-codex-progress-checkpoint" --stage closeout --reason "$REASON" --quiet >/dev/null
+
+if [[ -x "$PARITY_CLOSE" ]]; then
+  bash "$PARITY_CLOSE" close >/dev/null
+fi
+
+"$TOOLS/brain-seat-claim" --seat laptop --assistant claude --mode interactive >/dev/null
+"$TOOLS/brain-heartbeat" >/dev/null
+
+echo "codex-closeout: complete"

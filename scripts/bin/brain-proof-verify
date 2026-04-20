@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# brain-proof-verify -- Verify a proof-of-execution run and write summary verdict
+# Usage: brain-proof-verify --run RUN_ID [--allowed-surfaces "path1,path2"]
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
+INDEX_DIR="$BRAIN/brain/ops/proof-execution/index"
+PROOF_DIR="$BRAIN/brain/ops/proof-execution"
+
+RUN_ID=""
+ALLOWED_SURFACES=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run) RUN_ID="$2"; shift 2 ;;
+    --allowed-surfaces) ALLOWED_SURFACES="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$RUN_ID" ]]; then
+  echo "Usage: brain-proof-verify --run RUN_ID [--allowed-surfaces 'path1,path2']" >&2
+  exit 1
+fi
+
+RUN_FILE="$RUNS_DIR/${RUN_ID}.jsonl"
+SUMMARY_FILE="$RUNS_DIR/${RUN_ID}.summary.json"
+
+if [[ ! -f "$RUN_FILE" ]]; then
+  echo "Run file not found: $RUN_FILE" >&2
+  exit 1
+fi
+
+python3 - "$RUN_FILE" "$SUMMARY_FILE" "$ALLOWED_SURFACES" "$PROOF_DIR" <<'PYVERIFY'
+import base64
+import json, sys, hashlib
+import os
+from datetime import datetime, timezone
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+
+run_file = sys.argv[1]
+summary_file = sys.argv[2]
+allowed_raw = sys.argv[3] if len(sys.argv) > 3 else ""
+proof_dir = sys.argv[4]
+
+allowed_surfaces = [s.strip() for s in allowed_raw.split(",") if s.strip()] if allowed_raw else []
+
+events = []
+parse_errors = 0
+with open(run_file) as f:
+    for i, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            parse_errors += 1
+
+if not events:
+    print("FAIL: no events in run file")
+    sys.exit(1)
+
+first = events[0]
+run_id = first.get("run_id", "unknown")
+task_id = first.get("task_id", "unknown")
+executor = first.get("executor", "unknown")
+started_at = first.get("ts", "")
+schema_version = first.get("schema_version", "legacy-v1")
+signer_id = first.get("signer_id")
+
+# Compute evidence hash (sha256 of normalized jsonl content)
+with open(run_file, "rb") as f:
+    evidence_hash = hashlib.sha256(f.read()).hexdigest()
+
+# Count commands and failures
+commands_total = 0
+commands_failed = 0
+files_touched = set()
+ended_at = events[-1].get("ts", "")
+receipts_total = 0
+chain_valid = True
+tamper_detected = False
+replay_detected = False
+signature_failures = 0
+chain_head = None
+chain_tail = None
+receipt_hashes = []
+seen_receipt_ids = set()
+seen_receipt_hashes = set()
+legacy_mode = False
+prev_hash = None
+
+for idx, ev in enumerate(events):
+    etype = ev.get("event", "")
+    payload = ev.get("payload", {})
+    if etype == "command":
+        commands_total += 1
+        if payload.get("exit_code", 0) != 0:
+            commands_failed += 1
+    elif etype == "file_write":
+        path = payload.get("path", "")
+        if path:
+            files_touched.add(path)
+
+    receipt_hash = ev.get("receipt_hash")
+    receipt_id = ev.get("receipt_id")
+    payload_hash = ev.get("payload_hash")
+    if receipt_hash is None or receipt_id is None or payload_hash is None:
+        legacy_mode = True
+        continue
+
+    receipts_total += 1
+    chain_head = chain_head or receipt_hash
+    chain_tail = receipt_hash
+    receipt_hashes.append(receipt_hash)
+
+    if receipt_id in seen_receipt_ids or receipt_hash in seen_receipt_hashes:
+        replay_detected = True
+    seen_receipt_ids.add(receipt_id)
+    seen_receipt_hashes.add(receipt_hash)
+
+    expected_payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if expected_payload_hash != payload_hash:
+        tamper_detected = True
+
+    expected_prev = None if idx == 0 else prev_hash
+    if ev.get("prev_receipt_hash") != expected_prev:
+        chain_valid = False
+
+    receipt_basis = {
+        "schema_version": ev.get("schema_version", schema_version),
+        "run_id": ev.get("run_id"),
+        "task_id": ev.get("task_id"),
+        "executor": ev.get("executor"),
+        "actor": ev.get("actor"),
+        "signer_id": ev.get("signer_id"),
+        "event": ev.get("event"),
+        "sequence": ev.get("sequence"),
+        "receipt_id": ev.get("receipt_id"),
+        "prev_receipt_hash": ev.get("prev_receipt_hash"),
+        "payload_hash": ev.get("payload_hash"),
+        "ts": ev.get("ts"),
+    }
+    expected_receipt_hash = hashlib.sha256(json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if expected_receipt_hash != receipt_hash:
+        tamper_detected = True
+
+    sig_alg = ev.get("signature_alg")
+    sig_b64 = ev.get("signature_b64")
+    signer = ev.get("signer_id")
+    registry_path = os.path.join(proof_dir, "keys", "registry.json")
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+        key_meta = registry.get(signer)
+        if not key_meta or sig_alg != "ed25519" or not sig_b64:
+            signature_failures += 1
+        else:
+            with open(key_meta["public_key"], "rb") as f:
+                public_key = serialization.load_pem_public_key(f.read())
+            public_key.verify(base64.b64decode(sig_b64), json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode())
+    except (InvalidSignature, FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
+        signature_failures += 1
+    prev_hash = receipt_hash
+
+# Surface violation check
+surface_violations = []
+if allowed_surfaces:
+    for fpath in files_touched:
+        if not any(fpath.startswith(s) for s in allowed_surfaces):
+            surface_violations.append(fpath)
+
+# Determine verdict
+if legacy_mode:
+    chain_valid = None
+elif tamper_detected or replay_detected or chain_valid is False or signature_failures > 0:
+    verdict = "FAIL"
+    status = "failed"
+elif parse_errors > 0:
+    verdict = "FAIL"
+    status = "failed"
+elif commands_failed > 0 and commands_failed == commands_total:
+    verdict = "FAIL"
+    status = "failed"
+elif surface_violations:
+    verdict = "FAIL"
+    status = "failed"
+elif commands_failed > 0:
+    verdict = "WARN"
+    status = "completed"
+else:
+    verdict = "PASS"
+    status = "completed"
+
+summary = {
+    "schema_version": schema_version,
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "signer_id": signer_id,
+    "started_at": started_at,
+    "ended_at": ended_at,
+    "status": status,
+    "commands_total": commands_total,
+    "commands_failed": commands_failed,
+    "files_touched": sorted(files_touched),
+    "allowed_write_surfaces": allowed_surfaces,
+    "surface_violations": surface_violations,
+    "receipts_total": receipts_total,
+    "chain_valid": chain_valid,
+    "chain_head": chain_head,
+    "chain_tail": chain_tail,
+    "tamper_detected": tamper_detected,
+    "replay_detected": replay_detected,
+    "signature_failures": signature_failures,
+    "evidence_hash": evidence_hash,
+    "verified_by": "brain-proof-verify",
+    "verdict": verdict
+}
+
+with open(summary_file, "w") as f:
+    json.dump(summary, f, indent=2)
+
+# Update latest index
+import os
+index_file = os.path.join(os.path.dirname(os.path.dirname(summary_file)), "index", "latest.json")
+latest = {
+    "schema_version": schema_version,
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "signer_id": signer_id,
+    "started_at": started_at,
+    "status": status,
+    "verdict": verdict,
+    "evidence_hash": evidence_hash,
+    "chain_valid": chain_valid,
+    "tamper_detected": tamper_detected,
+    "replay_detected": replay_detected,
+    "signature_failures": signature_failures
+}
+with open(index_file, "w") as f:
+    json.dump(latest, f, indent=2)
+
+anchors_dir = os.path.join(proof_dir, "anchors")
+os.makedirs(anchors_dir, exist_ok=True)
+receipt_root = hashlib.sha256("\n".join(receipt_hashes).encode()).hexdigest() if receipt_hashes else None
+anchor = {
+    "schema_version": schema_version,
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "signer_id": signer_id,
+    "verified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "verdict": verdict,
+    "receipt_count": receipts_total,
+    "receipt_root": receipt_root,
+    "chain_head": chain_head,
+    "chain_tail": chain_tail,
+    "evidence_hash": evidence_hash,
+    "anchor_ready": bool(receipt_root),
+}
+anchor_path = os.path.join(anchors_dir, f"{run_id}.anchor.json")
+with open(anchor_path, "w", encoding="utf-8") as f:
+    json.dump(anchor, f, indent=2)
+index_anchor_file = os.path.join(os.path.dirname(os.path.dirname(summary_file)), "index", "latest-anchor.json")
+with open(index_anchor_file, "w", encoding="utf-8") as f:
+    json.dump(anchor, f, indent=2)
+
+chain_label = "legacy" if chain_valid is None else ("ok" if chain_valid else "broken")
+print(f"{verdict} | {run_id} | cmds={commands_total} fail={commands_failed} files={len(files_touched)} violations={len(surface_violations)} receipts={receipts_total} chain={chain_label} tamper={int(tamper_detected)} replay={int(replay_detected)} sigfail={signature_failures} | hash={evidence_hash[:12]}")
+if verdict == "FAIL":
+    sys.exit(2)
+PYVERIFY

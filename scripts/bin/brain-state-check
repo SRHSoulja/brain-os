@@ -1,0 +1,548 @@
+#!/bin/bash
+# brain-state-check — detect drift between filesystem truth and documented state
+# Usage: brain-state-check [--quiet]
+#
+# Compares live filesystem state against system-state.md and session-resume.md.
+# Reports: OK, STALE, or DRIFT for each surface.
+# Exit code: 0 = all OK, 1 = drift detected, 2 = stale detected
+
+set -uo pipefail
+
+# Resolve through symlinks so ~/bin wrappers can source libs reliably.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+. "$_SELF_DIR/../lib/brain-paths.sh"
+_require_local
+TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+. "$_SELF_DIR/../lib/frontmatter.sh"
+
+BRAIN="$_BRAIN"
+SSTATE="$_SYSTEM_STATE_MD"
+RESUME="$_SESSION_RESUME"
+QUIET="${1:-}"
+DRIFT=0
+STALE=0
+CONFLICT=0
+# Structured issues: each entry is "LEVEL|CODE|MESSAGE"
+ISSUES=()
+
+now=$(date +%s)
+
+report() {
+  local status="$1" code="$2" detail="$3"
+  if [[ "$status" == "OK" ]]; then
+    [[ "$QUIET" != "--quiet" ]] && echo "  OK  $code"
+  elif [[ "$status" == "STALE" ]]; then
+    echo "  STALE  $code — $detail"
+    STALE=1
+    ISSUES+=("STALE|${code}|${detail}")
+  elif [[ "$status" == "DRIFT" ]]; then
+    echo "  DRIFT  $code — $detail"
+    DRIFT=1
+    ISSUES+=("DRIFT|${code}|${detail}")
+  elif [[ "$status" == "CONFLICT" ]]; then
+    echo "  CONFLICT  $code — $detail"
+    CONFLICT=1
+    ISSUES+=("CONFLICT|${code}|${detail}")
+  fi
+}
+
+echo "=== Brain State Check ==="
+echo ""
+
+# ── 1. session-resume.md freshness ──────────────────────────────
+RESUME_THRESHOLD=1800  # 30 minutes
+if [[ -f "$RESUME" ]]; then
+  resume_mtime=$(stat -c %Y "$RESUME")
+  resume_age=$(( now - resume_mtime ))
+  if [[ $resume_age -gt $RESUME_THRESHOLD ]]; then
+    report "STALE" "SESSION_RESUME_STALE" "session-resume.md is $(( resume_age / 60 ))m old (threshold: $(( RESUME_THRESHOLD / 60 ))m). Run brain-resume."
+  else
+    report "OK" "SESSION_RESUME_FRESH" ""
+  fi
+else
+  report "DRIFT" "SESSION_RESUME_MISSING" "session-resume.md file missing"
+fi
+
+# ── 2. Review freshness (replaces old system-state.md last_updated check) ──
+# system-state.md is now generated, so its freshness tracks brain-resume runs, not
+# human review. The real "has a human reviewed?" signal is review-state.json next_due.
+_REVIEW_JSON="$BRAIN/brain/ops/review-state.json"
+if [[ -f "$_REVIEW_JSON" ]]; then
+  _next_due=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('weekly',{}).get('next_due',''))" "$_REVIEW_JSON" 2>/dev/null || echo "")
+  if [[ -n "$_next_due" ]]; then
+    _due_epoch=$(date -d "$_next_due" +%s 2>/dev/null || echo 0)
+    if [[ $_due_epoch -gt 0 && $now -gt $_due_epoch ]]; then
+      report "STALE" "REVIEW_OVERDUE" "Weekly review overdue (next_due: $_next_due). Run brain-review weekly."
+    else
+      report "OK" "REVIEW_FRESH" ""
+    fi
+  else
+    report "OK" "REVIEW_NO_DUE" ""
+  fi
+else
+  report "OK" "REVIEW_NO_STATE" ""
+fi
+
+# ── 3. Task queue counts (filesystem is truth) ───────────────────
+OPS_DIR="$BRAIN/brain/ops/tasks"
+fs_queued=0; fs_active=0; fs_completed=0
+for f in "$OPS_DIR"/queue/TASK-*.md; do [[ -f "$f" ]] && ! grep -q '^status:[[:space:]]*parked' "$f" && fs_queued=$((fs_queued+1)); done
+for f in "$OPS_DIR"/active/TASK-*.md; do [[ -f "$f" ]] && fs_active=$((fs_active+1)); done
+declare -A _seen_completed
+for f in "$OPS_DIR"/completed/TASK-*.md \
+          "$OPS_DIR"/must_execute/TASK-*.md \
+          "$OPS_DIR"/archive/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  _tid=$(basename "$f" .md); _tid="${_tid%-DEAD}"
+  [[ -n "${_seen_completed[$_tid]+x}" ]] && continue
+  if [[ "$f" == *"/completed/"* ]]; then
+    _seen_completed[$_tid]=1; fs_completed=$((fs_completed+1))
+  else
+    grep -q '^status:[[:space:]]*"completed"' "$f" 2>/dev/null || continue
+    _seen_completed[$_tid]=1; fs_completed=$((fs_completed+1))
+  fi
+done
+unset _seen_completed
+
+# Task counts are authoritative from filesystem — written to system-state.json by this tool.
+# No comparison against markdown tables (eliminated TASK_COUNT_MISMATCH drift cycle).
+report "OK" "TASK_COUNT_LIVE" ""
+
+# ── 4b. Admission compliance: queued tasks without admitted_at ──
+_nonadmitted=0
+for f in "$OPS_DIR"/queue/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  grep -q '^status:[[:space:]]*parked' "$f" && continue
+  if ! grep -q '^admitted_at:' "$f" 2>/dev/null; then
+    _nonadmitted=$((_nonadmitted + 1))
+  fi
+done
+if [[ $_nonadmitted -gt 0 ]]; then
+  report "STALE" "UNADMITTED_QUEUED_TASKS" "$_nonadmitted queued task(s) lack admitted_at stamp — run brain-task-admit to backfill"
+fi
+
+# ── 5. Priority queue: any P1/P2 items? ─────────────────────────
+_pq_p1=$(pq_items P1)
+_pq_p2=$(pq_items P2)
+p1_live=0
+p2_live=0
+[[ -n "$_pq_p1" ]] && p1_live=$(echo "$_pq_p1" | grep -c '^\- ' || true)
+[[ -n "$_pq_p2" ]] && p2_live=$(echo "$_pq_p2" | grep -c '^\- ' || true)
+if [[ "$p1_live" -gt 0 ]]; then
+  report "DRIFT" "PRIORITY_P1_OPEN" "$p1_live P1 item(s) — check immediately"
+elif [[ "$p2_live" -gt 0 ]]; then
+  report "STALE" "PRIORITY_P2_OPEN" "$p2_live P2 item(s) pending"
+else
+  report "OK" "PRIORITY_CLEAR" ""
+fi
+
+# ── 6. Active tasks with no owner ───────────────────────────────
+for f in "$OPS_DIR"/active/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  owner=$(fm_get "$f" "owner")
+  if [[ "$owner" == "unassigned" || -z "$owner" ]]; then
+    report "DRIFT" "UNCLAIMED_ACTIVE_TASK" "$(basename "$f") is in active/ but owner=$owner"
+  fi
+done
+
+# ══════════════════════════════════════════════════════════════════
+# Phase 2: Task schema validation, immutability, authority
+# ══════════════════════════════════════════════════════════════════
+
+# Legacy alias — uses shared frontmatter parser from tools/lib/frontmatter.sh
+fm_field() {
+  fm_get "$1" "$2"
+}
+
+# ── 7. Task schema validation (via task-schema-validator.py) ─────
+SCHEMA_VALIDATOR="$_SELF_DIR/../lib/task-schema-validator.py"
+schema_issues=0
+
+if [[ -x "$SCHEMA_VALIDATOR" || -f "$SCHEMA_VALIDATOR" ]]; then
+  while IFS='|' read -r sv_level sv_code sv_message; do
+    [[ -z "$sv_level" ]] && continue
+    report "$sv_level" "$sv_code" "$sv_message"
+    schema_issues=$((schema_issues + 1))
+  done < <(python3 "$SCHEMA_VALIDATOR" "$OPS_DIR" 2>/dev/null || true)
+fi
+
+# Duplicate task_id check (cross-folder — validator checks per-file, this checks cross-file)
+declare -A SEEN_IDS
+for folder in queue active completed; do
+  for f in "$OPS_DIR"/$folder/TASK-*.md; do
+    [[ -f "$f" ]] || continue
+    fname=$(basename "$f")
+    tid=$(fm_field "$f" "task_id")
+    if [[ -n "$tid" && -n "${SEEN_IDS[$tid]:-}" ]]; then
+      report "CONFLICT" "DUPLICATE_TASK_ID" "$tid exists in both ${SEEN_IDS[$tid]} and $folder/$fname"
+    elif [[ -n "$tid" ]]; then
+      SEEN_IDS[$tid]="$folder"
+    fi
+  done
+done
+
+if [[ $schema_issues -eq 0 && ${#SEEN_IDS[@]} -gt 0 ]]; then
+  report "OK" "TASK_SCHEMA" ""
+fi
+
+# ── 8. Completed task immutability (atomic manifest update) ──────
+MANIFEST="$OPS_DIR/completed/.task-checksums"
+
+if [[ -d "$OPS_DIR/completed" ]]; then
+  immutable_ok=true
+  new_tasks=0
+  checked=0
+
+  # Load existing manifest into associative array
+  declare -A STORED_HASHES
+  if [[ -f "$MANIFEST" ]]; then
+    while IFS=' ' read -r mf_name mf_hash; do
+      [[ -n "$mf_name" && -n "$mf_hash" ]] && STORED_HASHES["$mf_name"]="$mf_hash"
+    done < "$MANIFEST"
+  fi
+
+  # Build new manifest content while checking (.md + .completion.json)
+  declare -A NEW_MANIFEST
+  for f in "$OPS_DIR"/completed/TASK-*.md "$OPS_DIR"/completed/TASK-*.completion.json; do
+    [[ -f "$f" ]] || continue
+    fname=$(basename "$f")
+    current_hash=$(sha256sum "$f" | cut -d' ' -f1)
+
+    stored_hash="${STORED_HASHES[$fname]:-}"
+    if [[ -z "$stored_hash" ]]; then
+      # New completed task
+      new_tasks=$((new_tasks + 1))
+    elif [[ "$current_hash" != "$stored_hash" ]]; then
+      # IMMUTABILITY_VIOLATION check: is there a governed repair artifact?
+      # Extract TASK-ID from filename (TASK-YYYY-MM-DD-NNN)
+      tid=$(echo "$fname" | grep -oE "TASK-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{3}")
+      amendment="$BRAIN/work/logs/post-completion-amendments/${tid}.md"
+      
+      if [[ -n "$tid" && -f "$amendment" ]]; then
+        # Condition met: Authorized Repair (Option B)
+        report "OK" "IMMUTABILITY_REPAIR_APPLIED" "$fname hash mismatch repaired via $tid amendment"
+        # Log repair to events.jsonl
+        . "$_SELF_DIR/../lib/brain-event.sh"
+        brain_event IMMUTABILITY_REPAIR_APPLIED "$fname repaired via $(basename "$amendment")"
+      else
+        # No amendment found: raise HARD violation
+        report "DRIFT" "IMMUTABILITY_VIOLATION" "$fname was modified after completion (hash mismatch and no amendment found in work/logs/post-completion-amendments/)"
+        immutable_ok=false
+      fi
+    fi
+    checked=$((checked + 1))
+    NEW_MANIFEST["$fname"]="$current_hash"
+  done
+
+  # Atomic manifest rewrite: temp + rename
+  if [[ ${#NEW_MANIFEST[@]} -gt 0 ]]; then
+    MANIFEST_TMP=$(mktemp "$OPS_DIR/completed/.task-checksums.XXXXXX")
+    for mf_name in $(echo "${!NEW_MANIFEST[@]}" | tr ' ' '\n' | sort); do
+      echo "$mf_name ${NEW_MANIFEST[$mf_name]}" >> "$MANIFEST_TMP"
+    done
+    mv "$MANIFEST_TMP" "$MANIFEST"
+  fi
+
+  if $immutable_ok; then
+    if [[ $new_tasks -gt 0 || $checked -gt 0 ]]; then
+      report "OK" "IMMUTABILITY_OK" ""
+    fi
+  fi
+fi
+
+# ── 9. Task-surface authority ───────────────────────────────────
+# Legacy work/tasks/ surface archived 2026-04-07. Ops queue at brain/ops/tasks/ is canonical.
+# This check is retained only to detect if the directory reappears (e.g., from a stale merge).
+if [[ -d "$BRAIN/work/tasks" ]] && ls "$BRAIN/work/tasks"/task-*.md &>/dev/null; then
+  report "DRIFT" "TASK_SURFACE_REAPPEARED" "work/tasks/ contains task files after archival. Investigate."
+fi
+
+# ── 10. Execution run record reconciliation ──────────────────────
+# Checks active/*.run.json for stale, orphaned, or missing run state.
+# Uses file mtime for staleness — NOT PID liveness.
+# PID/hostname remain in run records for audit but are not used for liveness.
+RUN_STALE_THRESHOLD=3600  # 60 minutes (mtime-based, not PID-based)
+run_checked=0
+
+for rf in "$OPS_DIR"/active/*.run.json; do
+  [[ -f "$rf" ]] || continue
+  run_checked=$((run_checked + 1))
+  rf_base=$(basename "$rf" .run.json)
+
+  # Parse run record status
+  _rs=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('status','?'))
+except:
+    print('?')
+" "$rf" 2>/dev/null) || _rs="?"
+
+  # Check: run record for task no longer in active/
+  if [[ ! -f "$OPS_DIR/active/${rf_base}.md" ]]; then
+    report "DRIFT" "ORPHAN_RUN_RECORD" "${rf_base}.run.json exists but ${rf_base}.md is not in active/"
+    continue
+  fi
+
+  # Check: stale run — status "executing" + file mtime older than threshold
+  # "completing" and "completed" are not flagged (transition states)
+  if [[ "$_rs" == "executing" ]]; then
+    _rf_mtime=$(stat -c %Y "$rf" 2>/dev/null || echo "$now")
+    _rf_age=$(( now - _rf_mtime ))
+    if [[ $_rf_age -gt $RUN_STALE_THRESHOLD ]]; then
+      _rl=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('launched_at','?'))" "$rf" 2>/dev/null || echo "?")
+      report "DRIFT" "STALE_RUN" "${rf_base}: executing, last modified ${_rf_age}s ago (launched $_rl)"
+    fi
+  fi
+done
+
+# Check: active tasks with TASK_EXECUTE event but no run record
+# Prefer events.jsonl (structured), fall back to events.log (legacy)
+for f in "$OPS_DIR"/active/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  fname=$(basename "$f" .md)
+  _has_execute=false
+  if [[ -s "$_EVENTS_JSONL" ]] && grep -q "\"op\":\"TASK_EXECUTE\".*\"entity_id\":\"$fname\"" "$_EVENTS_JSONL" 2>/dev/null; then
+    _has_execute=true
+  elif grep -q "TASK_EXECUTE $fname " "$_EVENTS_LOG" 2>/dev/null; then
+    _has_execute=true
+  fi
+  if $_has_execute; then
+    if [[ ! -f "$OPS_DIR/active/${fname}.run.json" ]]; then
+      report "DRIFT" "MISSING_RUN_RECORD" "$fname has TASK_EXECUTE event but no run record in active/"
+    fi
+  fi
+done
+
+if [[ $run_checked -gt 0 ]]; then
+  # Only report OK if we checked something and found no issues from this section
+  # (issues are already reported individually above)
+  :
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# ── 10b. Agent Seat Parity (unification check) ──────────────────
+if [[ -x "$_SELF_DIR/brain-agent-parity-check" ]]; then
+  while IFS="|" read -r ap_level ap_code ap_message; do
+    [[ -z "$ap_level" ]] && continue
+    report "$ap_level" "$ap_code" "$ap_message"
+  done < <("$_SELF_DIR/brain-agent-parity-check" 2>/dev/null || true)
+fi
+
+# ── 10c. Hook Parity (agent-agnostic contract) ───────────────────
+if [[ -x "$_SELF_DIR/brain-hook-parity-check" ]]; then
+  while IFS="|" read -r hp_level hp_code hp_message; do
+    [[ -z "$hp_level" ]] && continue
+    report "$hp_level" "$hp_code" "$hp_message"
+  done < <("$_SELF_DIR/brain-hook-parity-check" 2>/dev/null || true)
+fi
+
+# ── 10d. Dispatch health (discard-bug regression detection) ──────
+if [[ -x "$_SELF_DIR/brain-dispatch-health-check" ]]; then
+  while IFS="|" read -r dh_level dh_code dh_message; do
+    [[ -z "$dh_level" ]] && continue
+    report "$dh_level" "$dh_code" "$dh_message"
+  done < <("$_SELF_DIR/brain-dispatch-health-check" 2>/dev/null || true)
+fi
+
+# Phase 3: Structural consistency
+# ══════════════════════════════════════════════════════════════════
+
+# ── 11. Frontmatter consistency in key directories ────────────────
+# Checks that files in directories with expected frontmatter actually have it.
+# Reports STRUCTURAL_DRIFT (advisory, does not block operations — uses STALE level).
+_struct_issues=0
+
+_check_frontmatter_dir() {
+  local dir_path="$1" dir_label="$2" required_field="$3"
+  local total=0 missing=0 missing_files=""
+
+  for f in "$dir_path"/*.md; do
+    [[ -f "$f" ]] || continue
+    fname=$(basename "$f")
+    [[ "$fname" == "README.md" || "$fname" == "INDEX.md" || "$fname" == ".gitkeep" ]] && continue
+    total=$((total + 1))
+    # Check if file starts with --- (has frontmatter block)
+    if ! head -1 "$f" | grep -q '^---$'; then
+      missing=$((missing + 1))
+      missing_files="$missing_files $fname"
+    elif [[ -n "$required_field" ]] && ! grep -q "^${required_field}:" "$f"; then
+      missing=$((missing + 1))
+      missing_files="$missing_files $fname"
+    fi
+  done
+
+  if [[ $missing -gt 0 && $total -gt 0 ]]; then
+    local pct=$(( (missing * 100) / total ))
+    # Only report if >0 files affected (any missing frontmatter is a potential export-breaker)
+    report "STALE" "STRUCTURAL_DRIFT" "$dir_label: $missing/$total files missing frontmatter${required_field:+ or $required_field field} (${missing_files## })"
+    _struct_issues=$((_struct_issues + 1))
+  fi
+}
+
+_check_frontmatter_dir "$BRAIN/work/logs/devlog" "devlogs" "title"
+_check_frontmatter_dir "$_DIAGNOSTICS_DIR" "diagnostics" "type"
+_check_frontmatter_dir "$OPS_DIR/queue" "task-queue" "task_id"
+_check_frontmatter_dir "$OPS_DIR/active" "task-active" "task_id"
+
+if [[ $_struct_issues -eq 0 ]]; then
+  report "OK" "STRUCTURAL_OK" ""
+fi
+
+# ── Briefing field assertions (post-compaction safety) ──────────
+# Verify session-resume.md contains mandatory briefing structure.
+# Uses regex anchors and section headers, not brittle substrings.
+# Each entry: "field_id|regex_pattern"
+_BRIEFING_CHECKS=(
+  "system_health|^## System Health"
+  "suggested_action|^## Suggested First Action"
+  "tasks_summary|^- \*\*Tasks:\*\*"
+  "freshness|Freshness:\*\*"
+  "prepared_focus|Prepared Focus:\*\*"
+  "verdict|\*\*Verdict:\*\*"
+)
+_briefing_missing=()
+if [[ -f "$RESUME" ]]; then
+  for _bc in "${_BRIEFING_CHECKS[@]}"; do
+    _bf_id="${_bc%%|*}"
+    _bf_pat="${_bc#*|}"
+    if ! grep -qE "$_bf_pat" "$RESUME" 2>/dev/null; then
+      _briefing_missing+=("$_bf_id")
+    fi
+  done
+  if [[ ${#_briefing_missing[@]} -gt 0 ]]; then
+    report "STALE" "BRIEFING_FIELDS_MISSING" "session-resume.md missing: ${_briefing_missing[*]}"
+  else
+    report "OK" "BRIEFING_FIELDS_OK" ""
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# Verdict: determine status, write files, print summary
+# ══════════════════════════════════════════════════════════════════
+
+VERDICT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ISSUE_COUNT=${#ISSUES[@]}
+
+# Severity order: CONFLICT > DRIFT > STALE > OK
+if [[ $CONFLICT -gt 0 ]]; then
+  VERDICT="CONFLICT"
+  SUMMARY="${ISSUE_COUNT} issue(s) detected. Authority conflict present."
+  EXIT_CODE=1
+elif [[ $DRIFT -gt 0 ]]; then
+  VERDICT="DRIFT"
+  SUMMARY="${ISSUE_COUNT} issue(s) detected."
+  EXIT_CODE=1
+elif [[ $STALE -gt 0 ]]; then
+  VERDICT="STALE"
+  SUMMARY="${ISSUE_COUNT} issue(s) detected."
+  EXIT_CODE=2
+else
+  VERDICT="OK"
+  SUMMARY="All validations passed."
+  EXIT_CODE=0
+fi
+
+# ── Write state-verdict.json (atomic: write tmp then rename) ────
+VERDICT_DIR=$(dirname "$_VERDICT_JSON")
+VERDICT_TMP=$(mktemp "$VERDICT_DIR/.state-verdict.json.XXXXXX")
+
+# Build structured issues array via python for safe JSON encoding
+python3 -c "
+import json, sys
+
+issues_raw = sys.argv[1:]
+issues = []
+for entry in issues_raw:
+    parts = entry.split('|', 2)
+    if len(parts) == 3:
+        issues.append({'level': parts[0], 'code': parts[1], 'message': parts[2]})
+
+verdict = {
+    'timestamp': '$VERDICT_TS',
+    'status': '$VERDICT',
+    'summary': '$SUMMARY',
+    'task_counts': {
+        'queued': $fs_queued,
+        'active': $fs_active,
+        'completed': $fs_completed
+    },
+    'issue_count': len(issues),
+    'issues': issues
+}
+
+with open('$VERDICT_TMP', 'w') as f:
+    json.dump(verdict, f, indent=2)
+    f.write('\n')
+" "${ISSUES[@]+"${ISSUES[@]}"}" 2>/dev/null
+
+mv "$VERDICT_TMP" "$_VERDICT_JSON"
+
+# ── Write state-verdict.md (atomic) ─────────────────────────────
+MD_TMP=$(mktemp "$VERDICT_DIR/.state-verdict.md.XXXXXX")
+{
+  echo "# GMGN Brain State Verdict"
+  echo ""
+  echo "**Timestamp:** $VERDICT_TS"
+  echo "**Status:** $VERDICT"
+  echo "**Issues:** $ISSUE_COUNT"
+  echo ""
+  if [[ $ISSUE_COUNT -gt 0 ]]; then
+    echo "## Details"
+    echo ""
+    for issue in "${ISSUES[@]}"; do
+      IFS='|' read -r lvl code msg <<< "$issue"
+      echo "- [$lvl] $code — $msg"
+    done
+  else
+    echo "_No issues detected._"
+  fi
+  echo ""
+  echo "---"
+  echo "_Generated by brain-state-check_"
+} > "$MD_TMP"
+mv "$MD_TMP" "$_VERDICT_MD"
+
+# ── Write system-state.json sidecar (authoritative machine state) ──
+SSTATE_JSON_DIR=$(dirname "$_SYSTEM_STATE_JSON")
+SSTATE_JSON_TMP=$(mktemp "$SSTATE_JSON_DIR/.system-state.json.XXXXXX")
+python3 -c "
+import json
+sstate = {
+    'timestamp': '$VERDICT_TS',
+    'task_counts': {
+        'queued': $fs_queued,
+        'active': $fs_active,
+        'completed': $fs_completed
+    },
+    'verdict': '$VERDICT',
+    'verdict_issues': $ISSUE_COUNT
+}
+with open('$SSTATE_JSON_TMP', 'w') as f:
+    json.dump(sstate, f, indent=2)
+    f.write('\n')
+" 2>/dev/null
+mv "$SSTATE_JSON_TMP" "$_SYSTEM_STATE_JSON"
+
+# ── Event log ──────────────────────────────────────────────────
+. "$_SELF_DIR/../lib/brain-event.sh"
+brain_event VERDICT "$VERDICT ${fs_queued}q/${fs_active}a/${fs_completed}c"
+
+# ── Terminal summary ────────────────────────────────────────────
+echo ""
+echo "Filesystem truth: ${fs_queued} queued, ${fs_active} active, ${fs_completed} completed"
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo "RESULT: ALL OK"
+else
+  echo "RESULT: $VERDICT — $SUMMARY"
+fi
+
+exit $EXIT_CODE

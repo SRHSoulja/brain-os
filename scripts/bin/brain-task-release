@@ -1,0 +1,109 @@
+#!/bin/bash
+# brain-task-release — Release an orphaned task from active/ back to queue/
+# Usage: brain-task-release <TASK-ID> [--reason "why"]
+#
+# Moves the task file from active/ to queue/, resets owner to unassigned,
+# cleans up the run record, and logs a TASK_RELEASE event.
+#
+# Safety: refuses to release a task whose run record PID is still alive
+# unless --force is used.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+. "$TOOLS/lib/frontmatter.sh"
+. "$TOOLS/lib/brain-event.sh"
+
+TASK_ID=""
+REASON="orphan release"
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --reason) REASON="$2"; shift 2 ;;
+    --force) FORCE=true; shift ;;
+    *)
+      if [[ "$1" =~ ^TASK- ]]; then
+        TASK_ID="$1"; shift
+      else
+        echo "Error: unknown argument: $1"
+        echo "Usage: brain-task-release <TASK-ID> [--reason \"why\"] [--force]"
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: TASK-ID required"
+  echo "Usage: brain-task-release <TASK-ID> [--reason \"why\"] [--force]"
+  exit 1
+fi
+
+ACTIVE_FILE="$OPS_DIR/active/${TASK_ID}.md"
+RUN_RECORD="$OPS_DIR/active/${TASK_ID}.run.json"
+QUEUE_TARGET="$OPS_DIR/queue/${TASK_ID}.md"
+
+if [[ ! -f "$ACTIVE_FILE" ]]; then
+  echo "Error: $TASK_ID not found in active/"
+  echo "Active tasks:"
+  ls "$OPS_DIR/active/"TASK-*.md 2>/dev/null | sed 's|.*/||' || echo "  (none)"
+  exit 1
+fi
+
+if [[ -f "$QUEUE_TARGET" ]]; then
+  echo "Error: $TASK_ID already exists in queue/ — cannot release without overwriting"
+  exit 1
+fi
+
+# Safety: check if PID is still alive
+if [[ -f "$RUN_RECORD" ]] && ! $FORCE; then
+  _pid=$(python3 -c "import json; print(json.load(open('$RUN_RECORD')).get('pid',''))" 2>/dev/null) || true
+  if [[ -n "$_pid" ]] && kill -0 "$_pid" 2>/dev/null; then
+    echo "Error: PID $_pid from run record is still alive — task may still be executing"
+    echo "Use --force to override"
+    exit 1
+  fi
+fi
+
+# Reset owner and status in frontmatter
+python3 - "$ACTIVE_FILE" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+content = re.sub(r'^owner:.*$', 'owner: "unassigned"', content, flags=re.MULTILINE)
+content = re.sub(r'^status:.*$', 'status: queued', content, flags=re.MULTILINE)
+# Remove claimed_at and branch lines (will be re-set on next claim)
+content = re.sub(r'^claimed_at:.*\n', '', content, flags=re.MULTILINE)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+
+# Move task back to queue
+mv "$ACTIVE_FILE" "$QUEUE_TARGET"
+
+# Archive run record if it exists
+if [[ -f "$RUN_RECORD" ]]; then
+  _archive_name="${TASK_ID}.released-$(date +%Y%m%d-%H%M%S).run.json"
+  mv "$RUN_RECORD" "$OPS_DIR/completed/${_archive_name}" 2>/dev/null || rm "$RUN_RECORD"
+fi
+
+# Clean up worker artifacts
+for wf in "$OPS_DIR/active/.worker-${TASK_ID}-"*; do
+  [[ -f "$wf" ]] || continue
+  rm "$wf"
+done
+
+# Log event
+_emit_event "TASK_RELEASE" "$TASK_ID" "reason=$REASON"
+
+echo "Released: $TASK_ID → queue/"
+echo "  Reason: $REASON"
+echo "  Owner reset to: unassigned"
+echo "  Status reset to: queued"
+[[ -f "$OPS_DIR/completed/${_archive_name:-}" ]] && echo "  Run record archived: completed/$_archive_name"

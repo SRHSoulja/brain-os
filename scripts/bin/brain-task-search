@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# brain-task-search — Bounded, logged, read-only knowledge retrieval during task execution.
+# v1.0: Pilot. Fixed allowlist, 3-query budget, full run-record logging.
+# Governed by: ADR-0003, sync-surface-authority-gap impact note.
+# Design: work/inbox/design-brain-search-task-access.md
+
+set -euo pipefail
+
+BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+TOOLS="${TOOLS:-$HOME/gmgn-brain/scripts}"
+OPS_DIR="$BRAIN/brain/ops/tasks"
+
+# ── Parse args ──────────────────────────────────────────────────
+
+usage() {
+  echo "Usage: brain-task-search TASK-ID \"query string\""
+  echo ""
+  echo "Bounded knowledge retrieval for an active task."
+  echo "Requires knowledge_access: true in the task's execution contract."
+  echo "Budget: 3 queries per task. Read-only. Logged to run record."
+  exit 1
+}
+
+[[ $# -lt 2 ]] && usage
+
+TASK_ID="$1"
+QUERY="$2"
+
+# ── Validate active task ────────────────────────────────────────
+
+RUN_RECORD="$OPS_DIR/active/${TASK_ID}.run.json"
+TASK_FILE="$OPS_DIR/active/${TASK_ID}.md"
+
+if [[ ! -f "$RUN_RECORD" ]]; then
+  echo "Error: No run record for $TASK_ID in active/. Task must be claimed and executing."
+  exit 1
+fi
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID not found in active/."
+  exit 1
+fi
+
+# ── Check knowledge_access in execution contract ────────────────
+
+python3 - "$TASK_FILE" "$RUN_RECORD" "$QUERY" "$BRAIN" "$TASK_ID" <<'PYEOF'
+import json, sys, os, re, subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+task_file = sys.argv[1]
+run_record_path = sys.argv[2]
+query = sys.argv[3]
+brain = sys.argv[4]
+task_id = sys.argv[5]
+
+BUDGET = 3
+
+# ── Check knowledge_access in task file ──
+
+task_text = Path(task_file).read_text()
+has_access = bool(re.search(r'knowledge_access:\s*true', task_text, re.IGNORECASE))
+
+if not has_access:
+    print(f"Error: {task_id} does not have knowledge_access: true in its execution contract.")
+    sys.exit(1)
+
+# ── Check verdict ──
+
+verdict_file = os.path.join(brain, "brain/ops/derived/state-verdict.json")
+try:
+    verdict = json.loads(Path(verdict_file).read_text())
+    status = verdict.get("verdict", "UNKNOWN")
+    if status in ("DRIFT", "CONFLICT"):
+        print(f"Error: Brain verdict is {status}. Knowledge access blocked.")
+        sys.exit(1)
+except (FileNotFoundError, json.JSONDecodeError):
+    print("Warning: Could not read state-verdict.json. Proceeding with caution.")
+
+# ── Check query budget ──
+
+run_record = json.loads(Path(run_record_path).read_text())
+existing_queries = run_record.get("knowledge_queries", [])
+queries_used = len(existing_queries)
+
+if queries_used >= BUDGET:
+    print(f"Error: Query budget exhausted ({queries_used}/{BUDGET}). No queries remaining for {task_id}.")
+    sys.exit(1)
+
+budget_remaining = BUDGET - queries_used - 1  # after this query
+
+# ── Run brain-search ──
+
+tools = os.environ.get("TOOLS", os.path.expanduser("~/2026Projects/tools"))
+search_bin = os.path.join(tools, "bin", "brain-search")
+
+try:
+    result = subprocess.run(
+        [search_bin, query],
+        capture_output=True, text=True, timeout=30
+    )
+    raw_output = result.stdout
+except subprocess.TimeoutExpired:
+    print("Error: brain-search timed out (30s).")
+    sys.exit(1)
+except FileNotFoundError:
+    print(f"Error: brain-search not found at {search_bin}")
+    sys.exit(1)
+
+# ── Extract result paths from brain-search output ──
+# brain-search outputs lines like "1. path/to/file.md (score: 15) — Title"
+
+result_paths = []
+for line in raw_output.splitlines():
+    match = re.match(r'\s*\d+\.\s+(\S+\.md)', line)
+    if match:
+        result_paths.append(match.group(1))
+
+# ── Filter against allowlist ──
+
+ALLOWLIST_PATTERNS = [
+    r'^nodes/[^/]+/INDEX\.md$',
+    r'^nodes/[^/]+/docs/',
+    r'^nodes/[^/]+/CHANGELOG\.md$',
+    r'^work/logs/devlog/',
+    r'^docs/ops/tools-[^/]+\.md$',
+    r'^work/open-questions\.md$',
+]
+
+DENYLIST_PATTERNS = [
+    r'^nodes/the-lab/work/',
+]
+
+def is_allowed(path):
+    # Normalize path relative to brain root
+    if path.startswith(brain + "/"):
+        path = path[len(brain) + 1:]
+    # Check denylist first
+    for deny in DENYLIST_PATTERNS:
+        if re.match(deny, path):
+            return False
+    # Check allowlist
+    for allow in ALLOWLIST_PATTERNS:
+        if re.match(allow, path):
+            return True
+    return False
+
+allowed_paths = [p for p in result_paths if is_allowed(p)]
+filtered_count = len(result_paths) - len(allowed_paths)
+
+# ── Filter brain-search output to only show allowed results ──
+
+filtered_output_lines = []
+for line in raw_output.splitlines():
+    match = re.match(r'\s*\d+\.\s+(\S+\.md)', line)
+    if match:
+        path = match.group(1)
+        if is_allowed(path):
+            filtered_output_lines.append(line)
+        # else: silently drop
+    else:
+        # Non-result lines (headers, separators) -- keep if we have results
+        if not line.strip().startswith("Results for") or allowed_paths:
+            filtered_output_lines.append(line)
+
+# ── Build query record ──
+
+query_record = {
+    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "query": query,
+    "results_returned": len(allowed_paths),
+    "results_filtered": filtered_count,
+    "results_paths": allowed_paths,
+    "truncated": len(result_paths) >= 5,
+    "budget_remaining": budget_remaining,
+}
+
+# ── Append to run record ──
+
+if "knowledge_queries" not in run_record:
+    run_record["knowledge_queries"] = []
+run_record["knowledge_queries"].append(query_record)
+
+with open(run_record_path, 'w') as f:
+    json.dump(run_record, f, indent=2)
+    f.write("\n")
+
+# ── Output ──
+
+if allowed_paths:
+    print(f"[brain-task-search] {len(allowed_paths)} result(s) | {filtered_count} filtered | {budget_remaining} queries remaining")
+    print("")
+    print("\n".join(filtered_output_lines))
+else:
+    print(f"[brain-task-search] 0 results (all {len(result_paths)} filtered by allowlist) | {budget_remaining} queries remaining")
+
+PYEOF

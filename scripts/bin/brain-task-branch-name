@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# brain-task-branch-name — Generate the canonical task branch name for an agent+task pair
+#
+# Usage:
+#   brain-task-branch-name <TASK-ID> [--agent <agent>]
+#   brain-task-branch-name TASK-2026-04-13-001
+#   brain-task-branch-name TASK-2026-04-13-001 --agent codex
+#
+# Output: one line, e.g. "claude/task-2026-04-13-001-fix-dispatch-routing"
+#
+# Naming convention: <agent>/<slug>
+#   where <agent> is the canonical agent name (claude, codex, gemini)
+#   and <slug> is "task-<id>-<title-slug>" (title lowercased, spaces→hyphens, 40 chars max)
+#
+# Rules:
+#   - Branch names are deterministic: same task+agent always yields the same name
+#   - Title slug is derived from task frontmatter title field; falls back to task ID only
+#   - Agent prefix uses short form: claude (not claude-code), codex, gemini, human
+#   - Result is safe for git branch names (no spaces, no special chars)
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="${TOOLS_DIR:-$HOME/gmgn-brain/scripts}"
+
+. "$TOOLS/lib/brain-paths.sh"
+. "$TOOLS/lib/frontmatter.sh"
+
+TASK_ID=""
+AGENT="${BRAIN_AGENT:-${AGENT_NAME:-claude-code}}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="$2"; shift 2 ;;
+    --help|-h) grep '^#' "$0" | sed 's/^# //; s/^#//'; exit 0 ;;
+    -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+    *) TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Usage: brain-task-branch-name <TASK-ID> [--agent <agent>]" >&2
+  exit 1
+fi
+
+# Find task file (queue, active, or completed)
+TASK_FILE=""
+for dir in "$_OPS_TASKS_DIR/queue" "$_OPS_TASKS_DIR/active" "$_OPS_TASKS_DIR/completed"; do
+  f="$dir/${TASK_ID}.md"
+  [[ -f "$f" ]] && TASK_FILE="$f" && break
+done
+
+# Derive title slug
+TITLE_SLUG=""
+if [[ -n "$TASK_FILE" ]]; then
+  RAW_TITLE=$(fm_get "$TASK_FILE" "title" 2>/dev/null || echo "")
+  if [[ -n "$RAW_TITLE" ]]; then
+    TITLE_SLUG=$(echo "$RAW_TITLE" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed 's/\[.*\]//g' \
+      | sed 's/[^a-z0-9 ]/ /g' \
+      | tr -s ' ' '-' \
+      | sed 's/^-//; s/-$//' \
+      | cut -c1-40 \
+      | sed 's/-$//')
+  fi
+fi
+
+# Map agent to short prefix
+case "$AGENT" in
+  claude|claude-code) AGENT_PREFIX="claude" ;;
+  codex)              AGENT_PREFIX="codex" ;;
+  gemini|gemini-cli)  AGENT_PREFIX="gemini" ;;
+  human)              AGENT_PREFIX="human" ;;
+  *)                  AGENT_PREFIX=$(echo "$AGENT" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-') ;;
+esac
+
+# Build branch name
+if [[ -n "$TITLE_SLUG" ]]; then
+  # Extract date+seq from TASK-ID for compact representation
+  _ID_COMPACT=$(echo "$TASK_ID" | sed 's/TASK-//')
+  BRANCH_NAME="${AGENT_PREFIX}/task-${_ID_COMPACT}-${TITLE_SLUG}"
+else
+  _ID_COMPACT=$(echo "$TASK_ID" | sed 's/TASK-//')
+  BRANCH_NAME="${AGENT_PREFIX}/task-${_ID_COMPACT}"
+fi
+
+echo "$BRANCH_NAME"

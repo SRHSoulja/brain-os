@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# brain-promptbox-archive — Archive executed terminal prompt files to git-tracked storage
+#
+# Moves dated prompt files from brain/ops/promptbox/terminal/ into
+# brain/ops/promptbox/archive/YYYY-MM/ so they survive git clean, VE restores,
+# and manual cleanup. response-latest.md and latest.md are not archived (runtime files).
+#
+# Usage:
+#   brain-promptbox-archive            Archive prompts older than ARCHIVE_AGE_HOURS (default: 1)
+#   brain-promptbox-archive --dry-run  Show what would be archived without moving
+#   brain-promptbox-archive --all      Archive all dated prompts regardless of age
+#   brain-promptbox-archive --force-delete-older-than N
+#                                      Hard-delete archived files older than N days (explicit only)
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TERMINAL_DIR="$BRAIN/brain/ops/promptbox/terminal"
+ARCHIVE_BASE="$BRAIN/brain/ops/promptbox/archive"
+ARCHIVE_AGE_HOURS="${ARCHIVE_AGE_HOURS:-1}"
+
+DRY_RUN=false
+ARCHIVE_ALL=false
+FORCE_DELETE_DAYS=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --all) ARCHIVE_ALL=true; shift ;;
+    --force-delete-older-than) FORCE_DELETE_DAYS="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ ! -d "$TERMINAL_DIR" ]]; then
+  echo "[brain-promptbox-archive] Terminal dir not found: $TERMINAL_DIR"
+  exit 0
+fi
+
+archived=0
+skipped=0
+
+while IFS= read -r -d '' f; do
+  fname=$(basename "$f")
+
+  # Skip runtime files
+  [[ "$fname" == "response-latest.md" ]] && continue
+  [[ "$fname" == "latest.md" ]] && continue
+  [[ "$fname" == .* ]] && continue
+
+  # Skip if not old enough (unless --all)
+  if ! $ARCHIVE_ALL; then
+    # mtime in seconds since epoch
+    age_secs=$(( $(date +%s) - $(date -r "$f" +%s 2>/dev/null || echo 0) ))
+    age_hours=$(( age_secs / 3600 ))
+    if [[ $age_hours -lt $ARCHIVE_AGE_HOURS ]]; then
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+  fi
+
+  # Determine archive bucket from filename date (2026-04-20T...) or mtime fallback
+  if [[ "$fname" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2}) ]]; then
+    bucket="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+  else
+    bucket=$(date -r "$f" +%Y-%m 2>/dev/null || date +%Y-%m)
+  fi
+
+  dest_dir="$ARCHIVE_BASE/$bucket"
+  dest="$dest_dir/$fname"
+
+  if $DRY_RUN; then
+    echo "[dry-run] would archive: $fname → archive/$bucket/$fname"
+  else
+    mkdir -p "$dest_dir"
+    mv "$f" "$dest"
+    echo "[brain-promptbox-archive] archived: $fname → archive/$bucket/"
+    archived=$(( archived + 1 ))
+  fi
+done < <(find "$TERMINAL_DIR" -maxdepth 1 -name "*.md" -print0 2>/dev/null)
+
+if ! $DRY_RUN; then
+  echo "[brain-promptbox-archive] done: $archived archived, $skipped too recent"
+fi
+
+# ── Hard-delete path (explicit operator flag only) ──────────────────
+if [[ $FORCE_DELETE_DAYS -gt 0 ]]; then
+  echo "[brain-promptbox-archive] force-deleting archived files older than $FORCE_DELETE_DAYS days..."
+  deleted=0
+  while IFS= read -r -d '' f; do
+    if $DRY_RUN; then
+      echo "[dry-run] would delete: $(basename "$f")"
+    else
+      rm -f "$f"
+      deleted=$(( deleted + 1 ))
+    fi
+  done < <(find "$ARCHIVE_BASE" -name "*.md" -mtime "+$FORCE_DELETE_DAYS" -print0 2>/dev/null)
+  ! $DRY_RUN && echo "[brain-promptbox-archive] deleted $deleted archived file(s) older than $FORCE_DELETE_DAYS days"
+fi

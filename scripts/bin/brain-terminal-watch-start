@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# brain-terminal-watch-start — Start the ChatGPT terminal monitor watcher
+#
+# Agent-agnostic setup: starts inotifywait on the promptbox directory and
+# saves the PID. Works regardless of which brain agent is in the seat.
+# The caller (agent command) handles the monitoring loop in their own way.
+#
+# Usage: brain-terminal-watch-start [--force]
+#   --force  kill any existing watcher first
+#
+# Outputs the PID on stdout. Exit 0=started, 1=already running (without --force).
+
+set -euo pipefail
+
+BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+PROMPTBOX="$BRAIN/brain/ops/promptbox/terminal"
+PID_FILE="/tmp/brain-terminal-watcher.pid"
+LOG_FILE="/tmp/brain-terminal-events.log"
+FORCE=false
+[[ "${1:-}" == "--force" ]] && FORCE=true
+
+# ── Check if already running ──────────────────────────────────────
+if [[ -f "$PID_FILE" ]]; then
+  existing=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    if $FORCE; then
+      kill "$existing" 2>/dev/null || true
+      sleep 0.2
+    else
+      echo "already-running:$existing" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# ── Kill stale tail processes and orphaned inotifywait ───────────
+# Kill ALL tail processes watching the log file (including orphaned session tails)
+while IFS= read -r pid; do
+  kill "$pid" 2>/dev/null || true
+done < <(pgrep -f "tail.*$LOG_FILE" 2>/dev/null || true)
+# Sweep for any inotifywait watching this directory that escaped PID file tracking
+# (can happen when a previous session's PID file was overwritten without killing the process)
+pkill -f "inotifywait.*$(basename "$PROMPTBOX")" 2>/dev/null || true
+sleep 0.2
+
+# ── Start watcher ─────────────────────────────────────────────────
+# stdbuf -oL: force line-buffered stdout so each event flushes immediately.
+# Without this, libc buffers inotifywait output in an 8KB block — events
+# accumulate in memory and the log file goes stale until the buffer fills.
+stdbuf -oL inotifywait -m -e close_write --format '%w%f' "$PROMPTBOX" \
+  > "$LOG_FILE" 2>/dev/null &
+WATCHER_PID=$!
+echo "$WATCHER_PID" > "$PID_FILE"
+
+# Give inotifywait a moment to initialize
+sleep 0.3
+
+if ! kill -0 "$WATCHER_PID" 2>/dev/null; then
+  echo "ERROR: watcher failed to start" >&2
+  rm -f "$PID_FILE"
+  exit 2
+fi
+
+echo "$WATCHER_PID"

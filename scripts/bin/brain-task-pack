@@ -1,0 +1,40 @@
+#!/bin/bash
+# brain-task-pack — Compile a task file into a structured Execution Pack
+# Usage: brain-task-pack <TASK-ID>
+#
+# Locates the task in queue/ or active/, compiles it into a deterministic
+# JSON Execution Pack, and prints to stdout.
+# Does not mutate any files.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+OPS_DIR="$BRAIN/brain/ops/tasks"
+COMPILER="$TOOLS/lib/compile-execution-pack.py"
+
+TASK_ID="${1:-}"
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Usage: brain-task-pack <TASK-ID>" >&2
+  echo "Example: brain-task-pack TASK-2026-03-15-011" >&2
+  exit 1
+fi
+
+# Locate task file in queue or active
+TASK_FILE=""
+for folder in active queue completed; do
+  candidate="$OPS_DIR/$folder/${TASK_ID}.md"
+  if [[ -f "$candidate" ]]; then
+    TASK_FILE="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID not found in queue/, active/, or completed/" >&2
+  exit 1
+fi
+
+# Compile and output
+python3 "$COMPILER" "$TASK_FILE"

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# codex-claude-handoff — Generate a Claude implementation prompt from the current Codex handoff state
+set -euo pipefail
+exec python3 "${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/codex/codex_claude_handoff.py" "$@"

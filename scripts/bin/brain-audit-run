@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# brain-audit-run: Orchestrates full forensic sweep.
+
+echo "Initiating Brain Forensic Audit (v1)..."
+./brain/modules/audit/audit.sh

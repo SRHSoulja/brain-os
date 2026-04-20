@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# brain-seat-claim -- Declare which assistant owns which seat
+# Usage: brain-seat-claim --seat laptop|ve --assistant claude|codex --mode interactive|bridge|standby
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+SEAT_FILE="$BRAIN/brain/ops/.brain-active-seat.json"
+
+SEAT=""
+ASSISTANT=""
+MODE="interactive"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --seat) SEAT="$2"; shift 2 ;;
+    --assistant) ASSISTANT="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$SEAT" || -z "$ASSISTANT" ]]; then
+  echo "Usage: brain-seat-claim --seat laptop|ve --assistant <name> --mode interactive|bridge|standby" >&2
+  exit 1
+fi
+
+# Validate
+case "$SEAT" in laptop|ve) ;; *) echo "Invalid seat: $SEAT" >&2; exit 1 ;; esac
+# Agent-agnostic: accept any non-empty assistant name (claude, codex, gemini, etc.)
+if [[ -z "$ASSISTANT" ]]; then echo "Assistant name required" >&2; exit 1; fi
+case "$MODE" in interactive|bridge|standby) ;; *) echo "Invalid mode: $MODE" >&2; exit 1 ;; esac
+
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+cat > "$SEAT_FILE" <<EOF
+{
+  "seat": "$SEAT",
+  "assistant": "$ASSISTANT",
+  "mode": "$MODE",
+  "ts": "$TS",
+  "source": "brain-seat-claim"
+}
+EOF
+
+echo "seat-claim: $SEAT/$ASSISTANT/$MODE"

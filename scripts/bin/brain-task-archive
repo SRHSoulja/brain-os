@@ -1,0 +1,96 @@
+#!/bin/bash
+# brain-task-archive — Move completed tasks older than N days to monthly archive
+# Usage: brain-task-archive [--days N] [--dry-run]
+#
+# Moves TASK-*.md + matching .completion.json + .run.json to completed/archive/YYYY-MM/
+# Updates checksum manifest. Logs to events.log.
+# Default: 30 days. Use --dry-run to preview without moving.
+
+set -uo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$_SELF_DIR/../lib/brain-paths.sh"
+TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+_require_local
+COMPLETED="$_OPS_TASKS_DIR/completed"
+MANIFEST="$COMPLETED/.task-checksums"
+. "$_SELF_DIR/../lib/brain-event.sh"
+MAX_AGE_DAYS=30
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --days) ;; # next arg is the value
+    [0-9]*) MAX_AGE_DAYS="$arg" ;;
+  esac
+done
+
+# Parse --days N properly
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days) shift; MAX_AGE_DAYS="${1:-30}" ;;
+  esac
+  shift
+done
+
+NOW=$(date +%s)
+CUTOFF=$((NOW - MAX_AGE_DAYS * 86400))
+MOVED=0
+SKIPPED=0
+
+echo "=== Brain Task Archive ==="
+echo "Threshold: $MAX_AGE_DAYS days (before $(date -d @$CUTOFF +%Y-%m-%d))"
+$DRY_RUN && echo "(dry-run mode — no moves)"
+echo ""
+
+for task_file in "$COMPLETED"/TASK-*.md; do
+  [[ -f "$task_file" ]] || continue
+
+  fname=$(basename "$task_file")
+  task_id="${fname%.md}"
+  file_mtime=$(stat -c %Y "$task_file")
+
+  if [[ $file_mtime -ge $CUTOFF ]]; then
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  # Determine archive month from file modification date
+  archive_month=$(date -d @$file_mtime +%Y-%m)
+  archive_dir="$COMPLETED/archive/$archive_month"
+
+  # Find associated files
+  associated=("$task_file")
+  [[ -f "$COMPLETED/${task_id}.completion.json" ]] && associated+=("$COMPLETED/${task_id}.completion.json")
+  [[ -f "$COMPLETED/${task_id}.run.json" ]] && associated+=("$COMPLETED/${task_id}.run.json")
+
+  echo "  $task_id → archive/$archive_month/ ($(date -d @$file_mtime +%Y-%m-%d), ${#associated[@]} files)"
+
+  if ! $DRY_RUN; then
+    mkdir -p "$archive_dir"
+    for af in "${associated[@]}"; do
+      mv "$af" "$archive_dir/"
+    done
+
+    # Remove archived task from checksum manifest
+    if [[ -f "$MANIFEST" ]]; then
+      grep -v "^${fname} " "$MANIFEST" > "${MANIFEST}.tmp" 2>/dev/null || true
+      mv "${MANIFEST}.tmp" "$MANIFEST"
+    fi
+
+    # Log event
+    brain_event TASK_ARCHIVE "$task_id archive/$archive_month"
+  fi
+
+  MOVED=$((MOVED + 1))
+done
+
+echo ""
+if [[ $MOVED -eq 0 ]]; then
+  echo "No tasks older than $MAX_AGE_DAYS days. Nothing to archive."
+else
+  echo "Archived: $MOVED task(s). Skipped: $SKIPPED (within threshold)."
+fi
+$DRY_RUN && [[ $MOVED -gt 0 ]] && echo "Run without --dry-run to execute."

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""brain-task-truth-validator -- Deterministic log-first task completion validator.
+
+This tool validates task completion using only canonical evidence (events.jsonl and
+completed/*.md artifacts), independent of discarded analytics surfaces.
+
+Usage:
+    brain-task-truth-validator <TASK_ID> [--json]
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+BRAIN_DIR = os.environ.get("BRAIN_DIR", os.path.expanduser("~/gmgn-brain"))
+EVENTS_LOG = os.path.join(BRAIN_DIR, "brain/ops/events.jsonl")
+COMPLETED_DIR = os.path.join(BRAIN_DIR, "brain/ops/tasks/completed")
+TASK_ID_PATTERN = re.compile(r'^TASK-\d{4}-\d{2}-\d{2}-\d{3}(-A|-B)?$')
+
+def validate_task_id(task_id):
+    if not TASK_ID_PATTERN.match(task_id):
+        print(f"Error: Invalid TASK_ID format: {task_id}", file=sys.stderr)
+        sys.exit(1)
+
+def find_task_event(task_id):
+    if not os.path.exists(EVENTS_LOG):
+        return False
+    
+    try:
+        with open(EVENTS_LOG, "r") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                    if event.get("entity_id") == task_id and event.get("op") == "TASK_COMPLETE":
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"Error reading events.jsonl: {e}", file=sys.stderr)
+        sys.exit(1)
+    return False
+
+def check_artifact(task_id):
+    artifact_path = os.path.join(COMPLETED_DIR, f"{task_id}.md")
+    return os.path.exists(artifact_path)
+
+def extract_output_text(task_id):
+    artifact_path = os.path.join(COMPLETED_DIR, f"{task_id}.md")
+    if not os.path.exists(artifact_path):
+        return ""
+    
+    try:
+        with open(artifact_path, "r") as f:
+            content = f.read()
+            m = re.search(r'(?:-\s*\*\*Output:\*\*|Output:)\s*(.*)', content, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+def classify_evidence(output_text):
+    if not output_text:
+        return "NONE"
+    
+    # Check for path-like strings (containing / and .) or git hashes (hex 7+)
+    has_path = re.search(r'([a-zA-Z0-9_\-/]+\.[a-zA-Z0-9_]+)', output_text)
+    has_hash = re.search(r'([a-f0-9]{7,40})', output_text)
+
+    if has_path or has_hash:
+        return "DECLARED_PATH_PRESENT"
+    else:
+        return "UNVERIFIABLE"
+
+def main():
+    parser = argparse.ArgumentParser(description="Task Truth Validator")
+    parser.add_argument("task_id", help="The Task ID to validate")
+    parser.add_argument("--json", action="store_true", help="Output result in JSON format")
+    args = parser.parse_args()
+
+    validate_task_id(args.task_id)
+
+    log_found = find_task_event(args.task_id)
+    artifact_found = check_artifact(args.task_id)
+    output_text = extract_output_text(args.task_id)
+    evidence_status = classify_evidence(output_text)
+
+    # Verdict Logic (Path C: Structural Only)
+    verdict = "INCORRECT"
+    status_code = 2
+    
+    if not log_found and not artifact_found:
+        if args.json:
+            print(json.dumps({"error": "Task not found", "task_id": args.task_id}))
+        else:
+            print(f"Error: Task not found: {args.task_id}", file=sys.stderr)
+        sys.exit(1)
+
+    if log_found and artifact_found:
+        verdict = "VERIFIED_STRUCTURE"
+        status_code = 0
+    elif log_found and not artifact_found:
+        verdict = "INCORRECT" # Log exists, Artifact missing
+    elif not log_found and artifact_found:
+        verdict = "INCORRECT" # Artifact exists, Log missing
+
+    result = {
+        "task_id": args.task_id,
+        "log_found": log_found,
+        "artifact_found": artifact_found,
+        "verdict": verdict,
+        "evidence_status": evidence_status
+    }
+
+    if args.json:
+        print(json.dumps(result))
+    else:
+        if verdict == "VERIFIED_STRUCTURE":
+            print(f"[VERDICT] {verdict} | Log: YES | Artifact: YES | Evidence: {evidence_status}")
+        else:
+            print(f"[VERDICT] {verdict} | Log: {'YES' if log_found else 'NO'} | Artifact: {'YES' if artifact_found else 'NO'}")
+
+    sys.exit(status_code)
+
+if __name__ == "__main__":
+    main()

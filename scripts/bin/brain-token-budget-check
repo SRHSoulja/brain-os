@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# brain-token-budget-check -- Report token estimates and enforce thresholds.
+# Exits non-zero if any file exceeds its budget.
+# Usage: brain-token-budget-check [--quiet]
+
+set -uo pipefail
+
+BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+QUIET=false
+[[ "${1:-}" == "--quiet" ]] && QUIET=true
+
+# Token budget policy: brain/governance/token-budget-policy.md
+# Budget changes require human approval per governance doc.
+declare -A BUDGETS=(
+  ["CLAUDE.md"]=1200
+  ["brain/index/active-context.compact.md"]=1200
+  ["brain/index/session-resume.md"]=1400
+  ["brain/ops/derived/system-state.md"]=900
+)
+
+FAIL=0
+TOTAL_BYTES=0
+TOTAL_TOKENS=0
+
+if [[ "$QUIET" == "false" ]]; then
+  printf "%-50s %8s %8s %8s %6s\n" "File" "Bytes" "~Tokens" "Budget" "Status"
+  printf "%-50s %8s %8s %8s %6s\n" "----" "-----" "-------" "------" "------"
+fi
+
+for rel in "${!BUDGETS[@]}"; do
+  fpath="$BRAIN/$rel"
+  budget=${BUDGETS[$rel]}
+
+  if [[ ! -f "$fpath" ]]; then
+    if [[ "$QUIET" == "false" ]]; then
+      printf "%-50s %8s %8s %8d %6s\n" "$rel" "MISSING" "-" "$budget" "SKIP"
+    fi
+    continue
+  fi
+
+  sz=$(wc -c < "$fpath")
+  tok=$((sz / 4))
+  TOTAL_BYTES=$((TOTAL_BYTES + sz))
+  TOTAL_TOKENS=$((TOTAL_TOKENS + tok))
+
+  if [[ $tok -gt $budget ]]; then
+    status="FAIL"
+    FAIL=$((FAIL + 1))
+  else
+    status="PASS"
+  fi
+
+  if [[ "$QUIET" == "false" ]]; then
+    printf "%-50s %8d %8d %8d %6s\n" "$rel" "$sz" "$tok" "$budget" "$status"
+  fi
+done
+
+if [[ "$QUIET" == "false" ]]; then
+  echo ""
+  echo "Total: ${TOTAL_BYTES}B ~${TOTAL_TOKENS} tokens across ${#BUDGETS[@]} files"
+  echo ""
+fi
+
+if [[ $FAIL -gt 0 ]]; then
+  echo "BUDGET CHECK: FAIL ($FAIL file(s) over budget)"
+  exit 1
+else
+  if [[ "$QUIET" == "false" ]]; then
+    echo "BUDGET CHECK: PASS"
+  fi
+  exit 0
+fi

@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# brain-review-dispatch — Dispatch-native verification/audit/gap-analysis lane
+# Usage:
+#   brain-review-dispatch <TASK-ID> [--type verification|gap-analysis|audit|prompt]
+#                         [--profile <id>] [--agent <agent>] [--output <path>]
+#                         [--timeout <sec>] [--dry-run]
+#
+# This is the canonical, vendor-agnostic review path.
+# It routes through brain-subagent-dispatch and writes an auditable artifact.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+. "$TOOLS/lib/brain-event.sh"
+
+TASK_ID=""
+REVIEW_TYPE="verification"
+PROFILE=""
+TARGET_AGENT=""
+TIMEOUT=180
+DRY_RUN=false
+OUT_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)    REVIEW_TYPE="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --agent)   TARGET_AGENT="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --output)  OUT_PATH="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      echo "Usage: brain-review-dispatch <TASK-ID> [--type verification|gap-analysis|audit|prompt] [--profile <id>] [--agent <agent>] [--output <path>] [--timeout <sec>] [--dry-run]"
+      exit 0
+      ;;
+    -*) echo "Unknown flag: $1"; exit 1 ;;
+    *)  TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: TASK-ID required"
+  echo "Usage: brain-review-dispatch <TASK-ID> [--type verification|gap-analysis|audit|prompt] [--dry-run]"
+  exit 1
+fi
+
+if [[ -z "$OUT_PATH" ]]; then
+  OUT_PATH="$BRAIN/work/outputs/reviews/${TASK_ID}-${REVIEW_TYPE}.md"
+fi
+mkdir -p "$(dirname "$OUT_PATH")"
+
+PACK_JSON=$("$TOOLS/bin/brain-task-pack" "$TASK_ID" 2>/dev/null) || {
+  echo "Error: failed to compile execution pack for $TASK_ID"
+  exit 1
+}
+PACK_FINGERPRINT=$(echo "$PACK_JSON" | sha256sum | cut -d' ' -f1)
+GOAL=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('goal',''))" 2>/dev/null)
+NODE=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('node',''))" 2>/dev/null)
+SUMMARY=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('summary','')[:240])" 2>/dev/null)
+CRITERIA=$(echo "$PACK_JSON" | python3 -c "import json,sys; print('\\n'.join('- '+c for c in json.load(sys.stdin).get('completion_criteria',[])))" 2>/dev/null)
+
+case "$REVIEW_TYPE" in
+  verification)
+    [[ -z "$PROFILE" ]] && PROFILE="repo-auditor"
+    QUESTION="Verification request for ${TASK_ID}.
+Goal: ${GOAL}
+Node: ${NODE}
+Pack fingerprint: ${PACK_FINGERPRINT:0:16}
+Completion criteria:
+${CRITERIA}
+
+Check implementation correctness and safety. If docs/wiki were updated, verify they match code and behavior."
+    ;;
+  gap-analysis)
+    [[ -z "$PROFILE" ]] && PROFILE="auditor-skeptic"
+    QUESTION="Gap-analysis request for ${TASK_ID}.
+Goal: ${GOAL}
+Node: ${NODE}
+Summary: ${SUMMARY}
+
+Identify the highest-leverage missing piece, risk, or follow-up."
+    ;;
+  audit)
+    [[ -z "$PROFILE" ]] && PROFILE="repo-auditor"
+    QUESTION="Audit request for ${TASK_ID}.
+Goal: ${GOAL}
+Node: ${NODE}
+Pack fingerprint: ${PACK_FINGERPRINT:0:16}
+
+Perform a read-only audit of scope and implementation quality."
+    ;;
+  prompt)
+    [[ -z "$PROFILE" ]] && PROFILE="systems-architect"
+    QUESTION="Pre-execution prompt-design request for ${TASK_ID}.
+Goal: ${GOAL}
+Node: ${NODE}
+Summary: ${SUMMARY}
+Completion criteria:
+${CRITERIA}
+
+Generate one focused implementation directive with constraints, likely file touchpoints, and pitfalls."
+    ;;
+  *)
+    echo "Error: unknown type '$REVIEW_TYPE' (use verification|gap-analysis|audit|prompt)"
+    exit 1
+    ;;
+esac
+
+CORRELATION_ID="rd-$(date -u +%Y%m%dT%H%M%SZ)-${TASK_ID}-${REVIEW_TYPE}"
+
+echo "Brain Review Dispatch"
+echo "  Task:         $TASK_ID"
+echo "  Type:         $REVIEW_TYPE"
+echo "  Profile:      $PROFILE"
+[[ -n "$TARGET_AGENT" ]] && echo "  Target agent: $TARGET_AGENT"
+echo "  Correlation:  $CORRELATION_ID"
+echo "  Fingerprint:  ${PACK_FINGERPRINT:0:16}"
+echo "  Output:       $OUT_PATH"
+echo ""
+
+DISPATCH_ARGS=(--profile "$PROFILE" --task "$TASK_ID" --op "$REVIEW_TYPE" --question "$QUESTION" --timeout "$TIMEOUT")
+[[ -n "$TARGET_AGENT" ]] && DISPATCH_ARGS+=(--agent "$TARGET_AGENT")
+$DRY_RUN && DISPATCH_ARGS+=(--dry-run)
+
+if $DRY_RUN; then
+  echo "Dry run — would dispatch:"
+  echo "  $TOOLS/bin/brain-subagent-dispatch ${DISPATCH_ARGS[*]}"
+  exit 0
+fi
+
+DISPATCH_OUT=$("$TOOLS/bin/brain-subagent-dispatch" "${DISPATCH_ARGS[@]}" 2>&1 || true)
+
+META_LINE=$(BRAIN_DISPATCH_OUT="$DISPATCH_OUT" python3 - "$OUT_PATH" "$TASK_ID" "$REVIEW_TYPE" "$PROFILE" "$CORRELATION_ID" "$PACK_FINGERPRINT" <<'PYEOF'
+import json, os, sys, datetime, re
+
+out_path, task_id, review_type, profile, correlation_id, fingerprint = sys.argv[1:7]
+dispatch_raw = os.environ.get('BRAIN_DISPATCH_OUT', '')
+
+def parse_dispatch(raw: str):
+    # First try direct JSON parse.
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    # Fallback: find the last JSON object in noisy output.
+    m = re.search(r'(\{[\s\S]*\})\s*$', raw)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    return {"agent": "unknown", "result": raw or "(dispatch returned no output)", "result_tokens": 0, "model": "default"}
+
+try:
+    dispatch = parse_dispatch(dispatch_raw)
+except Exception:
+    dispatch = {"agent": "unknown", "result": dispatch_raw, "result_tokens": 0, "model": "default"}
+
+agent = dispatch.get("agent", "unknown")
+model = dispatch.get("model", "default")
+duration = dispatch.get("duration_s", 0)
+result = dispatch.get("result", "").strip()
+
+_EMPTY_SENTINEL = "(dispatch returned no output)"
+if agent == "unknown" and result in ("", _EMPTY_SENTINEL):
+    sys.exit(1)  # hard-fail: discard empty dispatch, do not write review file
+
+ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+md = f"""---
+task_id: {task_id}
+review_type: {review_type}
+profile: {profile}
+target_agent: {agent}
+target_model: {model}
+correlation_id: {correlation_id}
+pack_fingerprint: {fingerprint}
+generated_at: "{ts}"
+---
+
+# Dispatch Review: {task_id} ({review_type})
+
+- correlation_id: `{correlation_id}`
+- profile: `{profile}`
+- target_agent: `{agent}`
+- target_model: `{model}`
+- duration_s: `{duration}`
+
+## Result
+
+{result}
+"""
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(md)
+
+print(f"agent={agent} model={model}")
+PYEOF
+)
+brain_event "REVIEW_DISPATCH" "${TASK_ID} type=${REVIEW_TYPE} profile=${PROFILE} correlation=${CORRELATION_ID} output=${OUT_PATH} ${META_LINE}"
+
+echo "Review artifact written:"
+echo "  $OUT_PATH"

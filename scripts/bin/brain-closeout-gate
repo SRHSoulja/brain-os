@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# brain-closeout-gate -- fail-closed checks before session seal
+# Usage: brain-closeout-gate [--json]
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS_HOME="$HOME/gmgn-brain/scripts"
+TOOLS_REPO="$TOOLS_HOME"
+
+JSON=false
+[[ "${1:-}" == "--json" ]] && JSON=true
+
+ISSUES=()
+ADVISORY=()
+BLOCKING=()
+
+add_issue() { ISSUES+=("$1"); }
+add_advisory() { ADVISORY+=("$1"); }
+add_blocking() { BLOCKING+=("$1"); }
+
+# 1) Devlog required (today)
+TODAY=$(date +%Y-%m-%d)
+if ! ls "$BRAIN/work/logs/devlog/${TODAY}"*.md >/dev/null 2>&1; then
+  add_issue "DEVLOG_MISSING|No devlog found for today ($TODAY) in work/logs/devlog/."
+fi
+
+# 2) Usage telemetry required + fresh
+USAGE_SNAP="$BRAIN/work/logs/usage-snapshot.json"
+USAGE_HIST="$BRAIN/work/logs/usage-history.jsonl"
+if [[ ! -f "$USAGE_SNAP" ]]; then
+  add_issue "USAGE_SNAPSHOT_MISSING|usage-snapshot.json missing; run a statusline/usage capture cycle."
+else
+  snap_age=$(( $(date +%s) - $(stat -c %Y "$USAGE_SNAP" 2>/dev/null || echo 0) ))
+  if [[ "$snap_age" -gt 10800 ]]; then
+    add_issue "USAGE_SNAPSHOT_STALE|usage-snapshot.json is older than 3h (${snap_age}s)."
+  fi
+fi
+if [[ ! -s "$USAGE_HIST" ]]; then
+  add_issue "USAGE_HISTORY_EMPTY|usage-history.jsonl missing or empty."
+fi
+
+# 3) DEPRECATED - Redundant check removed. See Step 6 (WIKI_ENFORCEMENT_FAIL).
+# Historical: Step 3 was an inline wiki check for changed tools in $TOOLS_REPO/bin.
+# It is now consolidated into scripts/bin/brain-wiki-enforcement-check.sh (Step 6).
+
+# 4) Memory mapping (hard fail -- every memory must have a wiki mirror)
+MEM_DIR="$BRAIN/brain/memory"
+if [[ -d "$MEM_DIR" ]]; then
+  unmapped=0
+  unmapped_list=""
+  for mf in "$MEM_DIR"/*.md; do
+    [[ -f "$mf" ]] || continue
+    b=$(basename "$mf")
+    [[ "$b" == "MEMORY.md" ]] && continue
+    if [[ ! -f "$BRAIN/brain/wiki/pages/$b" && ! -f "$BRAIN/brain/wiki/systems/$b" ]]; then
+      unmapped=$((unmapped+1))
+      [[ -n "$unmapped_list" ]] && unmapped_list="$unmapped_list, "
+      unmapped_list="${unmapped_list}${b}"
+    fi
+  done
+  if [[ "$unmapped" -gt 0 ]]; then
+    add_issue "MEMORY_UNMAPPED|$unmapped memory file(s) have no wiki mirror: ${unmapped_list:0:200}"
+  fi
+fi
+
+# 4a) Digest coverage -- new memory files this session must be in their digest page
+WIKI_DIR="$BRAIN/brain/wiki"
+_digest_missing=0
+_digest_missing_list=""
+_new_memories=""
+if [[ -d "$MEM_DIR" ]]; then
+  _session_start=0
+  _resume_file="$BRAIN/brain/index/session-resume.md"
+  if [[ -f "$_resume_file" ]]; then
+    _session_start=$(stat -c %Y "$_resume_file" 2>/dev/null || echo 0)
+  fi
+  for _mf in "$MEM_DIR"/*.md; do
+    [[ -f "$_mf" ]] || continue
+    _mb=$(basename "$_mf")
+    [[ "$_mb" == "MEMORY.md" ]] && continue
+    _mf_mtime=$(stat -c %Y "$_mf" 2>/dev/null || echo 0)
+    if [[ "$_mf_mtime" -gt "$_session_start" ]]; then
+      _new_memories="${_new_memories:+${_new_memories}$'\n'}${_mb}"
+    fi
+  done
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    mf="$MEM_DIR/$b"
+    [[ -f "$mf" ]] || continue
+    [[ "$b" == "MEMORY.md" ]] && continue
+    mf_type=$(sed -n '/^type:/s/^type: *//p' "$mf" | tr -d '"' | head -1)
+    _digest_file=""
+    case "$mf_type" in
+      feedback)
+        _found=false
+        for dg in "$WIKI_DIR"/pages/memory_digest_*.md; do
+          [[ -f "$dg" ]] || continue
+          if grep -q "${b%.md}" "$dg" 2>/dev/null; then
+            _found=true
+            break
+          fi
+        done
+        if ! $_found; then
+          _digest_missing=$((_digest_missing+1))
+          [[ -n "$_digest_missing_list" ]] && _digest_missing_list="$_digest_missing_list, "
+          _digest_missing_list="${_digest_missing_list}${b}"
+        fi
+        continue
+        ;;
+      project)  _digest_file="$WIKI_DIR/systems/memory_digest_active_projects.md" ;;
+      reference) _digest_file="$WIKI_DIR/systems/memory_digest_references.md" ;;
+      user)     continue ;;
+      *)        continue ;;
+    esac
+    if [[ -n "$_digest_file" && -f "$_digest_file" ]]; then
+      if ! grep -q "${b%.md}" "$_digest_file" 2>/dev/null; then
+        _digest_missing=$((_digest_missing+1))
+        [[ -n "$_digest_missing_list" ]] && _digest_missing_list="$_digest_missing_list, "
+        _digest_missing_list="${_digest_missing_list}${b}"
+      fi
+    fi
+  done <<< "$_new_memories"
+  if [[ "$_digest_missing" -gt 0 ]]; then
+    add_blocking "DIGEST_COVERAGE_MISSING|$_digest_missing new memory file(s) not found in any digest page: ${_digest_missing_list:0:200}"
+  fi
+fi
+
+# 4b) Completed tasks this session must have wiki documentation
+EVENTS_LOG="$BRAIN/brain/ops/events.log"
+if [[ -f "$EVENTS_LOG" ]]; then
+  _today_tasks=$(grep "^${TODAY}" "$EVENTS_LOG" | grep "TASK_COMPLETE" | awk '{print $3}' | sort -u)
+  _undocumented=0
+  _undocumented_list=""
+  while IFS= read -r tid; do
+    [[ -z "$tid" ]] && continue
+    if ! grep -rl "$tid" "$BRAIN/brain/wiki/" >/dev/null 2>&1; then
+      _undocumented=$((_undocumented+1))
+      [[ -n "$_undocumented_list" ]] && _undocumented_list="$_undocumented_list, "
+      _undocumented_list="${_undocumented_list}${tid}"
+    fi
+  done <<< "$_today_tasks"
+  if [[ "$_undocumented" -gt 0 ]]; then
+    add_blocking "TASK_WIKI_MISSING|$_undocumented completed task(s) today not referenced in any wiki page: ${_undocumented_list:0:200}"
+  fi
+fi
+
+# 4b) Devlog must reference all completed tasks from today
+if [[ -f "$EVENTS_LOG" ]]; then
+  _devlog_file="$BRAIN/work/logs/devlog/devlog-${TODAY}.md"
+  if [[ -f "$_devlog_file" ]]; then
+    _devlog_content=$(cat "$_devlog_file")
+    _missing_from_devlog=0
+    _missing_devlog_list=""
+    while IFS= read -r tid; do
+      [[ -z "$tid" ]] && continue
+      if ! grep -q "$tid" <<< "$_devlog_content"; then
+        _missing_from_devlog=$((_missing_from_devlog+1))
+        [[ -n "$_missing_devlog_list" ]] && _missing_devlog_list="$_missing_devlog_list, "
+        _missing_devlog_list="${_missing_devlog_list}${tid}"
+      fi
+    done <<< "$_today_tasks"
+    if [[ "$_missing_from_devlog" -gt 0 ]]; then
+      add_blocking "DEVLOG_INCOMPLETE|$_missing_from_devlog completed task(s) today not mentioned in devlog: ${_missing_devlog_list:0:200}"
+    fi
+  fi
+fi
+
+# 4b) Core memory unresolved queue (hard block)
+if command -v brain-core-memory-status >/dev/null 2>&1; then
+  cmem_count=$(brain-core-memory-status --count-only 2>/dev/null || echo "0")
+  if [[ "$cmem_count" -gt 0 ]]; then
+    add_issue "CORE_MEMORY_UNRESOLVED|$cmem_count unresolved CORE_MEMORY queue item(s). Remediate: brain-memory-promote-core \"<statement>\" --tag <topic> && brain-core-memory-resolve --id <capture_id> --run-id <proof_run_id>"
+  fi
+else
+  add_blocking "CORE_MEMORY_TOOL_MISSING|brain-core-memory-status not found in PATH."
+fi
+
+# 5) Memory compile staleness warning (non-block)
+COMPILE_LATEST="$BRAIN/work/logs/memory-compiler-latest.json"
+if [[ -f "$COMPILE_LATEST" ]]; then
+  compile_age=$(( $(date +%s) - $(stat -c %Y "$COMPILE_LATEST" 2>/dev/null || echo 0) ))
+  if [[ "$compile_age" -gt 21600 ]]; then
+    add_advisory "MEMORY_COMPILE_STALE|memory-compiler-latest.json is older than 6h (${compile_age}s). Run brain-memory-flush && brain-memory-compile."
+  fi
+else
+  if ls "$BRAIN/brain/ops/daily/"*.md >/dev/null 2>&1; then
+    add_advisory "MEMORY_COMPILE_MISSING|Daily memory files exist but memory-compiler-latest.json is missing."
+  fi
+fi
+
+# 6) Wiki enforcement check (hard fail for changed tools missing wiki/MAP)
+WIKI_CHECK="$BRAIN/scripts/bin/brain-wiki-enforcement-check.sh"
+if [[ -x "$WIKI_CHECK" ]]; then
+  WIKI_RESULT="$("$WIKI_CHECK" --json 2>/dev/null || true)"
+  WIKI_VERDICT="$(echo "$WIKI_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('verdict','SKIP'))" 2>/dev/null || echo "SKIP")"
+  WIKI_FAIL="$(echo "$WIKI_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('fail',0))" 2>/dev/null || echo "0")"
+  if [[ "$WIKI_VERDICT" == "FAIL" ]]; then
+    add_issue "WIKI_ENFORCEMENT_FAIL|$WIKI_FAIL changed tool(s) missing wiki page or MAP entry."
+  fi
+fi
+
+# 7) Publish pipeline gate (advisory)
+if command -v brain-publish-gate &>/dev/null; then
+  if ! brain-publish-gate --check &>/dev/null; then
+    _blocked_json=$(brain-publish-gate --status --json 2>/dev/null || true)
+    _blocked_count=$(echo "$_blocked_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count_blocked','?'))" 2>/dev/null || echo "?")
+    add_advisory "PUBLISH_PIPELINE_BLOCKED|${_blocked_count} draft(s) in queue with incomplete pipeline passes."
+  fi
+fi
+
+# 8) Codex handoff gate (advisory)
+if command -v brain-codex-handoff-gate &>/dev/null; then
+  if ! brain-codex-handoff-gate &>/dev/null; then
+    _handoff_violations=$(brain-codex-handoff-gate --json 2>/dev/null | \
+      python3 -c "import json,sys; d=json.load(sys.stdin); print('; '.join(d.get('violations',[][:3])))" 2>/dev/null || echo "ad hoc handoff files detected")
+    add_advisory "CODEX_HANDOFF_INFORMAL|Ad hoc handoff files detected in codex-lab. Details: ${_handoff_violations:0:200}"
+  fi
+fi
+
+# 8a) Agent-agnostic drift advisory: seat-local edits this session without
+#     any accompanying agnostic edit (brain/wiki/, brain/governance/, brain/MANUAL.md).
+#     See feedback_agent_agnostic_first. Advisory (not blocking) — legitimate
+#     seat-only edits exist (bootstrap hook wiring, CLI auth). Surfaces the
+#     drift so the operator/agent can confirm or fix before sealing.
+if command -v git >/dev/null 2>&1 && git -C "$BRAIN" rev-parse --git-dir >/dev/null 2>&1; then
+  _seat_paths=(.claude .codex .gemini CLAUDE.md AGENTS.md GEMINI.md)
+  _agn_paths=(brain/wiki brain/governance brain/MANUAL.md brain/core-knowledge)
+  _seat_local=$( {
+    git -C "$BRAIN" diff --name-only HEAD -- "${_seat_paths[@]}" 2>/dev/null
+    git -C "$BRAIN" diff --name-only --staged -- "${_seat_paths[@]}" 2>/dev/null
+    git -C "$BRAIN" ls-files --others --exclude-standard -- "${_seat_paths[@]}" 2>/dev/null
+  } | sort -u )
+  _agnostic=$( {
+    git -C "$BRAIN" diff --name-only HEAD -- "${_agn_paths[@]}" 2>/dev/null
+    git -C "$BRAIN" diff --name-only --staged -- "${_agn_paths[@]}" 2>/dev/null
+    git -C "$BRAIN" ls-files --others --exclude-standard -- "${_agn_paths[@]}" 2>/dev/null
+  } | sort -u )
+  if [[ -n "$_seat_local" && -z "$_agnostic" ]]; then
+    _seat_count=$(echo "$_seat_local" | wc -l)
+    _seat_sample=$(echo "$_seat_local" | head -3 | tr '\n' ',' | sed 's/,$//')
+    add_advisory "AGNOSTIC_DRIFT|$_seat_count seat-local file(s) changed with no agnostic counterpart (brain/wiki, brain/governance, brain/MANUAL.md, or brain/core-knowledge). Sample: ${_seat_sample}. See feedback_agent_agnostic_first. Confirm canonical content exists or add it before sealing."
+  fi
+fi
+
+# 9) Documentation candidate gate (non-blocking, auto mode only when not JSON)
+_DOC_GATE="$BRAIN/scripts/bin/brain-doc-gate"
+if [[ -x "$_DOC_GATE" ]] && ! $JSON; then
+  "$_DOC_GATE" --auto 2>/dev/null || true
+fi
+
+if $JSON; then
+  # Write lists to temporary files to avoid shell escaping issues
+  ISSUE_FILE=$(mktemp)
+  BLOCKING_FILE=$(mktemp)
+  ADVISORY_FILE=$(mktemp)
+  printf "%s\n" "${ISSUES[@]}" > "$ISSUE_FILE"
+  printf "%s\n" "${BLOCKING[@]}" > "$BLOCKING_FILE"
+  printf "%s\n" "${ADVISORY[@]}" > "$ADVISORY_FILE"
+  
+  python3 "$BRAIN/scripts/lib/brain-closeout-gate-fix.py" "$ISSUE_FILE" "$BLOCKING_FILE" "$ADVISORY_FILE"
+  rm -f "$ISSUE_FILE" "$BLOCKING_FILE" "$ADVISORY_FILE"
+else
+
+  echo "=== Closeout Gate ==="
+  [[ ${#ISSUES[@]} -eq 0 ]] && echo "PASS: Issues" || { echo "FAIL: Issues"; for i in "${ISSUES[@]}"; do echo "  - $i"; done; }
+  [[ ${#BLOCKING[@]} -eq 0 ]] && echo "PASS: Blocking Warnings" || { echo "BLOCKING WARNINGS"; for w in "${BLOCKING[@]}"; do echo "  - $w"; done; }
+  [[ ${#ADVISORY[@]} -eq 0 ]] && echo "PASS: Advisory Warnings" || { echo "ADVISORY WARNINGS"; for w in "${ADVISORY[@]}"; do echo "  - $w"; done; }
+fi
+
+if [[ ${#ISSUES[@]} -gt 0 || ${#BLOCKING[@]} -gt 0 ]]; then
+  exit 1
+fi
+exit 0

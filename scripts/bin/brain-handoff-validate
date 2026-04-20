@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# brain-handoff-validate — canonical wrapper for handoff_refresh_validate.sh
+HDIR="${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/handoff-system"
+if [[ "handoff_refresh_validate.sh" == *.py ]]; then
+  exec python3 "$HDIR/handoff_refresh_validate.sh" "$@"
+else
+  exec bash "$HDIR/handoff_refresh_validate.sh" "$@"
+fi

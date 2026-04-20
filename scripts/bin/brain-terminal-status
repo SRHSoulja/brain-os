@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# brain-terminal-status — Report ChatGPT terminal monitor state
+#
+# Checks whether the brain-watch-terminal inotifywait watcher is running,
+# and optionally the brain-advisor-api MCP server state.
+#
+# Usage:
+#   brain-terminal-status              # human-readable one-liner
+#   brain-terminal-status --json       # JSON output
+#   brain-terminal-status --quiet      # exit 0=off, 1=on (for scripts)
+#
+# This is NOT a start/stop tool. Use /brain-watch-terminal to start,
+# /brain-stop-terminal to stop.
+
+set -euo pipefail
+
+MODE="human"
+[[ "${1:-}" == "--json" ]] && MODE="json"
+[[ "${1:-}" == "--quiet" ]] && MODE="quiet"
+
+# ── Watcher state ─────────────────────────────────────────────────
+WATCHER_PID=""
+WATCHER_RUNNING=false
+if [[ -f /tmp/brain-terminal-watcher.pid ]]; then
+  WATCHER_PID=$(cat /tmp/brain-terminal-watcher.pid 2>/dev/null || echo "")
+  if [[ -n "$WATCHER_PID" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
+    WATCHER_RUNNING=true
+  fi
+fi
+
+# ── Advisor API state (ChatGPT MCP server) ────────────────────────
+API_RUNNING=false
+API_PID=""
+if [[ -f /tmp/brain-advisor-api.pid ]]; then
+  API_PID=$(cat /tmp/brain-advisor-api.pid 2>/dev/null || echo "")
+  [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null && API_RUNNING=true
+fi
+# Fallback: check port 7735
+if ! $API_RUNNING; then
+  ss -tlnp 2>/dev/null | grep -q ':7735' && API_RUNNING=true
+fi
+
+# ── Promptbox queue depth ─────────────────────────────────────────
+BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+QUEUE_DIR="$BRAIN/brain/ops/promptbox/terminal"
+QUEUE_COUNT=0
+if [[ -d "$QUEUE_DIR" ]]; then
+  QUEUE_COUNT=$(find "$QUEUE_DIR" -maxdepth 1 -name '*.md' \
+    ! -name 'latest.md' ! -name 'response-latest.md' \
+    ! -name 'brain-watch-terminal.md' ! -name 'brain-stop-terminal.md' \
+    2>/dev/null | wc -l)
+fi
+
+# ── Output ────────────────────────────────────────────────────────
+if [[ "$MODE" == "quiet" ]]; then
+  $WATCHER_RUNNING && exit 1 || exit 0
+fi
+
+if [[ "$MODE" == "json" ]]; then
+  python3 -c "
+import json
+print(json.dumps({
+  'watcher_running': $([ '$WATCHER_RUNNING' = 'true' ] && echo 'true' || echo 'false'),
+  'watcher_pid': '${WATCHER_PID:-}',
+  'api_running': $([ '$API_RUNNING' = 'true' ] && echo 'true' || echo 'false'),
+  'queue_depth': ${QUEUE_COUNT},
+}, indent=2))
+"
+  exit 0
+fi
+
+# Human mode
+if $WATCHER_RUNNING; then
+  echo "Terminal monitor: ON (watcher pid $WATCHER_PID, ${QUEUE_COUNT} queued prompts)"
+else
+  echo "Terminal monitor: OFF"
+fi
+
+if $API_RUNNING; then
+  echo "Advisor API (ChatGPT MCP): running on :7735"
+else
+  echo "Advisor API (ChatGPT MCP): not running — start with brain-advisor-serve start"
+fi

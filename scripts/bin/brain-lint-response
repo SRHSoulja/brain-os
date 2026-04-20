@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# brain-lint-response — validate response-latest.md against advisor contract
+# Exits 0 (PASS) or 1 (WARN) — never fatal to calling workflows.
+# Usage: brain-lint-response [path-to-response-file]
+
+BRAIN="${BRAIN:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null)}"
+RESPONSE_FILE="${1:-$BRAIN/brain/ops/promptbox/terminal/response-latest.md}"
+
+if [[ ! -f "$RESPONSE_FILE" ]]; then
+  echo "SKIP: $RESPONSE_FILE not found"
+  exit 0
+fi
+
+# Required section prefixes (match at start of line, case-insensitive)
+REQUIRED_SECTIONS=(
+  "## Status"
+  "## Root Cause"
+  "## Files Changed"
+  "## Behavior Change"
+  "## Verification"
+  "## Regressions Check"
+  "## Open Risk"
+  "## Recommended Next Action"
+  "## Execution Anomalies"
+)
+
+MISSING=()
+for section in "${REQUIRED_SECTIONS[@]}"; do
+  if ! grep -qi "^${section}" "$RESPONSE_FILE"; then
+    MISSING+=("$section")
+  fi
+done
+
+if [[ ${#MISSING[@]} -eq 0 ]]; then
+  echo "PASS: all 9 required sections present"
+  exit 0
+else
+  echo "WARN: response-latest.md missing ${#MISSING[@]} required section(s):"
+  for s in "${MISSING[@]}"; do
+    echo "  - $s"
+  done
+  exit 1
+fi

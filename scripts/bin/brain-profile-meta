@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# brain-profile-meta — Look up execution profile attributes (context_tier, preamble, model routing) used by dispatch and subagent tools
+# Usage:
+#   brain-profile-meta --profile <id>              Print full profile as JSON
+#   brain-profile-meta --profile <id> --field <f>  Print single field value
+#   brain-profile-meta --list                      List all profile IDs
+#   brain-profile-meta --list --field context_tier List all IDs with a field value
+#
+# Agent-agnostic: callable by Claude, Codex, Gemini seats via ~/bin symlink.
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+PROFILES="$BRAIN/brain/ops/execution-profiles.json"
+
+PROFILE_ID=""
+FIELD=""
+LIST=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)  PROFILE_ID="$2"; shift 2 ;;
+    --field)    FIELD="$2"; shift 2 ;;
+    --list)     LIST=true; shift ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: brain-profile-meta --profile <id> [--field <field>]
+       brain-profile-meta --list [--field <field>]
+
+Options:
+  --profile <id>   Profile ID to look up (e.g. rapid-implementer)
+  --field <name>   Return only this field's value (e.g. context_tier, preamble_file)
+  --list           List all profile IDs (with --field: show id=value pairs)
+
+Exit codes:
+  0  Match found / list emitted
+  1  Profile not found or field missing
+
+Examples:
+  brain-profile-meta --profile systems-architect --field context_tier
+  brain-profile-meta --profile repo-auditor --field preferred_runtimes
+  brain-profile-meta --list --field context_tier
+  brain-profile-meta --profile rapid-implementer
+HELP
+      exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$PROFILES" ]]; then
+  echo "Error: profiles file not found: $PROFILES" >&2
+  exit 1
+fi
+
+if $LIST; then
+  python3 -c "
+import json, sys
+data = json.load(open('$PROFILES'))
+field = '$FIELD'
+for p in data.get('profiles', []):
+    pid = p.get('profile_id', '?')
+    if field:
+        val = p.get(field, '')
+        if isinstance(val, (list, dict)):
+            val = json.dumps(val)
+        print(f'{pid}={val}')
+    else:
+        print(pid)
+"
+  exit 0
+fi
+
+if [[ -z "$PROFILE_ID" ]]; then
+  echo "Error: --profile or --list required" >&2
+  exit 1
+fi
+
+python3 -c "
+import json, sys
+data = json.load(open('$PROFILES'))
+profile = next((p for p in data.get('profiles', []) if p.get('profile_id') == '$PROFILE_ID'), None)
+if profile is None:
+    print('Error: profile not found: $PROFILE_ID', file=sys.stderr)
+    sys.exit(1)
+field = '$FIELD'
+if field:
+    val = profile.get(field)
+    if val is None:
+        print(f'Error: field \"{field}\" not in profile \"{$PROFILE_ID}\"', file=sys.stderr)
+        sys.exit(1)
+    if isinstance(val, (list, dict)):
+        print(json.dumps(val))
+    else:
+        print(val)
+else:
+    print(json.dumps(profile, indent=2, ensure_ascii=False))
+"

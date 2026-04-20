@@ -1,0 +1,161 @@
+#!/bin/bash
+# brain-task-handoff — Compatibility wrapper for review dispatch
+# Usage:
+#   brain-task-handoff <TASK-ID> [--type verification|gap-analysis|audit|prompt] [--dry-run] [--legacy-sidecar]
+#
+# Default path is dispatch-native via brain-review-dispatch.
+# Legacy Codex sidecar path is retained behind --legacy-sidecar for transition.
+#
+# Types:
+#   verification  — post-completion: verify work was implemented correctly
+#   gap-analysis  — post-completion: identify remaining improvements
+#   audit         — any time: read-only scope and implementation analysis
+#   prompt        — pre-execution: generate scoped implementation directive
+#
+# The prompt type uses Codex to analyze a task before execution and produce
+# a focused implementation prompt with constraints, risks, and approach.
+# Use for ambiguous, cross-system, or higher-risk tasks. Skip for simple builds.
+#
+# This wrapper exists to preserve old command ergonomics while deprecating
+# vendor-specific sidecar routing.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+CODEX_LAB="${CODEX_LAB_DIR:-$HOME/codex-lab}"
+HANDOFF_CLI="$HOME/bin/codex-claude-handoff"
+
+TASK_ID=""
+HANDOFF_TYPE="verification"
+DRY_RUN=false
+LEGACY_SIDECAR=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)    HANDOFF_TYPE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --legacy-sidecar) LEGACY_SIDECAR=true; shift ;;
+    -*)        echo "Unknown flag: $1"; exit 1 ;;
+    *)         TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Usage: brain-task-handoff <TASK-ID> [--type verification|gap-analysis|audit|prompt] [--dry-run] [--legacy-sidecar]"
+  echo ""
+  echo "Dispatches a Brain task review request via the canonical dispatch lane."
+  echo "Use --legacy-sidecar to force old codex-claude-handoff behavior."
+  echo ""
+  echo "Types:"
+  echo "  verification   — verify completed work (default)"
+  echo "  gap-analysis   — identify remaining improvements"
+  echo "  audit          — read-only analysis of task scope"
+  echo "  prompt         — pre-execution: generate scoped implementation directive"
+  exit 1
+fi
+
+# ── Canonical path: dispatch-native review lane ───────────────────
+if [[ "$LEGACY_SIDECAR" != "true" ]]; then
+  ARGS=("$TASK_ID" --type "$HANDOFF_TYPE")
+  $DRY_RUN && ARGS+=(--dry-run)
+  exec "$TOOLS/bin/brain-review-dispatch" "${ARGS[@]}"
+fi
+
+# ── Legacy compatibility path (Codex sidecar) ─────────────────────
+echo "Legacy sidecar mode enabled (--legacy-sidecar)."
+
+# ── Compile execution pack ────────────────────────────────────────
+PACK_JSON=$("$TOOLS/bin/brain-task-pack" "$TASK_ID" 2>/dev/null) || {
+  echo "Error: failed to compile execution pack for $TASK_ID"
+  exit 1
+}
+
+PACK_FINGERPRINT=$(echo "$PACK_JSON" | sha256sum | cut -d' ' -f1)
+
+# Extract pack fields for the handoff
+_GOAL=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('goal',''))" 2>/dev/null)
+_NODE=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('node',''))" 2>/dev/null)
+_SUMMARY=$(echo "$PACK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('summary','')[:200])" 2>/dev/null)
+_CRITERIA=$(echo "$PACK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for c in d.get('completion_criteria', []):
+    print(f'- {c}')
+" 2>/dev/null)
+
+# ── Build objective ───────────────────────────────────────────────
+case "$HANDOFF_TYPE" in
+  verification)
+    SUBMIT_CMD="submit-verification"
+    DELIVERABLE="$CODEX_LAB/audits/${TASK_ID}-verification.md"
+    OBJECTIVE="Verify whether ${TASK_ID} (${_GOAL}) was implemented correctly and safely. Task node: ${_NODE}. Pack fingerprint: ${PACK_FINGERPRINT:0:16}. Completion criteria: ${_CRITERIA}. Documentation accuracy: if the task created or updated wiki pages for tools or systems, read the wiki page AND the actual code/files it documents, then confirm the wiki accurately describes what was implemented. Flag any wiki content that is vague, stale, or does not match the code."
+    ;;
+  gap-analysis)
+    SUBMIT_CMD="submit-gap-analysis"
+    DELIVERABLE="$CODEX_LAB/audits/${TASK_ID}-gap-analysis.md"
+    OBJECTIVE="Identify the highest-leverage remaining improvement after ${TASK_ID} (${_GOAL}) was completed. Task node: ${_NODE}. Context: ${_SUMMARY}"
+    ;;
+  audit)
+    SUBMIT_CMD="submit-audit"
+    DELIVERABLE="$CODEX_LAB/audits/${TASK_ID}-audit.md"
+    OBJECTIVE="Perform a read-only audit of the scope and implementation of ${TASK_ID} (${_GOAL}). Task node: ${_NODE}. Pack fingerprint: ${PACK_FINGERPRINT:0:16}."
+    ;;
+  prompt)
+    SUBMIT_CMD="submit-next-prompt"
+    DELIVERABLE="$CODEX_LAB/audits/${TASK_ID}-prompt.md"
+    _CONTRACT=$(echo "$PACK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d.get('execution_contract', {})
+parts = []
+if c.get('authority_owner'): parts.append(f'authority: {c[\"authority_owner\"]}')
+if c.get('allowed_write_surfaces'): parts.append(f'write surfaces: {\", \".join(c[\"allowed_write_surfaces\"])}')
+if c.get('rollback_reference'): parts.append(f'rollback: {c[\"rollback_reference\"]}')
+print('; '.join(parts) if parts else 'none')
+" 2>/dev/null)
+    _INSTRUCTIONS=$(echo "$PACK_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('execution_instructions', '')[:500])
+" 2>/dev/null)
+    OBJECTIVE="Generate a scoped implementation directive for ${TASK_ID} before execution begins. Task: ${_GOAL}. Node: ${_NODE}. Summary: ${_SUMMARY}. Completion criteria: ${_CRITERIA}. Execution contract: ${_CONTRACT}. Current instructions: ${_INSTRUCTIONS}. Analyze the task scope, identify risks or ambiguities, and produce a focused implementation prompt with: (1) recommended approach, (2) key constraints Claude must follow, (3) files likely to be touched, (4) potential pitfalls. Keep it to one implementable directive."
+    ;;
+  *)
+    echo "Error: unknown handoff type '$HANDOFF_TYPE' (use verification, gap-analysis, audit, or prompt)"
+    exit 1
+    ;;
+esac
+
+# ── Output ────────────────────────────────────────────────────────
+echo "Brain → Codex Handoff"
+echo "  Task:        $TASK_ID"
+echo "  Goal:        $_GOAL"
+echo "  Node:        $_NODE"
+echo "  Type:        $HANDOFF_TYPE"
+echo "  Fingerprint: ${PACK_FINGERPRINT:0:16}"
+echo "  Deliverable: $DELIVERABLE"
+echo ""
+
+if $DRY_RUN; then
+  echo "Dry run — would submit:"
+  echo "  $HANDOFF_CLI $SUBMIT_CMD \\"
+  echo "    --repo-root $BRAIN \\"
+  echo "    --deliverable $DELIVERABLE \\"
+  echo "    --objective \"$OBJECTIVE\" \\"
+  echo "    --full-auto"
+  exit 0
+fi
+
+# ── Submit handoff ────────────────────────────────────────────────
+echo "Submitting to Codex..."
+"$HANDOFF_CLI" "$SUBMIT_CMD" \
+  --repo-root "$BRAIN" \
+  --deliverable "$DELIVERABLE" \
+  --objective "$OBJECTIVE" \
+  --full-auto 2>&1
+
+echo ""
+echo "Handoff submitted."
+echo "  Watch: $DELIVERABLE"
+echo "  Check: brain-codex-check"

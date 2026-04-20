@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# brain-handoff-seed — canonical wrapper for handoff_seed_tasks.sh
+HDIR="${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/handoff-system"
+if [[ "handoff_seed_tasks.sh" == *.py ]]; then
+  exec python3 "$HDIR/handoff_seed_tasks.sh" "$@"
+else
+  exec bash "$HDIR/handoff_seed_tasks.sh" "$@"
+fi

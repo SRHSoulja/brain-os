@@ -1,0 +1,189 @@
+#!/bin/bash
+# brain-token-report — Generate token usage report from Claude Code session logs
+#
+# Usage:
+#   brain-token-report                — report for current/latest session
+#   brain-token-report <session-id>   — report for specific session
+#   brain-token-report --all          — summary across all gmgn-brain sessions
+#   brain-token-report --json         — machine-readable output
+
+set -uo pipefail
+
+PROJECT_DIR="$HOME/.claude/projects/-home-arson-gmgn-brain"
+JSON=false
+ALL=false
+SESSION_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON=true; shift ;;
+    --all) ALL=true; shift ;;
+    *) SESSION_ID="$1"; shift ;;
+  esac
+done
+
+python3 - "$PROJECT_DIR" "$SESSION_ID" "$ALL" "$JSON" << 'PYEOF'
+import json, os, sys, glob
+from datetime import datetime
+
+PROJECT_DIR = sys.argv[1]
+SESSION_ID = sys.argv[2]
+ALL = sys.argv[3].lower() == "true"
+AS_JSON = sys.argv[4].lower() == "true"
+
+def analyze_session(filepath):
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_create = 0
+    turns = 0
+    first_ts = None
+    last_ts = None
+
+    for line in open(filepath):
+        try:
+            d = json.loads(line)
+            ts = d.get("timestamp")
+            if ts and not first_ts:
+                first_ts = ts
+            if ts:
+                last_ts = ts
+
+            usage = d.get("message", {}).get("usage")
+            if not usage or not isinstance(usage, dict):
+                continue
+            inp = usage.get("input_tokens", 0) or 0
+            out = usage.get("output_tokens", 0) or 0
+            cr = usage.get("cache_read_input_tokens", 0) or 0
+            cc = usage.get("cache_creation_input_tokens", 0) or 0
+            if inp > 0 or out > 0 or cr > 0 or cc > 0:
+                total_input += inp
+                total_output += out
+                total_cache_read += cr
+                total_cache_create += cc
+                turns += 1
+        except:
+            continue
+
+    total_context = total_input + total_cache_read + total_cache_create
+    cache_rate = (total_cache_read / total_context * 100) if total_context > 0 else 0
+    ctx_ratio = (total_context / total_output) if total_output > 0 else 0
+
+    return {
+        "turns": turns,
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cache_read": total_cache_read,
+        "cache_create": total_cache_create,
+        "total_context": total_context,
+        "cache_hit_rate": round(cache_rate, 1),
+        "context_output_ratio": round(ctx_ratio, 0),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+    }
+
+def print_report(name, stats):
+    print(f"=== {name} ===")
+    print(f"  Turns:           {stats['turns']:>12,}")
+    print(f"  Non-cached:      {stats['input_tokens']:>12,}")
+    print(f"  Cache hits:      {stats['cache_read']:>12,}")
+    print(f"  Cache writes:    {stats['cache_create']:>12,}")
+    print(f"  Total context:   {stats['total_context']:>12,}")
+    print(f"  Output:          {stats['output_tokens']:>12,}")
+    print(f"  Cache hit rate:  {stats['cache_hit_rate']:>11}%")
+    print(f"  Context/Output:  {stats['context_output_ratio']:>10.0f}x")
+    if stats.get("first_ts") and stats.get("last_ts"):
+        print(f"  Period:          {str(stats['first_ts'])[:19]} to {str(stats['last_ts'])[:19]}")
+    print()
+
+if ALL:
+    sessions = sorted(glob.glob(os.path.join(PROJECT_DIR, "*.jsonl")))
+    all_stats = []
+    for f in sessions:
+        sid = os.path.basename(f).replace(".jsonl", "")
+        stats = analyze_session(f)
+        if stats["turns"] > 0:
+            stats["session_id"] = sid
+            all_stats.append(stats)
+
+    if AS_JSON:
+        print(json.dumps({"sessions": all_stats}, indent=2))
+    else:
+        print(f"=== Token Report: {len(all_stats)} sessions ===\n")
+        total_turns = sum(s["turns"] for s in all_stats)
+        total_output = sum(s["output_tokens"] for s in all_stats)
+        total_context = sum(s["total_context"] for s in all_stats)
+        total_cache = sum(s["cache_read"] for s in all_stats)
+        avg_cache_rate = (total_cache / total_context * 100) if total_context > 0 else 0
+
+        print(f"  Total sessions:  {len(all_stats)}")
+        print(f"  Total turns:     {total_turns:>12,}")
+        print(f"  Total context:   {total_context:>12,}")
+        print(f"  Total output:    {total_output:>12,}")
+        print(f"  Avg cache rate:  {avg_cache_rate:>11.1f}%")
+        print()
+        print("Per-session breakdown:")
+        for s in all_stats[-10:]:
+            sid_short = s["session_id"][:8]
+            print(f"  {sid_short}  turns={s['turns']:<6} out={s['output_tokens']:<10,} cache={s['cache_hit_rate']}%")
+else:
+    if SESSION_ID:
+        filepath = os.path.join(PROJECT_DIR, f"{SESSION_ID}.jsonl")
+    else:
+        files = sorted(glob.glob(os.path.join(PROJECT_DIR, "*.jsonl")), key=os.path.getmtime)
+        filepath = files[-1] if files else None
+
+    if not filepath or not os.path.exists(filepath):
+        print(f"Session not found: {SESSION_ID or 'latest'}")
+        sys.exit(1)
+
+    sid = os.path.basename(filepath).replace(".jsonl", "")
+    stats = analyze_session(filepath)
+
+    # Read authoritative usage snapshot if available
+    snapshot = None
+    snap_path = os.path.expanduser("~/gmgn-brain/work/logs/usage-snapshot.json")
+    try:
+        with open(snap_path) as f:
+            snapshot = json.load(f)
+    except Exception:
+        pass
+
+    if AS_JSON:
+        stats["session_id"] = sid
+        if snapshot:
+            stats["plan_state"] = snapshot.get("rate_limits")
+            stats["session_cost_usd"] = snapshot.get("cost", {}).get("total_cost_usd")
+        print(json.dumps(stats, indent=2))
+    else:
+        print_report(f"Session {sid[:8]}", stats)
+
+        if snapshot:
+            rl = snapshot.get("rate_limits", {})
+            five = rl.get("five_hour") or {}
+            seven = rl.get("seven_day") or {}
+            cost_usd = snapshot.get("cost", {}).get("total_cost_usd")
+            captured = snapshot.get("captured_at", "")[:19]
+
+            print(f"=== Plan State (authoritative, via statusline) ===")
+            if five.get("used_percentage") is not None:
+                import time
+                remaining = int(five.get("resets_at", 0)) - int(time.time())
+                cd = ""
+                if remaining > 0:
+                    h, m = divmod(remaining // 60, 60)
+                    cd = f" (resets in {h}h{m:02d}m)"
+                print(f"  5h session:      {five['used_percentage']}%{cd}")
+            if seven.get("used_percentage") is not None:
+                remaining = int(seven.get("resets_at", 0)) - int(time.time())
+                cd = ""
+                if remaining > 0:
+                    d, rem = divmod(remaining, 86400)
+                    h = rem // 3600
+                    cd = f" (resets in {d}d{h}h)"
+                print(f"  7d weekly:       {seven['used_percentage']}%{cd}")
+            if cost_usd is not None:
+                print(f"  Session cost:    ${cost_usd:.2f} (API-rate equivalent)")
+            print(f"  Snapshot at:     {captured}")
+            print()
+PYEOF

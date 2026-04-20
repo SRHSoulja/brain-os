@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# brain-session-start -- Agent-agnostic session start logger
+# Usage: brain-session-start --agent <name> [--seat laptop|ve] [--mode interactive|bridge|standby]
+#
+# Logs SESSION_START to events.log + events.jsonl, writes session marker file.
+# Called by brain-agent-bootstrap automatically, or manually by any agent.
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+EVENTS_LOG="$BRAIN/brain/ops/events.log"
+EVENTS_JSONL="$BRAIN/brain/ops/events.jsonl"
+SESSION_FILE="$BRAIN/brain/ops/.active-session.json"
+
+# Fresh-clone safety: ensure runtime surfaces exist even when untracked in git.
+mkdir -p "$BRAIN/brain/ops" "$BRAIN/work/logs"
+touch "$EVENTS_LOG" "$EVENTS_JSONL" "$BRAIN/work/logs/post-commit.log"
+
+AGENT=""
+SEAT="laptop"
+MODE="interactive"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="$2"; shift 2 ;;
+    --seat) SEAT="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: brain-session-start --agent <name> [--seat laptop|ve] [--mode interactive|bridge|standby]"
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$AGENT" ]]; then
+  echo "Error: --agent <name> required" >&2
+  exit 1
+fi
+
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SESSION_ID="sess-$(date +%Y%m%d-%H%M%S)-${AGENT}"
+EVT_ID="evt-$(date +%Y%m%d-%H%M%S)-$(head -c3 /dev/urandom | xxd -p)"
+HOSTNAME=$(hostname -s 2>/dev/null || echo "unknown")
+
+# Count current queue/active state
+QUEUED=$(find "$BRAIN/brain/ops/tasks/queue/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+ACTIVE=$(find "$BRAIN/brain/ops/tasks/active/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+COMPLETED=$(find "$BRAIN/brain/ops/tasks/completed/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+
+# Write session marker (readable by brain-session-end)
+cat > "$SESSION_FILE" <<EOF
+{
+  "session_id": "$SESSION_ID",
+  "agent": "$AGENT",
+  "seat": "$SEAT",
+  "mode": "$MODE",
+  "started_at": "$TS",
+  "tasks_at_start": {"queued": $QUEUED, "active": $ACTIVE, "completed": $COMPLETED},
+  "commits_at_start": $(cd "$BRAIN" && git rev-list --count HEAD 2>/dev/null || echo 0)
+}
+EOF
+
+# Log to events.log (human-readable)
+echo "$TS SESSION_START $AGENT $SEAT/$MODE queue=${QUEUED} active=${ACTIVE}" >> "$EVENTS_LOG"
+
+# Log to events.jsonl (structured)
+python3 -c "
+import json, sys
+evt = {
+    'event_id': '$EVT_ID',
+    'ts': '$TS',
+    'source': 'local',
+    'source_host': '$HOSTNAME',
+    'op': 'SESSION_START',
+    'entity_id': '$SESSION_ID',
+    'surface': 'brain/ops/.active-session.json',
+    'meta': {
+        'agent': '$AGENT',
+        'seat': '$SEAT',
+        'mode': '$MODE',
+        'tasks_queued': $QUEUED,
+        'tasks_active': $ACTIVE,
+        'tasks_completed': $COMPLETED
+    }
+}
+print(json.dumps(evt, separators=(',', ':')))
+" >> "$EVENTS_JSONL"
+
+echo "session-start: $SESSION_ID ($AGENT on $SEAT)"

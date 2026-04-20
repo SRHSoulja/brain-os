@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# brain-codex-bootstrap -- Codex-native startup for Brain task lifecycle
+# Usage:
+#   brain-codex-bootstrap            # read-only startup
+#   brain-codex-bootstrap --deep     # include heavier consistency checks
+
+DEEP=false
+if [[ "${1:-}" == "--deep" ]]; then
+  DEEP=true
+fi
+
+BRAIN="$HOME/gmgn-brain"
+OPS="$BRAIN/brain/ops/tasks"
+
+echo "=== Codex Bootstrap ==="
+echo "Date: $(date -Iseconds)"
+
+echo "[1/4] Refresh session surfaces"
+if command -v brain-resume >/dev/null 2>&1; then
+  brain-resume >/dev/null || true
+else
+  echo "  WARN: brain-resume missing"
+fi
+
+echo "[2/4] Task surface counts"
+Q=0; A=0; C=0
+[[ -d "$OPS/queue" ]] && Q=$(find "$OPS/queue" -maxdepth 1 -name 'TASK-*.md' | wc -l | tr -d ' ')
+[[ -d "$OPS/active" ]] && A=$(find "$OPS/active" -maxdepth 1 -name 'TASK-*.md' | wc -l | tr -d ' ')
+[[ -d "$OPS/completed" ]] && C=$(find "$OPS/completed" -maxdepth 1 -name 'TASK-*.md' | wc -l | tr -d ' ')
+echo "  queued=$Q active=$A completed=$C"
+
+echo "[3/4] Resolve next task"
+NEXT=""
+if command -v brain-next-task >/dev/null 2>&1; then
+  NEXT=$(brain-next-task codex --dry-run --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_id",""))' 2>/dev/null || true)
+fi
+if [[ -z "$NEXT" && -d "$OPS/queue" ]]; then
+  NEXT=$(ls "$OPS/queue"/TASK-*.md 2>/dev/null | head -1 | xargs -r basename | sed 's/.md$//')
+fi
+if [[ -n "$NEXT" ]]; then
+  echo "  next=$NEXT"
+  echo "  preview: brain-codex-run-next $NEXT"
+  echo "  execute: brain-codex-run-next --execute $NEXT"
+else
+  echo "  no queued tasks found"
+fi
+
+if [[ "$DEEP" == true ]]; then
+  echo "[4/4] Deep checks"
+  command -v brain-state-check >/dev/null 2>&1 && brain-state-check >/dev/null || true
+  command -v brain-task-reconcile >/dev/null 2>&1 && brain-task-reconcile >/dev/null || true
+  echo "  deep checks complete"
+else
+  echo "[4/4] Deep checks skipped (use --deep)"
+fi

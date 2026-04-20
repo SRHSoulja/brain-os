@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# brain-wiki-harvest-links -- Parse [[wiki_link]] refs from page bodies, resolve to W-NNNN, backfill related: frontmatter
+# Usage:
+#   brain-wiki-harvest-links [--dry-run]
+#   brain-wiki-harvest-links --report   (show unresolvable links)
+# Exit codes: 0=success, 1=error
+import os, sys, re, json
+from pathlib import Path
+
+BRAIN = Path(os.environ.get("BRAIN_DIR", Path.home() / "gmgn-brain"))
+WIKI  = BRAIN / "brain/wiki"
+SCOPED_DIRS = ["tools", "pages", "systems"]
+
+dry_run = "--dry-run" in sys.argv
+report  = "--report" in sys.argv
+
+# --- build slug → page_id + path index ---
+def build_index():
+    """Return slug→{page_id, path} and path→page_id maps."""
+    slug_map = {}   # slug (filename without .md) → {page_id, rel_path}
+    path_map = {}   # rel_path → page_id
+
+    for scope in SCOPED_DIRS:
+        for md in (WIKI / scope).rglob("*.md"):
+            if md.name == "MAP.md": continue
+            rel = md.relative_to(WIKI).as_posix()
+            content = ""
+            try:
+                content = md.read_text(errors="replace")
+            except: continue
+            if not content.startswith("---"): continue
+            # Extract page_id from frontmatter
+            m = re.search(r'^page_id:\s*["\']?(W-\d+)["\']?', content, re.MULTILINE)
+            if not m: continue
+            page_id = m.group(1)
+            slug = md.stem   # filename without .md
+            slug_map[slug] = {"page_id": page_id, "path": rel}
+            path_map[rel] = page_id
+
+    return slug_map, path_map
+
+# --- frontmatter helpers ---
+def parse_frontmatter(content):
+    if not content.startswith("---"):
+        return None, None, content
+    lines = content.split("\n")
+    fm_lines = []
+    end_line = None
+    for i, line in enumerate(lines[1:], 1):
+        if line.endswith("---") and line.strip() != "---":
+            fm_lines.append(line[:-3])
+            end_line = i
+            break
+        if line.strip() == "---":
+            end_line = i
+            break
+        fm_lines.append(line)
+    if end_line is None:
+        return None, None, content
+    body = "\n".join(lines[end_line + 1:])
+    return fm_lines, end_line, body
+
+def get_related(fm_lines):
+    """Parse related: field, return list of current values."""
+    for line in fm_lines:
+        if re.match(r'^related:', line):
+            val = line[len("related:"):].strip()
+            if val.startswith("[") and val.endswith("]"):
+                items = re.findall(r'["\']?([^"\'>,\[\]\s]+)["\']?', val)
+                return [x for x in items if x]
+            elif val:
+                return [val]
+            return []
+    return []
+
+def set_related(fm_lines, related_list):
+    """Replace or add related: field."""
+    json_list = json.dumps(related_list)
+    new_line = f"related: {json_list}"
+    for i, line in enumerate(fm_lines):
+        if re.match(r'^related:', line):
+            fm_lines[i] = new_line
+            return fm_lines
+    fm_lines.append(new_line)
+    return fm_lines
+
+def rebuild_content(fm_lines, body):
+    return "---\n" + "\n".join(fm_lines) + "\n---\n" + body
+
+# --- extract [[links]] from body, skip code blocks and shell syntax ---
+SHELL_LINK_RE = re.compile(r'\[\[\s*[-!]')   # [[ -x or [[ !
+WIKI_LINK_RE  = re.compile(r'\[\[([a-zA-Z][a-zA-Z0-9_\-./]*)\]\]')
+FENCED_RE     = re.compile(r'```.*?```', re.DOTALL)
+INLINE_CODE_RE = re.compile(r'`[^`]+`')
+
+def extract_wiki_links(body):
+    # Strip fenced code blocks and inline code
+    clean = FENCED_RE.sub("", body)
+    clean = INLINE_CODE_RE.sub("", clean)
+    links = set()
+    for m in WIKI_LINK_RE.finditer(clean):
+        raw = m.group(1)
+        links.add(raw)
+    return links
+
+# --- main ---
+slug_map, path_map = build_index()
+
+updated = 0
+skipped_no_id = 0
+unresolvable = []
+pages_processed = 0
+
+for scope in SCOPED_DIRS:
+    for md in sorted((WIKI / scope).rglob("*.md")):
+        if md.name == "MAP.md": continue
+        rel = md.relative_to(WIKI).as_posix()
+        try:
+            content = md.read_text(errors="replace")
+        except: continue
+        if not content.startswith("---"): continue
+
+        fm_lines, end_line, body = parse_frontmatter(content)
+        if fm_lines is None: continue
+
+        # Only process pages that have a page_id
+        m = re.search(r'^page_id:\s*["\']?(W-\d+)["\']?', content, re.MULTILINE)
+        if not m:
+            skipped_no_id += 1
+            continue
+
+        pages_processed += 1
+        wiki_links = extract_wiki_links(body)
+        if not wiki_links:
+            continue
+
+        current_related = get_related(fm_lines)
+        current_ids = set(x for x in current_related if x.startswith("W-"))
+        current_slugs = set(x for x in current_related if not x.startswith("W-"))
+
+        new_ids = set(current_ids)
+        for link in wiki_links:
+            slug = Path(link).stem if "/" in link else link
+            if slug in slug_map:
+                new_ids.add(slug_map[slug]["page_id"])
+            else:
+                unresolvable.append({"source": rel, "link": link})
+
+        # Also convert existing slug-based related: entries to IDs
+        for slug in current_slugs:
+            clean_slug = Path(slug).stem
+            if clean_slug in slug_map:
+                new_ids.add(slug_map[clean_slug]["page_id"])
+            # else leave as-is (external refs, governance files, etc.)
+
+        new_related = sorted(new_ids) + [x for x in current_related if not x.startswith("W-") and Path(x).stem not in slug_map]
+
+        if set(new_related) != set(current_related) or sorted(new_related) != sorted(current_related):
+            fm_lines = set_related(fm_lines, new_related)
+            new_content = rebuild_content(fm_lines, body)
+            if not dry_run:
+                md.write_text(new_content)
+            updated += 1
+
+print(f"brain-wiki-harvest-links complete")
+print(f"  pages processed:   {pages_processed}")
+print(f"  pages updated:     {updated}")
+print(f"  skipped (no ID):   {skipped_no_id}")
+print(f"  unresolvable refs: {len(unresolvable)}")
+
+if report and unresolvable:
+    print()
+    print("Unresolvable [[links]]:")
+    seen = set()
+    for u in unresolvable:
+        key = u["link"]
+        if key not in seen:
+            seen.add(key)
+            sources = [x["source"] for x in unresolvable if x["link"] == key]
+            print(f"  [[{key}]] — referenced in {len(sources)} page(s)")

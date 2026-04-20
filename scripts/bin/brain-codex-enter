@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# brain-codex-enter -- Claim laptop seat for Codex and force VE yield if active
+# Usage: brain-codex-enter [--mode interactive|bridge|standby]
+set -euo pipefail
+
+# Resolve through symlinks so ~/bin wrappers can locate canonical scripts/bin.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+TOOLS="$_SELF_DIR"
+MODE="interactive"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="${2:-interactive}"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Use universal bootstrap for seat claim + heartbeat
+"$TOOLS/brain-agent-bootstrap" --agent codex --mode "$MODE" 2>/dev/null || {
+  # Fallback: direct seat claim if bootstrap unavailable
+  "$TOOLS/brain-seat-claim" --seat laptop --assistant codex --mode "$MODE"
+  "$TOOLS/brain-heartbeat" >/dev/null 2>&1 || true
+}
+"$TOOLS/brain-codex-usage-snapshot" --cwd-prefix "$HOME/gmgn-brain" --quiet >/dev/null 2>&1 || true
+"$TOOLS/brain-codex-progress-checkpoint" --stage enter --reason "codex-enter mode=$MODE" --quiet >/dev/null 2>&1 || true
+
+# Command-map health preflight (advisory for now; entry should still succeed).
+if out="$("$TOOLS/brain-codex-command-map-check" 2>&1)"; then
+  echo "command-map: PASS"
+else
+  echo "command-map: FAIL"
+  echo "$out" | sed 's/^/  /'
+fi
+
+echo "codex-enter: complete"

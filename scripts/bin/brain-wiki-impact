@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# brain-wiki-impact -- Related wiki page staleness detector
+# Given a modified wiki page, find related pages by shared tags and related: fields.
+# Flag pages not updated in 30+ days as potentially stale.
+#
+# Usage:
+#   brain-wiki-impact <page-path>        # analyze a specific page
+#   brain-wiki-impact --staged           # analyze staged wiki files (pre/post-commit)
+#   brain-wiki-impact --recent [N]       # analyze pages changed in last N days (default 1)
+#   brain-wiki-impact --quiet            # suppress header, only print stale flags
+#
+# Output: stdout. Advisory only -- no writes.
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+WIKI="$BRAIN/brain/wiki"
+STALE_DAYS=30
+QUIET=false
+MODE="page"
+PAGES=()
+RECENT_DAYS=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --staged) MODE="staged"; shift ;;
+    --recent) MODE="recent"; [[ "${2:-}" =~ ^[0-9]+$ ]] && { RECENT_DAYS="$2"; shift; }; shift ;;
+    --quiet) QUIET=true; shift ;;
+    --stale-days) STALE_DAYS="$2"; shift 2 ;;
+    -*)  echo "Unknown flag: $1" >&2; exit 1 ;;
+    *)   PAGES+=("$1"); shift ;;
+  esac
+done
+
+# ── Collect pages to analyze ──────────────────────────────────────
+case "$MODE" in
+  staged)
+    while IFS= read -r f; do
+      [[ "$f" == brain/wiki/*.md || "$f" == brain/wiki/**/*.md ]] && PAGES+=("$BRAIN/$f")
+    done < <(git -C "$BRAIN" diff --cached --name-only -- 'brain/wiki/*.md' 'brain/wiki/**/*.md' 2>/dev/null || true)
+    ;;
+  recent)
+    while IFS= read -r f; do
+      PAGES+=("$f")
+    done < <(find "$WIKI" -name "*.md" -newer "$WIKI" -mtime -"${RECENT_DAYS}" 2>/dev/null || true)
+    # Also check git log for recently committed wiki files
+    while IFS= read -r f; do
+      full="$BRAIN/$f"
+      [[ -f "$full" ]] && PAGES+=("$full")
+    done < <(git -C "$BRAIN" log --since="${RECENT_DAYS} days ago" --name-only --pretty=format: -- 'brain/wiki/' 2>/dev/null | grep '\.md$' | sort -u || true)
+    ;;
+  page)
+    [[ ${#PAGES[@]} -eq 0 ]] && { echo "Usage: brain-wiki-impact <page-path>"; exit 1; }
+    ;;
+esac
+
+# Deduplicate
+declare -A SEEN
+UNIQUE_PAGES=()
+for p in "${PAGES[@]}"; do
+  [[ -f "$p" && -z "${SEEN[$p]:-}" ]] && { SEEN["$p"]=1; UNIQUE_PAGES+=("$p"); }
+done
+
+if [[ ${#UNIQUE_PAGES[@]} -eq 0 ]]; then
+  $QUIET || echo "brain-wiki-impact: no wiki pages to analyze"
+  exit 0
+fi
+
+python3 - "$WIKI" "$STALE_DAYS" "${UNIQUE_PAGES[@]}" <<'PYEOF'
+import sys, os, re, glob
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+wiki_dir = sys.argv[1]
+stale_days = int(sys.argv[2])
+input_pages = sys.argv[3:]
+today = datetime.now(timezone.utc).date()
+stale_cutoff = today - timedelta(days=stale_days)
+
+def read_frontmatter(path):
+    """Return (frontmatter_dict, body) from a markdown file."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return {}, ""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}, text
+    fm_text = text[4:end]
+    result = {}
+    # Parse tags: [a, b, c] or tags: a, b
+    for line in fm_text.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if key in ("tags", "related"):
+            # Handle YAML list: [a, b] or inline
+            items = re.findall(r'[\w\-\.]+', val)
+            result[key] = items
+        else:
+            result[key] = val.strip('"').strip("'")
+    return result, text[end+4:]
+
+def parse_date(s):
+    """Parse ISO date string to date. Returns None on failure."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            d = datetime.strptime(s[:19], fmt[:len(s[:19])])
+            return d.date()
+        except ValueError:
+            continue
+    return None
+
+# Build wiki index: path -> {tags, related, updated, title, slug}
+wiki_index = {}
+for md in glob.glob(os.path.join(wiki_dir, "**", "*.md"), recursive=True):
+    # Skip session/discord noise
+    rel = os.path.relpath(md, wiki_dir)
+    if rel.startswith("sessions/") or rel.startswith("discord/"):
+        continue
+    fm, _ = read_frontmatter(md)
+    slug = os.path.basename(md).replace(".md", "")
+    wiki_index[md] = {
+        "slug": slug,
+        "rel": rel,
+        "title": fm.get("title", slug),
+        "tags": fm.get("tags", []),
+        "related": fm.get("related", []),
+        "updated": parse_date(fm.get("updated", "") or fm.get("created", "")),
+    }
+
+any_stale = False
+
+for input_page in input_pages:
+    input_page = os.path.abspath(input_page)
+    fm, _ = read_frontmatter(input_page)
+    page_tags = set(fm.get("tags", []))
+    page_related = set(fm.get("related", []))
+    page_slug = os.path.basename(input_page).replace(".md", "")
+    page_title = fm.get("title", page_slug)
+
+    print(f"\n=== Impact: {page_title} ===")
+
+    # Find related pages: shared tags OR in related: field OR they reference this page
+    related_hits = {}  # path -> reason
+    for path, info in wiki_index.items():
+        if path == input_page:
+            continue
+        reasons = []
+        shared_tags = page_tags & set(info["tags"])
+        if shared_tags:
+            reasons.append(f"shared tags: {', '.join(sorted(shared_tags)[:3])}")
+        if page_slug in info["related"] or any(r in info["slug"] for r in page_related):
+            reasons.append("cross-referenced")
+        if info["slug"] in page_related or any(r in page_slug for r in info["related"]):
+            reasons.append("in related: field")
+        if reasons:
+            related_hits[path] = reasons
+
+    if not related_hits:
+        print("  No related pages found.")
+        continue
+
+    stale_found = []
+    fresh_found = []
+    unknown_found = []
+
+    for path, reasons in sorted(related_hits.items(), key=lambda x: x[0]):
+        info = wiki_index[path]
+        upd = info["updated"]
+        rel = info["rel"]
+        title = info["title"]
+        reason_str = "; ".join(reasons[:2])
+
+        if upd is None:
+            unknown_found.append((rel, title, reason_str, "no date"))
+        elif upd < stale_cutoff:
+            age = (today - upd).days
+            stale_found.append((rel, title, reason_str, f"last updated {age}d ago ({upd})"))
+        else:
+            fresh_found.append((rel, title, reason_str, str(upd)))
+
+    if stale_found:
+        any_stale = True
+        print(f"\n  STALE ({len(stale_found)}) -- may need review:")
+        for rel, title, reason, age in stale_found[:8]:
+            print(f"    [{age}] {rel}")
+            print(f"      {title} -- {reason}")
+
+    if unknown_found:
+        print(f"\n  UNKNOWN DATE ({len(unknown_found)}):")
+        for rel, title, reason, _ in unknown_found[:5]:
+            print(f"    {rel} ({reason})")
+
+    if fresh_found:
+        print(f"\n  FRESH ({len(fresh_found)}):")
+        for rel, title, reason, date in fresh_found[:5]:
+            print(f"    {rel} ({date})")
+        if len(fresh_found) > 5:
+            print(f"    ... and {len(fresh_found)-5} more")
+
+if not any_stale:
+    print("\nNo stale related pages found.")
+
+PYEOF

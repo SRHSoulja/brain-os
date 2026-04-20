@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# brain-proof-keygen -- Generate or show Ed25519 signing keys for proof-of-execution agents.
+# Usage:
+#   brain-proof-keygen --agent-id codex
+#   brain-proof-keygen --agent-id custom.agent@ve --json
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+PROOF_DIR="$BRAIN/brain/ops/proof-execution"
+AGENT_ID=""
+JSON=false
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent-id) AGENT_ID="$2"; shift 2 ;;
+    --json) JSON=true; shift ;;
+    --force) FORCE=true; shift ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$AGENT_ID" ]]; then
+  echo "Usage: brain-proof-keygen --agent-id <agent-id> [--json] [--force]" >&2
+  exit 1
+fi
+
+python3 - "$PROOF_DIR" "$AGENT_ID" "$JSON" "$FORCE" <<'PY'
+import base64
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+proof_dir, agent_id, as_json, force = sys.argv[1:]
+as_json = as_json.lower() == "true"
+force = force.lower() == "true"
+
+if not re.match(r"^[A-Za-z0-9._:@-]+$", agent_id):
+    print(f"Invalid agent id: {agent_id}", file=sys.stderr)
+    sys.exit(2)
+
+keys_dir = os.path.join(proof_dir, "keys")
+priv_dir = os.path.join(keys_dir, "private")
+pub_dir = os.path.join(keys_dir, "public")
+os.makedirs(priv_dir, exist_ok=True)
+os.makedirs(pub_dir, exist_ok=True)
+
+safe = re.sub(r"[^A-Za-z0-9._-]", "_", agent_id)
+priv_path = os.path.join(priv_dir, f"{safe}.pem")
+pub_path = os.path.join(pub_dir, f"{safe}.pem")
+registry_path = os.path.join(keys_dir, "registry.json")
+
+registry = {}
+if os.path.exists(registry_path):
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+    except Exception:
+        registry = {}
+
+if force or not (os.path.exists(priv_path) and os.path.exists(pub_path)):
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    priv_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    with open(priv_path, "wb") as f:
+        f.write(priv_bytes)
+    with open(pub_path, "wb") as f:
+        f.write(pub_bytes)
+    os.chmod(priv_path, 0o600)
+    os.chmod(pub_path, 0o644)
+else:
+    with open(pub_path, "rb") as f:
+        public_key = serialization.load_pem_public_key(f.read())
+
+raw_pub_bytes = public_key.public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+)
+pubkey_fingerprint = base64.b16encode(raw_pub_bytes).decode("ascii").lower()[:32]
+registry[agent_id] = {
+    "algorithm": "ed25519",
+    "private_key": priv_path,
+    "public_key": pub_path,
+    "safe_name": safe,
+    "public_key_fingerprint": pubkey_fingerprint,
+    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+tmp = registry_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(registry, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, registry_path)
+
+out = {
+    "agent_id": agent_id,
+    "algorithm": "ed25519",
+    "private_key": priv_path,
+    "public_key": pub_path,
+    "public_key_fingerprint": pubkey_fingerprint,
+}
+if as_json:
+    print(json.dumps(out, indent=2))
+else:
+    print(f"proof-keygen: {agent_id} -> {pub_path}")
+PY

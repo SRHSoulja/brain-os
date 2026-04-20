@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# brain-wiki-assign-ids -- Assign stable W-NNNN page_id to all hand-authored wiki pages
+# Usage:
+#   brain-wiki-assign-ids [--dry-run] [--fix-frontmatter]
+#   brain-wiki-assign-ids --tombstone <path>
+# Exit codes: 0=success, 1=error
+import os, sys, re, json
+from pathlib import Path
+
+BRAIN = Path(os.environ.get("BRAIN_DIR", Path.home() / "gmgn-brain"))
+WIKI  = BRAIN / "brain/wiki"
+COUNTER_FILE  = WIKI / ".page-id-counter"
+TOMBSTONE_FILE = WIKI / ".page-id-tombstones.json"
+
+SCOPED_DIRS = ["tools", "pages", "systems"]
+EXCLUDED_SUBDIRS = {"sessions"}
+
+# --- args ---
+dry_run = "--dry-run" in sys.argv
+fix_fm  = "--fix-frontmatter" in sys.argv or True   # always fix broken --- while we're touching the file
+
+tombstone_path = None
+if "--tombstone" in sys.argv:
+    idx = sys.argv.index("--tombstone")
+    tombstone_path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
+
+# --- ID counter ---
+def load_counter():
+    if COUNTER_FILE.exists():
+        return int(COUNTER_FILE.read_text().strip())
+    # Derive from existing page_ids
+    max_id = 0
+    for d in SCOPED_DIRS:
+        for md in (WIKI / d).rglob("*.md"):
+            content = md.read_text(errors="replace")
+            m = re.search(r'^page_id:\s*W-(\d+)', content, re.MULTILINE)
+            if m:
+                max_id = max(max_id, int(m.group(1)))
+    return max_id
+
+def save_counter(n):
+    if not dry_run:
+        COUNTER_FILE.write_text(str(n))
+
+def next_id(counter):
+    counter += 1
+    return counter, f"W-{counter:04d}"
+
+# --- frontmatter parser ---
+def parse_frontmatter(content):
+    """Return (fm_dict_lines, fm_end_byte, body) handling broken closing ---."""
+    if not content.startswith("---"):
+        return None, 0, content
+
+    lines = content.split("\n")
+    fm_lines = []
+    end_line = None
+
+    for i, line in enumerate(lines[1:], 1):
+        # Broken case: field: value--- (closing --- glued to last field)
+        if line.endswith("---") and not line.strip() == "---":
+            # Split off the ---
+            actual_field = line[:-3]
+            fm_lines.append(actual_field)
+            end_line = i
+            break
+        if line.strip() == "---":
+            end_line = i
+            break
+        fm_lines.append(line)
+
+    if end_line is None:
+        return None, 0, content
+
+    body = "\n".join(lines[end_line + 1:])
+    return fm_lines, end_line, body
+
+def rebuild_content(fm_lines, body):
+    """Rebuild file content with clean frontmatter."""
+    return "---\n" + "\n".join(fm_lines) + "\n---\n" + body
+
+def get_fm_field(fm_lines, field):
+    pat = re.compile(rf'^{re.escape(field)}:\s*(.*)')
+    for line in fm_lines:
+        m = pat.match(line)
+        if m:
+            return m.group(1).strip().strip('"').strip("'")
+    return None
+
+def set_fm_field(fm_lines, field, value):
+    """Insert or replace a field. Inserts after first --- line."""
+    pat = re.compile(rf'^{re.escape(field)}:')
+    for i, line in enumerate(fm_lines):
+        if pat.match(line):
+            fm_lines[i] = f'{field}: "{value}"'
+            return fm_lines
+    # Insert after title if present, else at top
+    insert_at = 0
+    for i, line in enumerate(fm_lines):
+        if line.startswith("title:"):
+            insert_at = i + 1
+            break
+    fm_lines.insert(insert_at, f'{field}: "{value}"')
+    return fm_lines
+
+# --- systems manifest: identify hand-authored ---
+def load_hand_authored_set():
+    ha = set()
+    sys_manifest = WIKI / "systems/manifest.json"
+    pages_manifest = WIKI / "pages/manifest.json"
+    for mf in [sys_manifest, pages_manifest]:
+        if mf.exists():
+            data = json.loads(mf.read_text())
+            for p in data.get("pages", []):
+                if p.get("is_hand_authored"):
+                    ha.add(p["path"])   # e.g. "systems/foo.md"
+    # tools/ — all non-MAP files are hand-authored
+    for f in (WIKI / "tools").glob("*.md"):
+        if f.name != "MAP.md":
+            ha.add(f"tools/{f.name}")
+    return ha
+
+# --- tombstone ---
+def tombstone(path_str):
+    ts = {}
+    if TOMBSTONE_FILE.exists():
+        ts = json.loads(TOMBSTONE_FILE.read_text())
+    full = WIKI / path_str
+    content = ""
+    if full.exists():
+        content = full.read_text(errors="replace")
+    fm_lines, _, _ = parse_frontmatter(content)
+    pid = get_fm_field(fm_lines or [], "page_id")
+    if not pid:
+        print(f"No page_id found in {path_str} — cannot tombstone", file=sys.stderr)
+        sys.exit(1)
+    ts[pid] = {"path": path_str, "tombstoned": True}
+    if not dry_run:
+        TOMBSTONE_FILE.write_text(json.dumps(ts, indent=2))
+    print(f"Tombstoned {pid} ({path_str})")
+    sys.exit(0)
+
+# --- main ---
+if tombstone_path:
+    tombstone(tombstone_path)
+
+ha_set = load_hand_authored_set()
+counter = load_counter()
+
+assigned = 0
+already  = 0
+skipped  = 0
+fixed_fm = 0
+errors   = []
+
+for scope in SCOPED_DIRS:
+    scope_dir = WIKI / scope
+    if not scope_dir.exists():
+        continue
+    for md in sorted(scope_dir.rglob("*.md")):
+        rel = md.relative_to(WIKI).as_posix()
+        # Skip sessions, MAP, and non-hand-authored systems/pages files
+        parts = md.relative_to(WIKI).parts
+        if any(p in EXCLUDED_SUBDIRS for p in parts):
+            continue
+        if md.name == "MAP.md":
+            continue
+        if scope in ("systems", "pages") and rel not in ha_set:
+            skipped += 1
+            continue
+
+        try:
+            content = md.read_text(errors="replace")
+        except Exception as e:
+            errors.append(f"{rel}: read error {e}")
+            continue
+
+        fm_lines, end_line, body = parse_frontmatter(content)
+        if fm_lines is None:
+            skipped += 1
+            continue
+
+        existing_id = get_fm_field(fm_lines, "page_id")
+        broken_close = content.split("\n")[end_line].endswith("---") and content.split("\n")[end_line].strip() != "---" if end_line else False
+
+        needs_write = False
+        if existing_id:
+            already += 1
+        else:
+            counter, new_id = next_id(counter)
+            fm_lines = set_fm_field(fm_lines, "page_id", new_id)
+            assigned += 1
+            needs_write = True
+
+        if broken_close or needs_write:
+            new_content = rebuild_content(fm_lines, body)
+            if new_content != content:
+                if broken_close and not (existing_id is None):
+                    fixed_fm += 1
+                if not dry_run:
+                    md.write_text(new_content)
+                elif needs_write:
+                    pass  # dry-run: just count
+
+save_counter(counter)
+
+print(f"brain-wiki-assign-ids complete")
+print(f"  assigned:    {assigned}")
+print(f"  already had: {already}")
+print(f"  skipped:     {skipped}")
+print(f"  fm fixed:    {fixed_fm}")
+if errors:
+    print(f"  errors:      {len(errors)}")
+    for e in errors[:5]:
+        print(f"    {e}")

@@ -1,0 +1,68 @@
+#!/bin/bash
+# brain-verdict — print current brain state verdict
+# Usage: brain-verdict [--json] [--summary]
+#
+# Reads brain/ops/state-verdict.json (produced by brain-state-check).
+# If the verdict file doesn't exist or is stale (>1h), runs brain-state-check first.
+# Uses tools/lib/verdict-reader.py for normalized, validated parsing.
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+VERDICT_JSON="$_VERDICT_JSON"
+VERDICT_READER="$_VERDICT_READER"
+STALE_THRESHOLD=3600  # 1 hour
+
+# If verdict file missing or stale, regenerate
+if [[ ! -f "$VERDICT_JSON" ]]; then
+  "$_STATE_CHECK" --quiet > /dev/null 2>&1
+elif [[ -f "$VERDICT_JSON" ]]; then
+  age=$(( $(date +%s) - $(stat -c %Y "$VERDICT_JSON") ))
+  if [[ $age -gt $STALE_THRESHOLD ]]; then
+    "$_STATE_CHECK" --quiet > /dev/null 2>&1
+  fi
+fi
+
+if [[ ! -f "$VERDICT_JSON" ]]; then
+  echo "Brain Status: UNKNOWN"
+  echo "Verdict file not found. Run brain-state-check."
+  exit 1
+fi
+
+# --json: pass through normalized JSON from verdict-reader
+if [[ "${1:-}" == "--json" ]]; then
+  python3 "$VERDICT_READER" "$VERDICT_JSON" --json
+  exit $?
+fi
+
+# Single parse via verdict-reader.py (tab-separated output)
+_vr_output=$(python3 "$VERDICT_READER" "$VERDICT_JSON" 2>/dev/null) || true
+if [[ -z "$_vr_output" ]]; then
+  echo "Brain Status: UNKNOWN"
+  echo "Verdict reader failed."
+  exit 1
+fi
+
+IFS=$'\t' read -r status summary issue_count timestamp queued active completed <<< "$_vr_output"
+tasks="${queued}q/${active}a/${completed}c"
+
+# --summary: compact one-line
+if [[ "${1:-}" == "--summary" ]]; then
+  if [[ "$status" == "OK" ]]; then
+    echo "OK"
+  else
+    echo "$status — $issue_count issue(s)"
+  fi
+  exit 0
+fi
+
+# Default: human-readable display
+echo "Brain Status: $status"
+echo "Last Check: $timestamp"
+echo "Tasks: $tasks"
+
+if [[ "$issue_count" -gt 0 && "$status" != "OK" ]]; then
+  echo ""
+  echo "$issue_count issue(s):"
+  python3 "$VERDICT_READER" "$VERDICT_JSON" --issues
+fi

@@ -1,0 +1,267 @@
+#!/bin/bash
+# brain-vault — GPG-encrypted secrets store
+# Usage:
+#   brain-vault set <name> [value]    Store a secret (prompts if value omitted)
+#   brain-vault get <name>            Retrieve a secret
+#   brain-vault list                  List all secret names (no values)
+#   brain-vault rm <name>             Remove a secret
+#   brain-vault export [--env]        Dump all as KEY=VALUE
+#   brain-vault import <file>         Import from .env file
+#   brain-vault count                 Show total secrets count
+#
+# Storage: ~/.vault/secrets.gpg (AES-256 symmetric encryption)
+# Dependencies: gpg, jq
+#
+# Passphrase: set BRAIN_VAULT_PASS env var to avoid prompts,
+#             or the script will prompt once per invocation.
+
+set -euo pipefail
+
+VAULT_DIR="$HOME/.vault"
+VAULT_FILE="$VAULT_DIR/secrets.gpg"
+PASSPHRASE=""
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+brain-vault — GPG-encrypted secrets store
+
+Usage:
+  brain-vault set <name> [value]    Store a secret (prompts if value omitted)
+  brain-vault get <name>            Retrieve a secret
+  brain-vault list                  List all secret names (no values)
+  brain-vault rm <name>             Remove a secret
+  brain-vault export [--env]        Dump all as KEY=VALUE
+  brain-vault import <file>         Import from .env file
+  brain-vault count                 Show total secrets count
+
+Storage: ~/.vault/secrets.gpg
+Env:     Set BRAIN_VAULT_PASS to skip passphrase prompt
+EOF
+  exit 0
+}
+
+# Prompt for passphrase once, cache in $PASSPHRASE
+get_passphrase() {
+  if [[ -n "$PASSPHRASE" ]]; then
+    return
+  fi
+
+  # Check env var first
+  if [[ -n "${BRAIN_VAULT_PASS:-}" ]]; then
+    PASSPHRASE="$BRAIN_VAULT_PASS"
+    return
+  fi
+
+  # Interactive prompt
+  echo -n "Vault passphrase: " >&2
+  read -rs PASSPHRASE
+  echo "" >&2
+  if [[ -z "$PASSPHRASE" ]]; then
+    die "No passphrase provided"
+  fi
+}
+
+ensure_vault_dir() {
+  if [[ ! -d "$VAULT_DIR" ]]; then
+    (umask 077 && mkdir -p "$VAULT_DIR")
+    echo "[brain-vault] Created vault directory: $VAULT_DIR"
+  fi
+}
+
+gpg_encrypt() {
+  gpg --batch --yes --quiet --cipher-algo AES256 \
+    --passphrase "$PASSPHRASE" --pinentry-mode loopback \
+    --symmetric
+}
+
+gpg_decrypt() {
+  gpg --batch --yes --quiet \
+    --passphrase "$PASSPHRASE" --pinentry-mode loopback \
+    --decrypt "$VAULT_FILE" 2>/dev/null
+}
+
+# Initialize empty vault if none exists
+init_vault() {
+  ensure_vault_dir
+  if [[ ! -f "$VAULT_FILE" ]]; then
+    get_passphrase
+    # For new vaults, confirm the passphrase
+    if [[ -z "${BRAIN_VAULT_PASS:-}" ]]; then
+      local confirm
+      echo -n "Confirm passphrase: " >&2
+      read -rs confirm
+      echo "" >&2
+      if [[ "$PASSPHRASE" != "$confirm" ]]; then
+        die "Passphrases do not match"
+      fi
+    fi
+    echo '{}' | gpg_encrypt > "$VAULT_FILE"
+    chmod 600 "$VAULT_FILE"
+    echo "[brain-vault] Initialized new vault at $VAULT_FILE"
+  fi
+}
+
+# Decrypt vault to stdout — caller must call get_passphrase first
+decrypt_vault() {
+  gpg_decrypt || die "Decryption failed — wrong passphrase?"
+}
+
+# Encrypt from stdin to vault file (atomic via tmp file)
+encrypt_vault() {
+  local tmp_gpg
+  tmp_gpg=$(mktemp "$VAULT_DIR/.tmp.XXXXXX")
+  if ! gpg_encrypt > "$tmp_gpg"; then
+    rm -f "$tmp_gpg"
+    die "Encryption failed"
+  fi
+  chmod 600 "$tmp_gpg"
+  mv "$tmp_gpg" "$VAULT_FILE"
+}
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+cmd_set() {
+  local name="${1:-}"
+  local value="${2:-}"
+
+  [[ -z "$name" ]] && die "Usage: brain-vault set <name> [value]"
+
+  # If no value provided, prompt for it (hides input)
+  if [[ -z "$value" ]]; then
+    echo -n "Enter value for $name: " >&2
+    read -rs value
+    echo "" >&2
+    if [[ -z "$value" ]]; then
+      die "No value provided"
+    fi
+  fi
+
+  init_vault
+  get_passphrase
+
+  local data
+  data=$(decrypt_vault)
+  data=$(echo "$data" | jq --arg k "$name" --arg v "$value" '. + {($k): $v}')
+  echo "$data" | encrypt_vault
+
+  echo "[brain-vault] Stored: $name"
+}
+
+cmd_get() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: brain-vault get <name>"
+  [[ ! -f "$VAULT_FILE" ]] && die "Vault not found. Run 'brain-vault set' first."
+
+  get_passphrase
+  local data value
+  data=$(decrypt_vault)
+  value=$(echo "$data" | jq -r --arg k "$name" '.[$k] // empty')
+
+  if [[ -z "$value" ]]; then
+    die "Secret '$name' not found"
+  fi
+
+  echo "$value"
+}
+
+cmd_list() {
+  [[ ! -f "$VAULT_FILE" ]] && die "Vault not found. Run 'brain-vault set' first."
+
+  get_passphrase
+  local data
+  data=$(decrypt_vault)
+  echo "$data" | jq -r 'keys[]'
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: brain-vault rm <name>"
+  [[ ! -f "$VAULT_FILE" ]] && die "Vault not found."
+
+  get_passphrase
+  local data
+  data=$(decrypt_vault)
+
+  local exists
+  exists=$(echo "$data" | jq -r --arg k "$name" 'has($k)')
+  [[ "$exists" != "true" ]] && die "Secret '$name' not found"
+
+  data=$(echo "$data" | jq --arg k "$name" 'del(.[$k])')
+  echo "$data" | encrypt_vault
+
+  echo "[brain-vault] Removed: $name"
+}
+
+cmd_export() {
+  [[ ! -f "$VAULT_FILE" ]] && die "Vault not found."
+
+  get_passphrase
+  local data
+  data=$(decrypt_vault)
+  echo "$data" | jq -r 'to_entries[] | "\(.key)=\(.value)"'
+}
+
+cmd_import() {
+  local file="${1:-}"
+  [[ -z "$file" ]] && die "Usage: brain-vault import <file>"
+  [[ ! -f "$file" ]] && die "File not found: $file"
+
+  init_vault
+  get_passphrase
+
+  local data count=0
+  data=$(decrypt_vault)
+
+  while IFS= read -r line; do
+    # Skip comments and blank lines
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    # Parse KEY=VALUE (handle quotes)
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_.]*)[[:space:]]*=[[:space:]]*(.*) ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      # Strip surrounding quotes
+      val="${val#\"}"
+      val="${val%\"}"
+      val="${val#\'}"
+      val="${val%\'}"
+      data=$(echo "$data" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+      count=$((count + 1))
+    fi
+  done < "$file"
+
+  echo "$data" | encrypt_vault
+
+  echo "[brain-vault] Imported $count secret(s) from $file"
+}
+
+cmd_count() {
+  [[ ! -f "$VAULT_FILE" ]] && die "Vault not found."
+
+  get_passphrase
+  local data
+  data=$(decrypt_vault)
+  echo "$data" | jq 'length'
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+[[ $# -eq 0 ]] && usage
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  set)    cmd_set "$@" ;;
+  get)    cmd_get "$@" ;;
+  list)   cmd_list ;;
+  rm)     cmd_rm "$@" ;;
+  export) cmd_export ;;
+  import) cmd_import "$@" ;;
+  count)  cmd_count ;;
+  help|-h|--help) usage ;;
+  *)      die "Unknown command: $COMMAND. Run 'brain-vault help' for usage." ;;
+esac

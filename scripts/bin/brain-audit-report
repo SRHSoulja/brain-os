@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# brain-audit-report — Aggregates global forensic audit data.
+
+BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+RESULTS="$BRAIN/brain/ops/analytics/audit_progress.json"
+REPORT="$BRAIN/brain/ops/analytics/audit_summary_report.md"
+
+echo "# Brain System Integrity Report (Global Audit)" > "$REPORT"
+echo "Generated: $(date)" >> "$REPORT"
+echo "" >> "$REPORT"
+
+# 1. Global Aggregation
+TOTAL=$(jq '.total' "$RESULTS")
+PROCESSED=$(jq '.processed' "$RESULTS")
+
+echo "## Global Catalog Traversal" >> "$REPORT"
+echo "- Total Audited Tasks: $PROCESSED / $TOTAL" >> "$REPORT"
+echo "" >> "$REPORT"
+
+echo "### Global Status Distribution" >> "$REPORT"
+echo '```' >> "$REPORT"
+jq -r '.results[] | .status' "$RESULTS" | sort | uniq -c >> "$REPORT"
+echo '```' >> "$REPORT"
+echo "" >> "$REPORT"
+
+# 2. Issues and Regressions (Excluding Valid Non-Executed ARTIFACT_ONLY)
+echo "## Actionable Failures (Non-Success)" >> "$REPORT"
+echo "### Top 5 Actionable Tasks (Global Context)" >> "$REPORT"
+jq -r '.results[] | select(.status!="TRUE_COMPLETION" and .status!="ARTIFACT_ONLY") | .id + ": " + .reason' "$RESULTS" | head -n 5 >> "$REPORT"
+echo "" >> "$REPORT"
+
+# 3. Delta Tracking
+echo "## Recent Regressions" >> "$REPORT"
+echo "(Failures identified in last batch)" >> "$REPORT"
+jq -r '.results[-20:] | .[] | select(.status!="TRUE_COMPLETION" and .status!="ARTIFACT_ONLY") | .id' "$RESULTS" >> "$REPORT"
+echo "" >> "$REPORT"
+
+cat "$REPORT"

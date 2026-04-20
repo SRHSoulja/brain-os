@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# brain-completion-audit-watch — daemon: auto-run post-task-audit on new completions
+#
+# Watches brain/ops/tasks/completed/ for new *.completion.json files and runs
+# post-task-audit.py on each, appending results to work/logs/post-task-audit.log.
+#
+# Usage: brain-completion-audit-watch [start|stop|status] [--force]
+#   start [--force]  Start the daemon (--force kills any existing instance first)
+#   stop             Stop the daemon
+#   status           Show running/stopped + recent log tail
+
+set -euo pipefail
+
+BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+COMPLETED_DIR="$BRAIN/brain/ops/tasks/completed"
+AUDIT_LOG="$BRAIN/work/logs/post-task-audit.log"
+AUDIT_SCRIPT="$BRAIN/scripts/lib/post-task-audit.py"
+PID_FILE="/tmp/brain-completion-audit-watcher.pid"
+DAEMON_LOG="/tmp/brain-completion-audit-watcher.log"
+
+_is_running() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+_start() {
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  if _is_running; then
+    if $force; then
+      kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      sleep 0.3
+    else
+      echo "already-running:$(cat "$PID_FILE")" >&2
+      exit 1
+    fi
+  fi
+
+  mkdir -p "$(dirname "$AUDIT_LOG")"
+
+  # Daemon loop: watch for new .completion.json files and run audit on each
+  (
+    while IFS= read -r event_file; do
+      [[ "$event_file" == *.completion.json ]] || continue
+      [[ -f "$event_file" ]] || continue
+      task_id=$(basename "$event_file" .completion.json)
+      ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      echo "" >> "$AUDIT_LOG"
+      echo "=== $ts  $task_id ===" >> "$AUDIT_LOG"
+      python3 "$AUDIT_SCRIPT" "$event_file" --tools-dir "$BRAIN/scripts" \
+        >> "$AUDIT_LOG" 2>&1 || echo "(audit error for $task_id)" >> "$AUDIT_LOG"
+    done < <(inotifywait -m -e close_write --format '%w%f' "$COMPLETED_DIR" 2>/dev/null)
+  ) >> "$DAEMON_LOG" 2>&1 &
+
+  local daemon_pid=$!
+  echo "$daemon_pid" > "$PID_FILE"
+  sleep 0.3
+
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    echo "ERROR: daemon failed to start" >&2
+    rm -f "$PID_FILE"
+    exit 2
+  fi
+
+  echo "completion-audit-watcher started (pid $daemon_pid)"
+  echo "  audit log: $AUDIT_LOG"
+}
+
+_stop() {
+  if _is_running; then
+    pid=$(cat "$PID_FILE")
+    kill "$pid" 2>/dev/null && echo "Stopped pid $pid"
+    rm -f "$PID_FILE"
+  else
+    echo "not running"
+  fi
+}
+
+_status() {
+  if _is_running; then
+    echo "RUNNING (pid $(cat "$PID_FILE"))"
+  else
+    echo "STOPPED"
+  fi
+  if [[ -f "$AUDIT_LOG" ]]; then
+    echo ""
+    echo "Recent audit log ($AUDIT_LOG):"
+    tail -20 "$AUDIT_LOG"
+  fi
+}
+
+case "${1:-start}" in
+  start)  _start "${2:-}" ;;
+  stop)   _stop ;;
+  status) _status ;;
+  *)      echo "Usage: brain-completion-audit-watch {start|stop|status} [--force]" ;;
+esac

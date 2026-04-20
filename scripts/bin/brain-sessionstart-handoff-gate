@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-}"
+FORMAT="claude"
+# Parse optional --format <claude|gemini> flag after mode
+shift || true
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --format) FORMAT="${2:-claude}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+# Session-scoped lock file: use PPID (the Claude process that spawns hooks).
+# This prevents a second Claude instance (e.g., from brain-agent-swap) from
+# re-locking the gate for the first instance. PPID is consistent across all
+# hook invocations within the same Claude session.
+_SCOPE="${PPID:-$$}"
+REQ_FILE="${TMPDIR:-/tmp}/brain-handoff-required-${_SCOPE}"
+CLEARED_FILE="${TMPDIR:-/tmp}/brain-handoff-cleared-${_SCOPE}"
+HANDOFF_PATH="${BRAIN_DIR:-$HOME/gmgn-brain}/brain/index/claude-session-entry.md"
+
+emit_deny() {
+  local reason="$1"
+  if [[ "$FORMAT" == "gemini" ]]; then
+    jq -n --arg r "$reason" '{"decision":"deny","reason":$r}'
+  else
+    jq -n --arg r "$reason" '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$r}}'
+  fi
+}
+
+case "$MODE" in
+  init)
+    # Idempotent: skip if this PPID-scoped session already cleared the gate.
+    [[ -f "$CLEARED_FILE" ]] && exit 0
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$REQ_FILE"
+    ;;
+
+  pretool)
+    payload="$(cat || true)"
+
+    # Gate inactive
+    [[ -f "$REQ_FILE" ]] || exit 0
+
+    tool_name="$(printf '%s' "$payload" | jq -r '.tool_name // .tool // ""' 2>/dev/null || true)"
+
+    # Allow reading the canonical handoff exactly once; then unlock.
+    if [[ "$tool_name" == "Read" ]]; then
+      file_path="$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || true)"
+      if [[ "$file_path" == "$HANDOFF_PATH" ]]; then
+        rm -f "$REQ_FILE"
+        touch "$CLEARED_FILE"
+        exit 0
+      fi
+    fi
+
+    emit_deny "HANDOFF_ENTRY_GATE: Read $HANDOFF_PATH first using the Read tool. Tool execution is blocked until that file is read once in this session."
+    ;;
+
+  status)
+    if [[ -f "$REQ_FILE" ]]; then
+      echo "LOCKED"
+    else
+      echo "UNLOCKED"
+    fi
+    ;;
+
+  reset)
+    rm -f "$REQ_FILE" "$CLEARED_FILE"
+    ;;
+
+  *)
+    echo "Usage: brain-sessionstart-handoff-gate {init|pretool|status|reset}" >&2
+    exit 2
+    ;;
+esac

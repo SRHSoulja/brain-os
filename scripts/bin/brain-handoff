@@ -1,0 +1,169 @@
+#!/bin/bash
+# brain-handoff — Session handoff notes for context continuity
+# Captures: decisions made, ideas rejected, live context, next-session reminders
+# Modes:
+#   brain-handoff --interactive     Full end-of-session handoff (prompts for each section)
+#   brain-handoff --from-stdin      Read full handoff from stdin (for piping)
+#   brain-handoff --append-note "text"  Quick one-liner append to current handoff
+#   brain-handoff "decisions" "rejections" "context" "reminders"  Positional args
+#
+# Output: work/session-handoffs/YYYY-MM-DD-HHmm-handoff.md
+
+set -uo pipefail
+
+BRAIN_DIR="$HOME/gmgn-brain"
+OUTPUT_DIR="$BRAIN_DIR/work/session-handoffs"
+LOCK_FILE="/tmp/brain-handoff.lock"
+NOW=$(date +%Y-%m-%d-%H%M)
+DATE=$(date +%Y-%m-%d)
+OUTPUT_FILE="$OUTPUT_DIR/${NOW}-handoff.md"
+
+mkdir -p "$OUTPUT_DIR"
+
+# ── Flock: prevent overlapping writes ────────────────────────────
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  echo "[brain-handoff] Another handoff is in progress"
+  exit 0
+fi
+
+# ── Get session stats if available ───────────────────────────────
+SESSION_STATS=""
+if command -v brain-timer &>/dev/null; then
+  SESSION_STATS=$(brain-timer 2>/dev/null | head -3 || echo "")
+fi
+COMMIT_COUNT=$(cd "$BRAIN_DIR" && git log --since="$(date -d 'today 00:00' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date +%Y-%m-%dT00:00:00)" --oneline 2>/dev/null | wc -l | tr -d ' ')
+
+# ── Mode: --append-note ──────────────────────────────────────────
+if [[ "${1:-}" == "--append-note" ]]; then
+  NOTE="${2:-}"
+  if [[ -z "$NOTE" ]]; then
+    echo "Usage: brain-handoff --append-note \"your note here\""
+    exit 1
+  fi
+
+  # Find today's most recent handoff or create new one
+  LATEST=$(ls -t "$OUTPUT_DIR"/${DATE}-*-handoff.md 2>/dev/null | head -1)
+  if [[ -n "$LATEST" ]]; then
+    # Append to existing handoff
+    echo "" >> "$LATEST"
+    echo "### Quick Note ($(date +%H:%M))" >> "$LATEST"
+    echo "" >> "$LATEST"
+    echo "$NOTE" >> "$LATEST"
+    echo "[brain-handoff] Note appended to $(basename "$LATEST")"
+  else
+    # Create minimal handoff with just the note
+    cat > "$OUTPUT_FILE" << NOTE_EOF
+---
+title: "Session Handoff"
+type: "auto-generated"
+date: "$DATE"
+generated: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mode: "append-note"
+---
+
+# Session Handoff — $DATE
+
+### Quick Note ($(date +%H:%M))
+
+$NOTE
+NOTE_EOF
+    echo "[brain-handoff] New handoff created: $(basename "$OUTPUT_FILE")"
+  fi
+  exit 0
+fi
+
+# ── Mode: --from-stdin ───────────────────────────────────────────
+if [[ "${1:-}" == "--from-stdin" ]]; then
+  STDIN_CONTENT=$(cat)
+  if [[ -z "$STDIN_CONTENT" ]]; then
+    echo "[brain-handoff] No input received on stdin"
+    exit 1
+  fi
+
+  cat > "$OUTPUT_FILE" << STDIN_EOF
+---
+title: "Session Handoff"
+type: "auto-generated"
+date: "$DATE"
+generated: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mode: "stdin"
+commits_today: $COMMIT_COUNT
+---
+
+# Session Handoff — $DATE
+
+$STDIN_CONTENT
+
+## Session Stats
+
+- Commits today: $COMMIT_COUNT
+${SESSION_STATS:+- $SESSION_STATS}
+STDIN_EOF
+  echo "[brain-handoff] Handoff written: $(basename "$OUTPUT_FILE")"
+  exit 0
+fi
+
+# ── Mode: --interactive ──────────────────────────────────────────
+if [[ "${1:-}" == "--interactive" ]]; then
+  echo "=== Brain Handoff — End of Session ==="
+  echo ""
+
+  echo "## Decisions made this session (blank to skip):"
+  read -r DECISIONS
+  echo ""
+
+  echo "## Ideas considered but rejected, and why (blank to skip):"
+  read -r REJECTIONS
+  echo ""
+
+  echo "## Context that only exists right now (blank to skip):"
+  read -r CONTEXT
+  echo ""
+
+  echo "## Next session reminders (blank to skip):"
+  read -r REMINDERS
+else
+  # ── Mode: Positional args ──────────────────────────────────────
+  DECISIONS="${1:-}"
+  REJECTIONS="${2:-}"
+  CONTEXT="${3:-}"
+  REMINDERS="${4:-}"
+fi
+
+# ── Write handoff ────────────────────────────────────────────────
+cat > "$OUTPUT_FILE" << HANDOFF_EOF
+---
+title: "Session Handoff"
+type: "auto-generated"
+date: "$DATE"
+generated: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mode: "${1:-args}"
+commits_today: $COMMIT_COUNT
+---
+
+# Session Handoff — $DATE
+
+## Decisions Made
+
+${DECISIONS:-_No decisions noted._}
+
+## Ideas Considered but Rejected
+
+${REJECTIONS:-_No rejections noted._}
+
+## Context That Only Exists Right Now
+
+${CONTEXT:-_No context noted._}
+
+## Next Session Reminders
+
+${REMINDERS:-_No reminders._}
+
+## Session Stats
+
+- Commits today: $COMMIT_COUNT
+${SESSION_STATS:+- $SESSION_STATS}
+HANDOFF_EOF
+
+echo "[brain-handoff] Handoff written: $(basename "$OUTPUT_FILE")"

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# brain-terminal-watch-stop — Stop the ChatGPT terminal monitor watcher
+#
+# Agent-agnostic teardown. Works regardless of which brain agent is in the seat.
+# Also optionally deactivates terminal mode on the advisor API.
+#
+# Usage: brain-terminal-watch-stop [--no-api]
+#   --no-api  skip API deactivation (useful when API is down)
+
+set -euo pipefail
+
+PID_FILE="/tmp/brain-terminal-watcher.pid"
+STOP_FLAG="/tmp/brain-terminal-watch.stop"
+NO_API=false
+[[ "${1:-}" == "--no-api" ]] && NO_API=true
+
+STOPPED=false
+
+# ── Kill watcher process ──────────────────────────────────────────
+if [[ -f "$PID_FILE" ]]; then
+  pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null && STOPPED=true
+    echo "Watcher stopped (pid $pid)"
+  else
+    echo "Watcher was not running (stale pid file)"
+  fi
+  rm -f "$PID_FILE"
+else
+  echo "No watcher running"
+fi
+
+# ── Clean up state files ──────────────────────────────────────────
+rm -f "$STOP_FLAG"
+
+# ── Deactivate terminal mode on API ──────────────────────────────
+if ! $NO_API; then
+  _api_result=$(curl -s --max-time 3 -X POST http://localhost:7735/terminal \
+    -H "Content-Type: application/json" \
+    -d '{"mode":"deactivate"}' 2>/dev/null || echo "")
+  if [[ -n "$_api_result" ]]; then
+    echo "API terminal mode: deactivated"
+  fi
+fi
+
+$STOPPED && echo "Terminal monitor: OFF" || echo "Terminal monitor: already off"

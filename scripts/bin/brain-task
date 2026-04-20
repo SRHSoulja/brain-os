@@ -1,0 +1,396 @@
+#!/bin/bash
+# brain-task — Multi-session task continuity
+# Usage:
+#   brain-task create "name" [--priority P2] [--note "..."]
+#   brain-task update "name" [--status blocked] [--blocker "..."] [--note "..."]
+#   brain-task complete "name"
+#   brain-task list [--all]
+#
+# Tasks stored as: ~/gmgn-brain/work/tasks/task-name.md
+
+set -euo pipefail
+
+BRAIN_DIR="$HOME/gmgn-brain"
+TASK_DIR="$BRAIN_DIR/work/tasks"
+NOW=$(date '+%Y-%m-%d %H:%M')
+TODAY=$(date +%Y-%m-%d)
+
+mkdir -p "$TASK_DIR"
+
+# ── Helpers ────────────────────────────────────────────────────────
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+find_task() {
+  local name="$1"
+  local slug=$(slugify "$name")
+  local file="$TASK_DIR/${slug}.md"
+  if [[ -f "$file" ]]; then
+    echo "$file"
+    return 0
+  fi
+  # Try partial match
+  local match=$(ls "$TASK_DIR"/*.md 2>/dev/null | xargs grep -l "^title:.*$name" 2>/dev/null | head -1 || true)
+  if [[ -n "$match" ]]; then
+    echo "$match"
+    return 0
+  fi
+  return 1
+}
+
+# ── Create ─────────────────────────────────────────────────────────
+cmd_create() {
+  local name=""
+  local priority="P3"
+  local note=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --priority) priority="$2"; shift 2 ;;
+      --note) note="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: brain-task create \"task name\" [--priority P2] [--note \"...\"]"
+    exit 1
+  fi
+
+  local slug=$(slugify "$name")
+  local file="$TASK_DIR/${slug}.md"
+
+  if [[ -f "$file" ]]; then
+    echo "[brain-task] Task already exists: $slug"
+    echo "  Use: brain-task update \"$slug\" ..."
+    exit 1
+  fi
+
+  cat > "$file" << TASK_EOF
+---
+title: "$name"
+status: "active"
+priority: "$priority"
+created: "$TODAY"
+updated: "$TODAY"
+blockers: []
+related_files: []
+---
+
+## Next Steps
+
+- _Define next steps_
+
+## Notes
+
+- [$NOW] Created${note:+: $note}
+TASK_EOF
+
+  echo "[brain-task] Created: $file"
+  echo "  Title: $name"
+  echo "  Priority: $priority"
+  echo "  Status: active"
+}
+
+# ── Update ─────────────────────────────────────────────────────────
+cmd_update() {
+  local name=""
+  local status=""
+  local blocker=""
+  local note=""
+  local priority=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) status="$2"; shift 2 ;;
+      --blocker) blocker="$2"; shift 2 ;;
+      --note) note="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: brain-task update \"name\" [--status blocked] [--blocker \"...\"] [--note \"...\"]"
+    exit 1
+  fi
+
+  local file
+  file=$(find_task "$name") || {
+    echo "[brain-task] Task not found: $name"
+    echo "  Available tasks:"
+    ls "$TASK_DIR"/*.md 2>/dev/null | sed "s|$TASK_DIR/||;s|\.md$||" | sed 's/^/    /' || true
+    exit 1
+  }
+
+  # Use Python to safely parse frontmatter, update fields, and rewrite
+  python3 - "$file" "$status" "$priority" "$blocker" "$note" "$TODAY" "$NOW" << 'PYEOF'
+import sys, re
+
+fpath, new_status, new_priority, new_blocker, new_note, today, now = sys.argv[1:8]
+
+with open(fpath, 'r') as f:
+    content = f.read()
+
+lines = content.split('\n')
+
+# Split into frontmatter and body
+fm_lines = []
+body_lines = []
+if lines[0].strip() == '---':
+    fm_end = -1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '---':
+            fm_end = i
+            break
+    if fm_end > 0:
+        fm_lines = lines[1:fm_end]
+        body_lines = lines[fm_end+1:]
+    else:
+        body_lines = lines
+else:
+    body_lines = lines
+
+# Parse frontmatter into ordered key-value pairs
+fm = []
+for line in fm_lines:
+    m = re.match(r'^(\w[\w_-]*)\s*:\s*(.*)', line)
+    if m:
+        fm.append((m.group(1), m.group(2).strip()))
+    else:
+        fm.append((None, line))
+
+def set_fm(key, val):
+    for i, (k, v) in enumerate(fm):
+        if k == key:
+            fm[i] = (key, val)
+            return
+    fm.append((key, val))
+
+# Apply updates
+if new_status:
+    set_fm('status', f'"{new_status}"')
+if new_priority:
+    set_fm('priority', f'"{new_priority}"')
+set_fm('updated', f'"{today}"')
+
+if new_blocker:
+    for i, (k, v) in enumerate(fm):
+        if k == 'blockers':
+            # Parse existing blockers
+            existing = re.findall(r'"([^"]+)"', v)
+            existing.append(new_blocker)
+            fm[i] = ('blockers', '[' + ', '.join(f'"{b}"' for b in existing) + ']')
+            break
+
+# Rebuild frontmatter
+new_fm = ['---']
+for k, v in fm:
+    if k is None:
+        new_fm.append(v)
+    else:
+        new_fm.append(f'{k}: {v}')
+new_fm.append('---')
+
+# Build note line
+note_line = None
+if new_note:
+    note_line = f'- [{now}] {new_note}'
+elif new_status:
+    note_line = f'- [{now}] Status changed to {new_status}'
+
+# Reassemble: frontmatter + body + optional note
+body = '\n'.join(body_lines)
+if note_line:
+    body = body.rstrip() + '\n' + note_line + '\n'
+
+result = '\n'.join(new_fm) + '\n' + body
+with open(fpath, 'w') as f:
+    f.write(result)
+PYEOF
+
+  echo "[brain-task] Updated: $(basename "$file" .md)"
+  [[ -n "$status" ]] && echo "  Status: $status"
+  [[ -n "$priority" ]] && echo "  Priority: $priority"
+  [[ -n "$blocker" ]] && echo "  Blocker: $blocker"
+  [[ -n "$note" ]] && echo "  Note: $note"
+}
+
+# ── Complete ───────────────────────────────────────────────────────
+cmd_complete() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: brain-task complete \"name\""
+    exit 1
+  fi
+
+  # Delegate to brain-task-complete for full infrastructure:
+  # wiki, runbook, completion JSON, events, escalation, audit.
+  # Lightweight completion bypasses all of that — never use it.
+  local TOOLS_BIN="${TOOLS_DIR:-$HOME/bin}"
+  echo "[brain-task] Delegating to brain-task-complete (full lifecycle)."
+  echo "[brain-task] You must provide --by and --output flags."
+  echo ""
+  echo "  brain-task-complete $name --by <agent> --output \"<what was done>\""
+  echo ""
+  echo "Direct status-flip completion is disabled to prevent wiki/runbook/audit bypass."
+  exit 1
+
+  # Dead code below — kept for reference only, never reached.
+  local file
+  file=$(find_task "$name") || {
+    echo "[brain-task] Task not found: $name"
+    exit 1
+  }
+
+  # Reuse the Python updater
+  python3 - "$file" "complete" "" "" "Completed" "$TODAY" "$NOW" << 'PYEOF'
+import sys, re
+
+fpath, new_status, new_priority, new_blocker, new_note, today, now = sys.argv[1:8]
+
+with open(fpath, 'r') as f:
+    content = f.read()
+
+lines = content.split('\n')
+fm_lines = []
+body_lines = []
+if lines[0].strip() == '---':
+    fm_end = -1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '---':
+            fm_end = i
+            break
+    if fm_end > 0:
+        fm_lines = lines[1:fm_end]
+        body_lines = lines[fm_end+1:]
+    else:
+        body_lines = lines
+else:
+    body_lines = lines
+
+fm = []
+for line in fm_lines:
+    m = re.match(r'^(\w[\w_-]*)\s*:\s*(.*)', line)
+    if m:
+        fm.append((m.group(1), m.group(2).strip()))
+    else:
+        fm.append((None, line))
+
+def set_fm(key, val):
+    for i, (k, v) in enumerate(fm):
+        if k == key:
+            fm[i] = (key, val)
+            return
+    fm.append((key, val))
+
+if new_status:
+    set_fm('status', f'"{new_status}"')
+set_fm('updated', f'"{today}"')
+
+new_fm = ['---']
+for k, v in fm:
+    if k is None:
+        new_fm.append(v)
+    else:
+        new_fm.append(f'{k}: {v}')
+new_fm.append('---')
+
+body = '\n'.join(body_lines)
+if new_note:
+    body = body.rstrip() + '\n' + f'- [{now}] {new_note}' + '\n'
+
+result = '\n'.join(new_fm) + '\n' + body
+with open(fpath, 'w') as f:
+    f.write(result)
+PYEOF
+
+  echo "[brain-task] Completed: $(basename "$file" .md)"
+}
+
+# ── List ───────────────────────────────────────────────────────────
+cmd_list() {
+  local show_all="${1:-}"
+
+  python3 - "$TASK_DIR" "$show_all" << 'PYEOF'
+import os, sys, re
+
+task_dir = sys.argv[1]
+show_all = sys.argv[2] == '--all'
+
+tasks = []
+if os.path.isdir(task_dir):
+    for fname in sorted(os.listdir(task_dir)):
+        if not fname.endswith('.md') or fname == '.gitkeep':
+            continue
+        fpath = os.path.join(task_dir, fname)
+        with open(fpath) as f:
+            content = f.read()
+
+        # Parse frontmatter
+        fm = {}
+        lines = content.split('\n')
+        if lines[0].strip() == '---':
+            for i in range(1, min(len(lines), 20)):
+                if lines[i].strip() == '---':
+                    break
+                m = re.match(r'^(\w+)\s*:\s*"?(.+?)"?\s*$', lines[i])
+                if m:
+                    fm[m.group(1)] = m.group(2)
+
+        status = fm.get('status', 'unknown')
+        if not show_all and status == 'complete':
+            continue
+
+        tasks.append({
+            'name': fname.replace('.md', ''),
+            'title': fm.get('title', fname),
+            'status': status,
+            'priority': fm.get('priority', 'P3'),
+            'updated': fm.get('updated', '?'),
+        })
+
+if not tasks:
+    print("[brain-task] No active tasks.")
+    sys.exit(0)
+
+# Sort: active first, then by priority
+order = {'P1': 0, 'P2': 1, 'P3': 2, 'P4': 3}
+status_order = {'blocked': 0, 'active': 1, 'complete': 2}
+tasks.sort(key=lambda t: (status_order.get(t['status'], 9), order.get(t['priority'], 9)))
+
+print(f"{'Priority':<10} {'Status':<10} {'Updated':<12} {'Task'}")
+print(f"{'─'*9:<10} {'─'*9:<10} {'─'*11:<12} {'─'*30}")
+for t in tasks:
+    status_display = t['status'].upper() if t['status'] == 'blocked' else t['status']
+    print(f"{t['priority']:<10} {status_display:<10} {t['updated']:<12} {t['title']}")
+PYEOF
+}
+
+# ── Main ───────────────────────────────────────────────────────────
+case "${1:-}" in
+  create) shift; cmd_create "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  complete) shift; cmd_complete "$@" ;;
+  list) shift; cmd_list "${1:-}" ;;
+  ""|--help|-h)
+    echo "Usage: brain-task \"description\" [--node <node>] [--p1|--p2|--p3|--p4] [--why \"reason\"]"
+    echo ""
+    echo "Creates and admits a task to the queue. Canonical human-facing entrypoint."
+    echo "All flags are passed through to brain-task-quick."
+    echo ""
+    echo "Internal subcommands (legacy):"
+    echo "  create  update  complete  list"
+    exit 0
+    ;;
+  *)
+    # Default: plain description → route to brain-task-quick (canonical queue admission).
+    # brain-task is the human-facing entrypoint; brain-task-quick is the internal engine.
+    # Set attribution context if not already in an agent session — required by brain-dispatch
+    # for audit attribution and dedupe keying. Without this, dispatch falls back to
+    # BRAIN_AGENT=unknown and hard-blocks at the agent binding check.
+    export BRAIN_AGENT="${BRAIN_AGENT:-claude-code}"
+    exec brain-task-quick "$@"
+    ;;
+esac

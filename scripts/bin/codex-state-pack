@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# codex-state-pack — Build a compact Brain/Body state pack for the Claude↔Codex handshake
+exec python3 "${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/codex/codex_state_pack.py" "$@"

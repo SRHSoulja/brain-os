@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# brain-token-estimate -- Estimate token cost of a dispatch prompt or any text
+# Usage:
+#   brain-subagent-dispatch --dry-run ... | brain-token-estimate
+#   brain-token-estimate --file <path>
+#   brain-token-estimate --text "some string"
+#   brain-token-estimate --dispatch --profile <id> --task <TASK-ID> --question "..."
+#
+# Reports: total tokens, section breakdown, budget status, cost estimate (USD).
+# Agent-agnostic: callable by Claude, Codex, Gemini seats via ~/bin symlink.
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/bin"
+
+MODE="stdin"
+FILE=""
+TEXT=""
+DISPATCH_MODE=false
+DISPATCH_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)      MODE="file"; FILE="$2"; shift 2 ;;
+    --text)      MODE="text"; TEXT="$2"; shift 2 ;;
+    --dispatch)  DISPATCH_MODE=true; shift ;;
+    --profile|--task|--question|--agent|--skills)
+                 DISPATCH_ARGS+=("$1" "$2"); shift 2 ;;
+    -h|--help)
+      cat <<'HELP'
+Usage:
+  brain-subagent-dispatch --dry-run [args] | brain-token-estimate
+  brain-token-estimate --file <path>
+  brain-token-estimate --text "..."
+  brain-token-estimate --dispatch --profile <id> --task <TASK-ID> --question "..."
+
+Output: total tokens, section breakdown, cost estimate at Sonnet pricing.
+
+Examples:
+  brain-subagent-dispatch --dry-run --profile systems-architect --task TASK-123 \
+    --question "design this" | brain-token-estimate
+
+  brain-token-estimate --dispatch --profile rapid-implementer \
+    --task TASK-456 --question "fix the bug"
+
+  brain-token-estimate --file brain/index/session-resume.md
+HELP
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+# Get content to estimate
+if $DISPATCH_MODE; then
+  CONTENT=$("$TOOLS/brain-subagent-dispatch" --dry-run --agent claude-code \
+    "${DISPATCH_ARGS[@]}" 2>/dev/null || true)
+elif [[ "$MODE" == "file" ]]; then
+  CONTENT=$(cat "$FILE")
+elif [[ "$MODE" == "text" ]]; then
+  CONTENT="$TEXT"
+else
+  CONTENT=$(cat)
+fi
+
+python3 -c "
+import sys, re
+
+content = '''$CONTENT'''.replace(\"'''\", '')
+# If content came via stdin substitution it may be escaped differently
+if not content.strip():
+    content = sys.stdin.read() if not sys.stdin.isatty() else ''
+
+# Token estimate: bytes / 4 (matches brain token-budget-policy)
+total_bytes = len(content.encode('utf-8'))
+total_tokens = total_bytes // 4
+
+# Section breakdown by markdown ## headers
+sections = []
+current = 'preamble'
+current_bytes = 0
+for line in content.splitlines():
+    if line.startswith('## '):
+        if current_bytes > 0:
+            sections.append((current, current_bytes))
+        current = line[3:].strip()
+        current_bytes = len(line.encode('utf-8'))
+    else:
+        current_bytes += len(line.encode('utf-8')) + 1
+if current_bytes > 0:
+    sections.append((current, current_bytes))
+
+# Budget thresholds (from context_tier)
+budgets = {'minimal': 1500, 'standard': 3000, 'full': 8000}
+
+# Cost estimate: Sonnet input ~\$3/MTok
+cost_usd = (total_tokens / 1_000_000) * 3.0
+
+print(f'=== brain-token-estimate ===')
+print(f'Total:   {total_tokens:,} tokens  ({total_bytes:,} bytes)  ~\${cost_usd:.5f} USD input')
+print()
+print(f'Tier thresholds:  minimal={budgets[\"minimal\"]}  standard={budgets[\"standard\"]}  full={budgets[\"full\"]}')
+tier_status = 'minimal' if total_tokens <= budgets['minimal'] else 'standard' if total_tokens <= budgets['standard'] else 'full' if total_tokens <= budgets['full'] else 'OVER_BUDGET'
+print(f'Fits tier:        {tier_status}')
+print()
+if sections:
+    print('Section breakdown:')
+    for name, b in sections:
+        t = b // 4
+        bar = '█' * min(40, t // 20)
+        print(f'  {name[:35]:35s} {t:5d} tok  {bar}')
+" 2>/dev/null || python3 << PYEOF
+import sys
+content = sys.stdin.read() if not sys.stdin.isatty() else "$CONTENT"
+total_bytes = len(content.encode('utf-8'))
+total_tokens = total_bytes // 4
+cost_usd = (total_tokens / 1_000_000) * 3.0
+print(f'=== brain-token-estimate ===')
+print(f'Total: {total_tokens:,} tokens  ~\${cost_usd:.5f} USD input')
+PYEOF

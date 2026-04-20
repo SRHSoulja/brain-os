@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# brain-proof-start -- Create a new proof-of-execution run
+# Usage: brain-proof-start --task TASK-ID --executor <agent-id> [--signer-id <signer-id>]
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+PROOF_DIR="$BRAIN/brain/ops/proof-execution"
+RUNS_DIR="$PROOF_DIR/runs"
+INDEX_DIR="$PROOF_DIR/index"
+KEYGEN_TOOL="$HOME/bin/brain-proof-keygen"
+
+TASK_ID=""
+EXECUTOR=""
+SIGNER_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --task) TASK_ID="$2"; shift 2 ;;
+    --executor) EXECUTOR="$2"; shift 2 ;;
+    --signer-id) SIGNER_ID="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" || -z "$EXECUTOR" ]]; then
+  echo "Usage: brain-proof-start --task TASK-ID --executor <agent-id> [--signer-id <signer-id>]" >&2
+  exit 1
+fi
+
+if ! [[ "$EXECUTOR" =~ ^[A-Za-z0-9._:@-]+$ ]]; then
+  echo "Invalid executor: $EXECUTOR (must match ^[A-Za-z0-9._:@-]+$)" >&2
+  exit 1
+fi
+# Seat-vs-executor reconciliation: refuse to sign proof if executor doesn't match active seat
+if ! seat_agent_check "$EXECUTOR" "brain-proof-start"; then
+  echo "BLOCKED: Proof executor '$EXECUTOR' does not match active seat. Refusing to start proof run." >&2
+  echo "  Fix: ensure the correct agent identity is active (brain-seat-claim or brain-agent-bootstrap)" >&2
+  exit 1
+fi
+
+[[ -z "$SIGNER_ID" ]] && SIGNER_ID="$EXECUTOR"
+if [[ -x "$KEYGEN_TOOL" ]]; then
+  "$KEYGEN_TOOL" --agent-id "$SIGNER_ID" >/dev/null 2>&1
+fi
+
+mkdir -p "$RUNS_DIR" "$INDEX_DIR"
+
+# Generate run ID: proof-YYYYMMDD-HHMMSS-TASKID
+RUN_ID="proof-$(date +%Y%m%d-%H%M%S)-${TASK_ID}"
+RUN_FILE="$RUNS_DIR/${RUN_ID}.jsonl"
+SUMMARY_FILE="$RUNS_DIR/${RUN_ID}.summary.json"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+python3 - "$RUN_FILE" "$PROOF_DIR" "$NOW" "$RUN_ID" "$TASK_ID" "$EXECUTOR" "$SIGNER_ID" "$(hostname)" "$$" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import sys
+
+from cryptography.hazmat.primitives import serialization
+
+run_file, proof_dir, now, run_id, task_id, executor, signer_id, host, pid = sys.argv[1:]
+
+payload = {"host": host, "pid": int(pid)}
+payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+event = {
+    "schema_version": "poe-v2",
+    "ts": now,
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "actor": executor,
+    "signer_id": signer_id,
+    "event": "run_started",
+    "sequence": 0,
+    "receipt_id": f"{run_id}:0",
+    "prev_receipt_hash": None,
+    "payload_hash": payload_hash,
+    "payload": payload,
+}
+receipt_basis = {
+    "schema_version": event["schema_version"],
+    "run_id": event["run_id"],
+    "task_id": event["task_id"],
+    "executor": event["executor"],
+    "actor": event["actor"],
+    "signer_id": event["signer_id"],
+    "event": event["event"],
+    "sequence": event["sequence"],
+    "receipt_id": event["receipt_id"],
+    "prev_receipt_hash": event["prev_receipt_hash"],
+    "payload_hash": event["payload_hash"],
+    "ts": event["ts"],
+}
+receipt_bytes = json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode()
+event["receipt_hash"] = hashlib.sha256(receipt_bytes).hexdigest()
+
+registry = {}
+registry_path = os.path.join(proof_dir, "keys", "registry.json")
+with open(registry_path, "r", encoding="utf-8") as f:
+    registry = json.load(f)
+key_meta = registry.get(signer_id)
+if not key_meta:
+    raise SystemExit(f"missing signer key for {signer_id}")
+with open(key_meta["private_key"], "rb") as f:
+    private_key = serialization.load_pem_private_key(f.read(), password=None)
+signature = private_key.sign(receipt_bytes)
+event["signature_alg"] = "ed25519"
+event["signature_b64"] = base64.b64encode(signature).decode("ascii")
+event["public_key_fingerprint"] = key_meta.get("public_key_fingerprint")
+
+with open(run_file, "w", encoding="utf-8") as f:
+    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+PY
+
+# Write bootstrap summary
+python3 - "$SUMMARY_FILE" "$RUN_ID" "$TASK_ID" "$EXECUTOR" "$SIGNER_ID" "$NOW" <<'PY'
+import json, sys
+summary_file, run_id, task_id, executor, signer_id, now = sys.argv[1:]
+summary = {
+    "schema_version": "poe-v2",
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "signer_id": signer_id,
+    "started_at": now,
+    "ended_at": None,
+    "status": "running",
+    "commands_total": 0,
+    "commands_failed": 0,
+    "files_touched": [],
+    "allowed_write_surfaces": [],
+    "surface_violations": [],
+    "receipts_total": 0,
+    "chain_valid": None,
+    "chain_head": None,
+    "chain_tail": None,
+    "tamper_detected": False,
+    "replay_detected": False,
+    "evidence_hash": None,
+    "verified_by": None,
+    "verdict": None,
+}
+with open(summary_file, "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+PY
+
+# Update latest pointer
+python3 - "$INDEX_DIR/latest.json" "$RUN_ID" "$TASK_ID" "$EXECUTOR" "$SIGNER_ID" "$NOW" <<'PY'
+import json, sys
+latest_file, run_id, task_id, executor, signer_id, now = sys.argv[1:]
+latest = {
+    "schema_version": "poe-v2",
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "signer_id": signer_id,
+    "started_at": now,
+    "status": "running",
+}
+with open(latest_file, "w", encoding="utf-8") as f:
+    json.dump(latest, f, indent=2)
+PY
+
+echo "$RUN_ID"

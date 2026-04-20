@@ -1,0 +1,138 @@
+#!/bin/bash
+# brain-task-confirm — Confirm and clear post-task audit gate
+# Usage:
+#   brain-task-confirm [TASK-ID] [--by <agent>] [--allow-unverified --reason "<why>"]
+#
+# If TASK-ID is omitted, it reads the pending audit for the current agent.
+# Runs deterministic verification, shows reflection prompt, and clears the gate.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+
+TASK_ID=""
+AGENT="${BRAIN_AGENT:-claude-code}"
+ALLOW_UNVERIFIED=false
+OVERRIDE_REASON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by) AGENT="$2"; shift 2 ;;
+    --allow-unverified) ALLOW_UNVERIFIED=true; shift ;;
+    --reason) OVERRIDE_REASON="$2"; shift 2 ;;
+    -*)   echo "Unknown flag: $1"; exit 1 ;;
+    *)    TASK_ID="$1"; shift ;;
+  esac
+done
+
+if $ALLOW_UNVERIFIED && [[ -z "$OVERRIDE_REASON" ]]; then
+  echo "Error: --reason is required with --allow-unverified"
+  exit 1
+fi
+
+AGENT=$(canonical_agent "$AGENT")
+_AUDIT_MARKER=""
+
+if [[ -n "$TASK_ID" ]]; then
+  # Find marker containing this task_id
+  for f in "$BRAIN/brain/ops/tasks"/.pending-audit.*; do
+    [[ -f "$f" ]] || continue
+    if grep -q "$TASK_ID" "$f"; then
+      _AUDIT_MARKER="$f"
+      break
+    fi
+  done
+  if [[ -z "$_AUDIT_MARKER" ]]; then
+    echo "No pending audit found for task $TASK_ID."
+    exit 0
+  fi
+else
+  # Use current agent's marker
+  _AUDIT_MARKER="$BRAIN/brain/ops/tasks/.pending-audit.$AGENT"
+  if [[ ! -f "$_AUDIT_MARKER" ]]; then
+    echo "No pending audit found for agent $AGENT."
+    exit 0
+  fi
+fi
+
+_MARKER_TASK=$(python3 -c "import json; print(json.load(open('$_AUDIT_MARKER')).get('task_id','unknown'))" 2>/dev/null || echo "unknown")
+TASK_ID="$_MARKER_TASK"
+
+echo ""
+echo "=== Self-Assessment ($TASK_ID) ==="
+echo "Reflect on the completed task before proceeding:"
+echo ""
+echo "  COMPLETENESS"
+echo "  - Have all structural changes been documented with accurate wiki pages?"
+echo "  - Are there discoveries that haven't been turned into tasks or wiki entries?"
+echo "  - Did this task change any behavioral contracts (MANUAL.md, agent docs)?"
+echo "  - Would a different seat holder, starting fresh, understand what happened and why?"
+echo "  - Did this task add a non-bin capability (skill, hook, settings change, slash command)?"
+    echo "    If yes: is it registered in MAP.md / wiki / MANUAL? Can a fresh agent discover and use it? (MANUAL §10.4)"
+echo ""
+echo "  GAPS & IDEAS"
+echo "  - Did anything surface that the brain doesn't handle yet? Document it:"
+echo "      Task (actionable):  brain-task-quick \"P3: ...\""
+echo "      Idea (exploratory): brain-wiki create \"<title>\" --cat ideas"
+echo "      Pattern (reusable): brain-wiki create \"<title>\" --cat patterns"
+echo "  - WHY was something missed or incomplete? Is it a process gap, a tool gap,"
+    echo "    or a knowledge gap? The reason matters more than the item."
+echo ""
+echo "  SHORTCUTS & COMPLEXITY"
+echo "  - Did you defer anything 'for later'? Write it down now or it's gone."
+echo "  - Is the brain easier to operate after this task, or harder?"
+echo "    If harder, is the complexity justified?"
+echo ""
+echo "  OPERATOR LENS"
+echo "  - If the operator reviewed this right now, what would they push back on?"
+    echo "    Address it before they have to ask."
+echo ""
+echo "  SIGNAL"
+echo "  - Is anything nagging you that you haven't written down?"
+echo "  - If you had to hand this seat to another agent right now, what would you"
+    echo "    say in 30 seconds to get them up to speed on what just changed?"
+echo ""
+echo "Address gaps now. Then proceed."
+echo ""
+
+# Deterministic audit verification before clearing marker
+if $ALLOW_UNVERIFIED; then
+  _AUDIT_RESULT=$(AUDIT_VERIFY_ALLOW_UNVERIFIED=1 python3 "$TOOLS/lib/audit-verify.py" "$TASK_ID" 2>/dev/null || echo '{"pass":true,"checks":[],"hard_fails":[],"warnings":[]}')
+else
+  _AUDIT_RESULT=$(python3 "$TOOLS/lib/audit-verify.py" "$TASK_ID" 2>/dev/null || echo '{"pass":true,"checks":[],"hard_fails":[],"warnings":[]}')
+fi
+_AUDIT_PASS=$(echo "$_AUDIT_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pass',True))" 2>/dev/null)
+_AUDIT_FAILS=$(echo "$_AUDIT_RESULT" | python3 -c "import json,sys; [print(f'  {x}') for x in json.load(sys.stdin).get('hard_fails',[])]" 2>/dev/null)
+_AUDIT_WARNS=$(echo "$_AUDIT_RESULT" | python3 -c "import json,sys; [print(f'  {x}') for x in json.load(sys.stdin).get('warnings',[])]" 2>/dev/null)
+_AUDIT_CHECKS=$(echo "$_AUDIT_RESULT" | python3 -c "import json,sys; [print(f'  {x}') for x in json.load(sys.stdin).get('checks',[])]" 2>/dev/null)
+
+if [[ "$_AUDIT_PASS" == "False" ]]; then
+  echo "=== Audit Verification FAILED ==="
+  [[ -n "$_AUDIT_FAILS" ]] && echo "$_AUDIT_FAILS"
+  [[ -n "$_AUDIT_WARNS" ]] && echo "$_AUDIT_WARNS"
+  echo ""
+  echo "Fix the hard fails above, then retry: brain-task-confirm $TASK_ID"
+  exit 1
+fi
+
+# Show results
+[[ -n "$_AUDIT_CHECKS" ]] && echo "$_AUDIT_CHECKS"
+[[ -n "$_AUDIT_WARNS" ]] && echo "$_AUDIT_WARNS"
+if $ALLOW_UNVERIFIED; then
+  echo "  WARN: unverified override used — $OVERRIDE_REASON"
+fi
+echo ""
+
+# Log confirmation event
+. "$TOOLS/lib/brain-event.sh"
+brain_event TASK_AUDIT_CONFIRM "$TASK_ID by $AGENT"
+if $ALLOW_UNVERIFIED; then
+  brain_event TASK_AUDIT_CONFIRM_OVERRIDE "$TASK_ID by $AGENT reason=$OVERRIDE_REASON"
+fi
+
+rm -f "$_AUDIT_MARKER"
+echo "Audit checks passed for $TASK_ID — marker cleared."

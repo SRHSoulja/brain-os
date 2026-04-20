@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# brain-codex-verify -- DEPRECATED 2026-04-17. Use brain-review-dispatch.
+#
+# Canonical verification path: brain-review-dispatch <TASK-ID> --type verification
+# which routes through brain-subagent-dispatch (vendor-agnostic). The codex-lab
+# sidecar lane is being absorbed per TASK-2026-04-12-004. This tool remains
+# runnable only for transition.
+#
+# Usage (legacy):
+#   brain-codex-verify <commit-ish> [--task <task-file>] [--dry-run]
+#
+# Phases:
+#   1. PACK  -- extract diff, commit msg, optional task spec into a focused context
+#   2. DISPATCH -- submit to Codex via codex-claude-handoff (existing lane)
+#   3. PARSE -- read Codex deliverable, extract structured verdict, write artifact
+#
+# Output:
+#   brain/ops/codex-verdicts/<short-hash>.json
+#   Exit: 0=PASS, 1=FAIL, 2=BLOCKED
+#
+# Advisory only. Does not gate commits. Does not modify repo state.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+CODEX_LAB="$HOME/codex-lab"
+HANDOFF_CLI="$CODEX_LAB/tools/codex-claude-handoff"
+VERDICT_DIR="$BRAIN/brain/ops/codex-verdicts"
+EVENTS_LOG="$BRAIN/brain/ops/events.log"
+MAX_DIFF_BYTES=6000
+
+# ── Parse args ──────────────────────────────────────────────────────
+COMMIT=""
+TASK_FILE=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --task)    TASK_FILE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      sed -n '2,/^$/s/^# //p' "$0"
+      exit 0
+      ;;
+    -*)        echo "Unknown flag: $1" >&2; exit 2 ;;
+    *)         COMMIT="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$COMMIT" ]]; then
+  echo "Usage: brain-codex-verify <commit-ish> [--task <task-file>] [--dry-run]" >&2
+  exit 2
+fi
+
+# ── Resolve commit ──────────────────────────────────────────────────
+cd "$BRAIN"
+
+FULL_HASH=$(git rev-parse "$COMMIT" 2>/dev/null) || {
+  echo "Error: cannot resolve commit '$COMMIT'" >&2
+  exit 2
+}
+SHORT_HASH="${FULL_HASH:0:7}"
+COMMIT_MSG=$(git log --format='%s%n%n%b' -1 "$FULL_HASH" | head -20)
+COMMIT_DATE=$(git log --format='%aI' -1 "$FULL_HASH")
+FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r "$FULL_HASH" | head -30)
+
+# Check if verdict already exists
+if [[ -f "$VERDICT_DIR/${SHORT_HASH}.json" ]]; then
+  echo "Verdict already exists: $VERDICT_DIR/${SHORT_HASH}.json" >&2
+  cat "$VERDICT_DIR/${SHORT_HASH}.json"
+  exit 0
+fi
+
+# ── Phase 1: PACK ──────────────────────────────────────────────────
+echo "=== brain-codex-verify: PACK ==="
+echo "  Commit: $SHORT_HASH"
+echo "  Date:   $COMMIT_DATE"
+echo "  Message: $(echo "$COMMIT_MSG" | head -1)"
+
+DIFF=$(git diff "$FULL_HASH~1".."$FULL_HASH" 2>/dev/null | dd bs="$MAX_DIFF_BYTES" count=1 2>/dev/null || true)
+DIFF_SIZE=${#DIFF}
+
+PACK="## Commit Under Review
+
+Hash: $SHORT_HASH ($FULL_HASH)
+Date: $COMMIT_DATE
+Message: $COMMIT_MSG
+
+## Files Changed
+
+$FILES_CHANGED
+
+## Diff (${DIFF_SIZE}B, capped at ${MAX_DIFF_BYTES}B)
+
+\`\`\`diff
+$DIFF
+\`\`\`"
+
+# Append task context if provided
+TASK_ID=""
+WRITE_SURFACES=""
+if [[ -n "$TASK_FILE" && -f "$TASK_FILE" ]]; then
+  TASK_CONTENT=$(head -80 "$TASK_FILE")
+  TASK_ID=$(grep '^task_id:' "$TASK_FILE" | head -1 | sed 's/task_id: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  WRITE_SURFACES=$(grep -A5 'write_surfaces\|allowed_write_surfaces' "$TASK_FILE" | head -5 || true)
+  PACK="$PACK
+
+## Task Specification
+
+Task ID: $TASK_ID
+
+\`\`\`yaml
+$TASK_CONTENT
+\`\`\`
+
+Declared write surfaces: $WRITE_SURFACES"
+  echo "  Task:   $TASK_ID"
+fi
+
+PACK_SIZE=${#PACK}
+echo "  Pack:   ${PACK_SIZE}B"
+echo ""
+
+# ── Build verification objective ────────────────────────────────────
+SCOPE_BLOCK=""
+if [[ -n "$TASK_ID" ]]; then
+SCOPE_BLOCK="IMPORTANT -- Runner infrastructure distinction:
+The autonomous runner always writes these files as bookkeeping (NOT task scope violations):
+  - brain/ops/tasks/completed/*.md (the task record itself)
+  - brain/ops/derived/.signal-admit-rate.json (rate limiting)
+  - work/logs/autonomous-run.log (session log)
+These are expected in every autonomous commit. Do NOT flag them as scope violations.
+Only flag files outside BOTH the declared write surfaces AND the runner infrastructure list."
+else
+SCOPE_BLOCK="NOTE: No task specification was provided. This commit is NOT bound by any task execution contract. Do NOT infer a task contract from files mentioned in the diff. Skip the SCOPE check entirely and focus on INTENT, DEFECTS, and SAFETY only."
+fi
+
+OBJECTIVE="Verify commit $SHORT_HASH. Review the diff and task specification (if provided).
+
+$SCOPE_BLOCK
+
+Check these criteria:
+1. SCOPE: (Only if a task spec is provided) Do the TASK PAYLOAD files fall within the declared write surfaces? Skip this check if no task spec was given.
+2. INTENT: Do the changes match what the commit message says was done?
+3. DEFECTS: Are there syntax errors, broken references, placeholder residue, or obvious bugs? Check that data fields contain meaningful content (not empty strings, not placeholder arrays).
+4. SAFETY: Do the changes touch governance, credentials, production paths, or CLAUDE.md?
+
+After your analysis, you MUST write the deliverable file containing ONLY a JSON object (no markdown, no fences, no prose before or after) with this exact schema:
+
+{
+  \"commit\": \"$SHORT_HASH\",
+  \"task_id\": \"${TASK_ID:-none}\",
+  \"verdict\": \"PASS or FAIL\",
+  \"summary\": \"one sentence\",
+  \"findings\": [
+    {\"severity\": \"error or warning\", \"file\": \"path\", \"detail\": \"what is wrong\"}
+  ]
+}
+
+verdict MUST be PASS (no errors) or FAIL (at least one error-severity finding).
+findings array MUST be empty for PASS. warnings alone do not cause FAIL.
+
+Context pack follows:
+
+$PACK"
+
+DELIVERABLE="$CODEX_LAB/audits/verify-${SHORT_HASH}.json"
+
+if $DRY_RUN; then
+  echo "=== DRY RUN: would submit ==="
+  echo "  Deliverable: $DELIVERABLE"
+  echo "  Objective length: ${#OBJECTIVE} chars"
+  echo "  Pack size: ${PACK_SIZE}B"
+  echo ""
+  echo "--- Pack preview (first 40 lines) ---"
+  echo "$PACK" | head -40
+  exit 0
+fi
+
+# ── Phase 2: DISPATCH ──────────────────────────────────────────────
+echo "=== brain-codex-verify: DISPATCH ==="
+
+"$HANDOFF_CLI" submit-verification \
+  --repo-root "$BRAIN" \
+  --deliverable "$DELIVERABLE" \
+  --objective "$OBJECTIVE" \
+  --constraint "Return ONLY valid JSON in the deliverable file, no markdown wrapping" \
+  --constraint "Do not modify the canonical repo" \
+  --acceptance "Deliverable contains valid JSON with verdict, summary, findings fields" \
+  --acceptance "verdict is PASS or FAIL" \
+  --acceptance "findings array present even if empty" \
+  --response-format "json" \
+  --sandbox read-only \
+  --add-dir "$BRAIN" \
+  --full-auto 2>&1
+
+DISPATCH_EXIT=$?
+
+# ── Phase 3: PARSE ──────────────────────────────────────────────────
+echo ""
+echo "=== brain-codex-verify: PARSE ==="
+
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [[ $DISPATCH_EXIT -ne 0 ]]; then
+  echo "  Dispatch failed (exit $DISPATCH_EXIT). Writing BLOCKED verdict."
+  python3 -c "
+import json
+verdict = {
+    'commit': '$SHORT_HASH',
+    'task_id': '${TASK_ID:-none}',
+    'verdict': 'BLOCKED',
+    'summary': 'Codex dispatch failed with exit $DISPATCH_EXIT',
+    'findings': [],
+    'verified_at': '$NOW',
+    'dispatch_exit': $DISPATCH_EXIT,
+    'pack_size_bytes': $PACK_SIZE
+}
+print(json.dumps(verdict, indent=2))
+" > "$VERDICT_DIR/${SHORT_HASH}.json"
+  echo "  Wrote: $VERDICT_DIR/${SHORT_HASH}.json"
+  echo "$NOW CODEX_VERIFY $SHORT_HASH BLOCKED dispatch_failed" >> "$EVENTS_LOG"
+  exit 2
+fi
+
+# Try to parse Codex deliverable
+if [[ ! -f "$DELIVERABLE" ]]; then
+  echo "  Deliverable not found at $DELIVERABLE. Checking outbox..."
+  # Codex may have written result elsewhere; check latest outbox
+  DELIVERABLE=""
+fi
+
+VERDICT_JSON=""
+if [[ -n "$DELIVERABLE" && -f "$DELIVERABLE" ]]; then
+  # Try to extract JSON from deliverable (may have markdown wrapping despite instructions)
+  VERDICT_JSON=$(python3 -c "
+import json, sys, re
+
+raw = open('$DELIVERABLE').read().strip()
+
+# Try direct parse first
+try:
+    d = json.loads(raw)
+    print(json.dumps(d))
+    sys.exit(0)
+except json.JSONDecodeError:
+    pass
+
+# Try extracting from markdown code fence
+m = re.search(r'\`\`\`(?:json)?\s*\n(.*?)\n\`\`\`', raw, re.DOTALL)
+if m:
+    try:
+        d = json.loads(m.group(1))
+        print(json.dumps(d))
+        sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+
+# Try finding first { to last }
+start = raw.find('{')
+end = raw.rfind('}')
+if start >= 0 and end > start:
+    try:
+        d = json.loads(raw[start:end+1])
+        print(json.dumps(d))
+        sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+
+sys.exit(1)
+" 2>/dev/null) || true
+fi
+
+if [[ -n "$VERDICT_JSON" ]]; then
+  # Enrich with metadata and write
+  python3 -c "
+import json, sys
+
+d = json.loads(sys.argv[1])
+# Ensure required fields
+d.setdefault('commit', '$SHORT_HASH')
+d.setdefault('task_id', '${TASK_ID:-none}')
+d.setdefault('verdict', 'BLOCKED')
+d.setdefault('summary', '')
+d.setdefault('findings', [])
+d['verified_at'] = '$NOW'
+d['pack_size_bytes'] = $PACK_SIZE
+
+# Normalize verdict
+v = d['verdict'].upper()
+if v not in ('PASS', 'FAIL', 'BLOCKED'):
+    v = 'BLOCKED'
+d['verdict'] = v
+
+print(json.dumps(d, indent=2))
+" "$VERDICT_JSON" > "$VERDICT_DIR/${SHORT_HASH}.json"
+
+  FINAL_VERDICT=$(python3 -c "import json; print(json.load(open('$VERDICT_DIR/${SHORT_HASH}.json'))['verdict'])")
+  FINAL_SUMMARY=$(python3 -c "import json; print(json.load(open('$VERDICT_DIR/${SHORT_HASH}.json'))['summary'])")
+  FINDING_COUNT=$(python3 -c "import json; print(len(json.load(open('$VERDICT_DIR/${SHORT_HASH}.json'))['findings']))")
+
+  echo "  Verdict: $FINAL_VERDICT"
+  echo "  Summary: $FINAL_SUMMARY"
+  echo "  Findings: $FINDING_COUNT"
+  echo "  Wrote: $VERDICT_DIR/${SHORT_HASH}.json"
+  echo "$NOW CODEX_VERIFY $SHORT_HASH $FINAL_VERDICT $FINDING_COUNT findings" >> "$EVENTS_LOG"
+
+  case "$FINAL_VERDICT" in
+    PASS)    exit 0 ;;
+    FAIL)    exit 1 ;;
+    *)       exit 2 ;;
+  esac
+else
+  echo "  Could not parse structured verdict from Codex output."
+  echo "  Writing BLOCKED verdict (unparseable response)."
+  python3 -c "
+import json
+verdict = {
+    'commit': '$SHORT_HASH',
+    'task_id': '${TASK_ID:-none}',
+    'verdict': 'BLOCKED',
+    'summary': 'Codex response could not be parsed as structured JSON',
+    'findings': [],
+    'verified_at': '$NOW',
+    'pack_size_bytes': $PACK_SIZE,
+    'raw_deliverable': '$(echo "${DELIVERABLE:-missing}" | sed "s/'/\\\\'/g")'
+}
+print(json.dumps(verdict, indent=2))
+" > "$VERDICT_DIR/${SHORT_HASH}.json"
+  echo "  Wrote: $VERDICT_DIR/${SHORT_HASH}.json"
+  echo "$NOW CODEX_VERIFY $SHORT_HASH BLOCKED unparseable" >> "$EVENTS_LOG"
+  exit 2
+fi

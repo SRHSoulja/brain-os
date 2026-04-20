@@ -1,0 +1,1307 @@
+#!/bin/bash
+# brain-task-complete — Complete an active task with verdict gate + lock
+# Usage:
+#   brain-task-complete <TASK-ID> --by <agent> --output <desc> [--notes <notes>] [--impact <m:b:a>]
+#   brain-task-complete --payload <payload.json>
+#
+# Reads task from active/, validates Results, writes completed version to
+# temp file in completed/, atomic rename, then removes source from active/.
+# Active files are NEVER modified in place.
+# Enforces: VERDICT_GATE, per-task lock, source/destination guards.
+
+set -euo pipefail
+
+BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+TOOLS="${TOOLS:-$HOME/gmgn-brain/scripts}"
+
+# Self-dispatch: route through brain-dispatch if not already dispatched.
+# brain-dispatch sets BRAIN_DISPATCH_ACTIVE=1 before calling this tool.
+if [[ -z "${BRAIN_DISPATCH_ACTIVE:-}" ]]; then
+  exec "$TOOLS/bin/brain-dispatch" "brain-task-complete" "$@"
+fi
+
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$BRAIN/brain/ops/tasks"
+. "$TOOLS/lib/frontmatter.sh"
+
+# ── Parse arguments ───────────────────────────────────────────────
+TASK_ID=""
+COMPLETED_BY=""
+OUTPUT=""
+NOTES=""
+IMPACT=""
+PAYLOAD_FILE=""
+EXECUTION_NOTE=""
+SKIP_EXECUTION_NOTE=false
+AUTO_VERIFY=false
+MODEL_OVERRIDE=""
+ALLOW_UNRESOLVED_MODEL=false
+UNRESOLVED_MODEL_REASON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by)      COMPLETED_BY="$2"; shift 2 ;;
+    --output)  OUTPUT="$2"; shift 2 ;;
+    --notes)   NOTES="$2"; shift 2 ;;
+    --impact)  IMPACT="$2"; shift 2 ;;
+    --payload|--from-payload) PAYLOAD_FILE="$2"; shift 2 ;;
+    --execution-note) EXECUTION_NOTE="$2"; shift 2 ;;
+    --skip-execution-note) SKIP_EXECUTION_NOTE=true; shift ;;
+    --verify)  AUTO_VERIFY=true; shift ;;
+    --model)   MODEL_OVERRIDE="$2"; shift 2 ;;
+    --allow-unresolved-model) ALLOW_UNRESOLVED_MODEL=true; shift ;;
+    --reason)  UNRESOLVED_MODEL_REASON="$2"; shift 2 ;;
+    -*)        echo "Unknown flag: $1" >&2; exit 1 ;;
+    *)         TASK_ID="$1"; shift ;;
+  esac
+done
+
+if $ALLOW_UNRESOLVED_MODEL && [[ -z "$UNRESOLVED_MODEL_REASON" ]]; then
+  echo "Error: --reason is required with --allow-unresolved-model" >&2
+  exit 1
+fi
+
+# ── Payload mode: load and validate ───────────────────────────────
+PAYLOAD_JSON=""
+if [[ -n "$PAYLOAD_FILE" ]]; then
+  if [[ ! -f "$PAYLOAD_FILE" ]]; then
+    echo "Error: payload file not found: $PAYLOAD_FILE" >&2
+    exit 1
+  fi
+
+  # Validate payload
+  VALIDATE_OUT=$(python3 "$TOOLS/lib/validate-completion-payload.py" "$PAYLOAD_FILE" 2>&1) || {
+    echo "Payload validation failed:" >&2
+    echo "$VALIDATE_OUT" >&2
+    exit 1
+  }
+
+  # Extract fields from payload
+  PAYLOAD_JSON=$(cat "$PAYLOAD_FILE")
+  _PL_TASK_ID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('task_id',''))" "$PAYLOAD_FILE")
+  _PL_SUMMARY=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('completion_summary',''))" "$PAYLOAD_FILE")
+  _PL_NOTES=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('implementation_notes',''))" "$PAYLOAD_FILE")
+  _PL_IMPACT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('impact',''))" "$PAYLOAD_FILE")
+
+  # Payload fields take precedence, CLI args can override
+  [[ -z "$TASK_ID" ]] && TASK_ID="$_PL_TASK_ID"
+  [[ -z "$OUTPUT" ]] && OUTPUT="$_PL_SUMMARY"
+  [[ -z "$NOTES" ]] && NOTES="$_PL_NOTES"
+  [[ -z "$IMPACT" ]] && IMPACT="$_PL_IMPACT"
+  # Default agent from seat environment or active task owner if not specified.
+  if [[ -z "$COMPLETED_BY" && -n "${BRAIN_AGENT:-}" ]]; then
+    COMPLETED_BY="$BRAIN_AGENT"
+  fi
+  if [[ -z "$COMPLETED_BY" && -n "$TASK_ID" ]]; then
+    _active_file="$OPS_DIR/active/${TASK_ID}.md"
+    if [[ -f "$_active_file" ]]; then
+      _task_owner=$(fm_get "$_active_file" "owner")
+      [[ -n "$_task_owner" && "$_task_owner" != "unassigned" ]] && COMPLETED_BY="$_task_owner"
+    fi
+  fi
+  # Final fallback if still empty
+  [[ -z "$COMPLETED_BY" ]] && COMPLETED_BY="claude-code"
+  COMPLETED_BY="$(canonical_agent "$COMPLETED_BY")"
+
+  # Seat-vs-agent reconciliation: warn if completing agent doesn't match active seat
+  if ! seat_agent_check "$COMPLETED_BY" "brain-task-complete"; then
+    echo "WARNING: Completing as '$COMPLETED_BY' but active seat has a different agent."
+    echo "  Completion will proceed but attribution may be incorrect."
+    echo "  To fix: pass correct --by <agent> or reclaim seat with brain-seat-claim."
+  fi
+
+  # Verify task_id consistency
+  if [[ -n "$_PL_TASK_ID" && -n "$TASK_ID" && "$_PL_TASK_ID" != "$TASK_ID" ]]; then
+    echo "Error: payload task_id ($_PL_TASK_ID) does not match CLI task_id ($TASK_ID)" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "$TASK_ID" || -z "$COMPLETED_BY" || -z "$OUTPUT" ]]; then
+  echo "Usage:" >&2
+  echo "  brain-task-complete <TASK-ID> --by <agent> --output <desc> [--notes <notes>] [--impact <m:b:a>]" >&2
+  echo "  brain-task-complete <TASK-ID> --by <agent> --output <desc> --execution-note <note>" >&2
+  echo "  brain-task-complete <TASK-ID> --by <agent> --output <desc> --model <model>" >&2
+  echo "  brain-task-complete --payload <payload.json>" >&2
+  echo "" >&2
+  echo "Payload mode:" >&2
+  echo "  brain-task-complete --payload completion.json" >&2
+  echo "  brain-task-complete TASK-ID --payload completion.json --by claude-code" >&2
+  exit 1
+fi
+
+# ── Completion model attribution (agent-agnostic) ───────────────
+COMPLETION_MODEL="${MODEL_OVERRIDE:-${BRAIN_MODEL:-}}"
+COMPLETION_MODEL_SOURCE="env:BRAIN_MODEL"
+if [[ -n "$MODEL_OVERRIDE" ]]; then
+  COMPLETION_MODEL_SOURCE="flag:--model"
+fi
+if [[ -z "$COMPLETION_MODEL" ]]; then
+  _CAPS_FILE="$BRAIN/brain/governance/capability-profiles/${COMPLETED_BY}.json"
+  if [[ -f "$_CAPS_FILE" ]]; then
+    COMPLETION_MODEL=$(python3 -c "import json; print(json.load(open('$_CAPS_FILE')).get('model',''))" 2>/dev/null || echo "")
+    [[ -n "$COMPLETION_MODEL" ]] && COMPLETION_MODEL_SOURCE="capability-profile:${COMPLETED_BY}"
+  fi
+fi
+if [[ -z "$COMPLETION_MODEL" && "$ALLOW_UNRESOLVED_MODEL" != "true" ]]; then
+  echo "Error: completion model unresolved for $COMPLETED_BY." >&2
+  echo "  Set BRAIN_MODEL, or pass --model <model>." >&2
+  echo "  Emergency bypass: --allow-unresolved-model --reason \"<why>\"" >&2
+  exit 1
+fi
+[[ -z "$COMPLETION_MODEL" ]] && COMPLETION_MODEL="unresolved"
+if [[ "$COMPLETION_MODEL" == "unresolved" ]]; then
+  COMPLETION_MODEL_SOURCE="override:unresolved"
+fi
+
+# ── Execution note gate ──────────────────────────────────────────
+# Require --execution-note or --skip-execution-note. The note captures
+# what failed, surprised, or should not need rediscovering.
+if [[ -z "$EXECUTION_NOTE" && "$SKIP_EXECUTION_NOTE" != "true" ]]; then
+  echo "Error: --execution-note <note> is required (or --skip-execution-note to bypass)." >&2
+  echo "  What failed, surprised, or should not need rediscovering?" >&2
+  echo "" >&2
+  echo "  Example: --execution-note 'brain-agent-bootstrap still has its own canonical_agent copy'" >&2
+  echo "  Example: --skip-execution-note" >&2
+  exit 1
+fi
+
+# ── Early existence check ─────────────────────────────────────────
+TASK_FILE="$OPS_DIR/active/${TASK_ID}.md"
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID not found in active/" >&2
+  echo "Active tasks:" >&2
+  ls "$OPS_DIR/active/"TASK-*.md 2>/dev/null | xargs -I{} basename {} .md >&2 || echo "  (none)" >&2
+  exit 1
+fi
+
+# ── VERDICT GATE ──────────────────────────────────────────────────
+. "$TOOLS/lib/verdict-gate.sh"
+verdict_read
+
+if ! verdict_gate_allow; then
+  echo ""
+  verdict_gate_message "task completion"
+  exit 1
+fi
+[[ "$_V_STATUS" == "STALE" ]] && verdict_gate_message "task completion"
+
+# ── ACQUIRE LOCK ──────────────────────────────────────────────────
+. "$TOOLS/lib/task-lock.sh"
+
+if ! task_lock_acquire "$TASK_ID" "complete" "$COMPLETED_BY"; then
+  exit 1
+fi
+
+COMPLETED_TMP=""
+cleanup() {
+  [[ -n "$COMPLETED_TMP" ]] && rm -f "$COMPLETED_TMP"
+  task_lock_cleanup
+}
+trap cleanup EXIT
+
+# ── SOURCE GUARDS (inside lock) ───────────────────────────────────
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: $TASK_ID was removed from active/ (file gone)"
+  exit 1
+fi
+
+COMPLETED_TARGET="$OPS_DIR/completed/${TASK_ID}.md"
+if [[ -f "$COMPLETED_TARGET" ]]; then
+  echo "Error: $TASK_ID already exists in completed/ — cannot complete again"
+  exit 1
+fi
+
+if ! fm_has_frontmatter "$TASK_FILE"; then
+  echo "Error: $TASK_ID has no frontmatter (missing opening ---)"
+  exit 1
+fi
+
+SRC_TASK_ID=$(fm_get "$TASK_FILE" "task_id")
+# Accept id: as alias for task_id: (some tasks created without task_id: field)
+if [[ -z "$SRC_TASK_ID" ]]; then
+  SRC_TASK_ID=$(fm_get "$TASK_FILE" "id")
+fi
+SRC_STATUS=$(fm_get "$TASK_FILE" "status")
+SRC_OWNER=$(fm_get "$TASK_FILE" "owner")
+
+if [[ "$SRC_TASK_ID" != "$TASK_ID" ]]; then
+  echo "Error: task_id in file ($SRC_TASK_ID) does not match argument ($TASK_ID)"
+  exit 1
+fi
+
+# ── Status gate ───────────────────────────────────────────────
+# Manual status edits are NEVER supported. See TASK-2026-04-10-136:
+# Option A (owner-match tolerance) was rejected because the
+# ACTIVE_STATUS rule in tools/lib/task-schema-validator.py (sourced
+# by brain-state-check) flags "status!=active|blocked in active/"
+# as DRIFT, which causes the verdict gate above to reject the
+# completion before this gate ever runs. Loosening one gate
+# without loosening the other would be dead code; loosening both
+# would weaken a hot-path invariant shared by every tool that
+# calls state-check.
+#
+# If an agent edits status to "completed" (or anything else)
+# before calling this tool, the correct recovery is to edit the
+# status field back to "active" and re-run. Full contract:
+# brain/wiki/pages/feedback_task_completion_contract.md
+if [[ "$SRC_STATUS" != "active" && "$SRC_STATUS" != "blocked" ]]; then
+  echo "Error: $TASK_ID has status=$SRC_STATUS in active/ (must be active or blocked)"
+  echo ""
+  echo "Manual status edits are NEVER supported. This state is blocked by TWO gates:"
+  echo "  1. tools/lib/task-schema-validator.py ACTIVE_STATUS rule"
+  echo "     (runs inside brain-state-check → sets verdict=DRIFT)"
+  echo "  2. This check in brain-task-complete"
+  echo ""
+  echo "Recovery (3 steps):"
+  echo "  1. Edit $TASK_FILE"
+  echo "     Change the 'status:' field back to \"active\""
+  echo "  2. (Optional) Run brain-state-check to refresh verdict to OK"
+  echo "  3. Re-run: brain-task-complete $TASK_ID --by $COMPLETED_BY --output \"...\""
+  echo ""
+  echo "The tool will then move the file to completed/ and set status=completed atomically."
+  echo "See brain/wiki/pages/feedback_task_completion_contract.md for the full contract."
+  exit 1
+fi
+
+if [[ -z "$SRC_OWNER" || "$SRC_OWNER" == "unassigned" ]]; then
+  echo "Error: $TASK_ID has owner=$SRC_OWNER (must be assigned before completion)"
+  exit 1
+fi
+
+# ── IMPACT INFERENCE (if not explicitly provided) ─────────────────
+IMPACT_INFERRED=false
+if [[ -z "$IMPACT" ]]; then
+  INFER_RESULT=$(python3 "$TOOLS/lib/infer-impact.py" "$TASK_FILE" "$OUTPUT" "$NOTES" 2>/dev/null) || true
+  if [[ -n "$INFER_RESULT" ]]; then
+    IFS=$'\t' read -r _inf_metric _inf_prev _inf_next <<< "$INFER_RESULT"
+    SUGGESTED="${_inf_metric}:${_inf_prev}:${_inf_next}"
+    echo ""
+    echo "Possible Impact Detected"
+    echo "  $SUGGESTED"
+    echo ""
+    if [[ -t 0 ]]; then
+      read -rp "Accept inferred impact? [Y/n] " _confirm
+      if [[ "$_confirm" =~ ^[Nn]$ ]]; then
+        echo "  Impact skipped."
+      else
+        IMPACT="$SUGGESTED"
+        IMPACT_INFERRED=true
+      fi
+    else
+      echo "  Auto-accepted (non-interactive)"
+      IMPACT="$SUGGESTED"
+      IMPACT_INFERRED=true
+    fi
+  fi
+fi
+
+# ── PROOF-OF-EXECUTION GATE (AI-owned contracted tasks) ──────────
+# If this task has a run record with a proof_run_id, check verdict.
+_PROOF_GATE_NOTE=""
+_RUN_RECORD="$OPS_DIR/active/${TASK_ID}.run.json"
+if [[ -f "$_RUN_RECORD" ]]; then
+  _PROOF_RUN_ID=$(python3 -c "import json; d=json.load(open('$_RUN_RECORD')); print(d.get('proof_run_id',''))" 2>/dev/null) || true
+  if [[ -n "$_PROOF_RUN_ID" ]]; then
+    _PROOF_SUMMARY="$BRAIN/brain/ops/proof-execution/runs/${_PROOF_RUN_ID}.summary.json"
+    # Auto-finalize: run brain-proof-verify if summary doesn't exist yet
+    # (TASK-108, 2026-04-12: previously just printed a note and continued)
+    if [[ ! -f "$_PROOF_SUMMARY" ]]; then
+      echo "  Auto-finalizing proof run $_PROOF_RUN_ID..."
+      "$TOOLS/bin/brain-proof-verify" --run "$_PROOF_RUN_ID" 2>&1 || true
+    fi
+    # Now check the verdict (may have just been created by auto-finalize)
+    if [[ -f "$_PROOF_SUMMARY" ]]; then
+      _PROOF_VERDICT=$(python3 -c "import json; print(json.load(open('$_PROOF_SUMMARY')).get('verdict',''))" 2>/dev/null) || true
+      if [[ "$_PROOF_VERDICT" == "FAIL" ]]; then
+        echo ""
+        echo "BLOCKED: Proof-of-execution verdict is FAIL for run $_PROOF_RUN_ID"
+        echo "  Fix issues and re-verify: brain-proof-verify --run $_PROOF_RUN_ID"
+        exit 1
+      elif [[ "$_PROOF_VERDICT" == "WARN" ]]; then
+        _PROOF_GATE_NOTE="Proof verdict: WARN (run $_PROOF_RUN_ID)"
+        echo ""
+        echo "WARNING: $_PROOF_GATE_NOTE"
+      fi
+    else
+      echo ""
+      echo "WARNING: proof run $_PROOF_RUN_ID could not be finalized (brain-proof-verify failed)"
+      echo "  Manual verify: brain-proof-verify --run $_PROOF_RUN_ID"
+    fi
+  fi
+fi
+
+# ── BUILD COMPLETED VERSION ───────────────────────────────────────
+# ── PRE-MUTATION DOCUMENTATION GATE ────────────────────────────
+# Fail-closed if undocumented tool changes are detected.
+_PRE_AUDIT=$(python3 "$BRAIN/scripts/lib/post-task-audit.py" --preflight --tools-dir "$TOOLS" 2>/dev/null) || true
+if [[ -n "$_PRE_AUDIT" ]]; then
+  echo "ERROR: Task completion BLOCKED by missing tool documentation."
+  echo "$_PRE_AUDIT"
+  echo ""
+  echo "Resolve these issues before re-running brain-task-complete."
+  exit 1
+fi
+
+COMPLETED_TMP=$(mktemp "$OPS_DIR/completed/.${TASK_ID}.md.XXXXXX")
+COMPLETED_DATE=$(date +%Y-%m-%d)
+
+python3 - "$TASK_FILE" "$COMPLETED_TMP" "$COMPLETED_BY" "$COMPLETED_DATE" "$OUTPUT" "$NOTES" "$IMPACT" "$IMPACT_INFERRED" "$COMPLETION_MODEL" <<'PYEOF'
+import re, sys
+
+task_file, out_file, completed_by, completed_on, output, notes, impact_raw, inferred_str, completion_model = sys.argv[1:10]
+impact_inferred = inferred_str == 'true'
+
+with open(task_file, 'r') as f:
+    content = f.read()
+
+# Normalize id: → task_id: in frontmatter (backward compat for tasks created without task_id:)
+if not re.search(r'^task_id:\s', content, re.MULTILINE) and re.search(r'^id:\s', content, re.MULTILINE):
+    content = re.sub(r'^(id:\s)', 'task_id: ', content, flags=re.MULTILINE, count=1)
+
+content = re.sub(r'^status:.*$', 'status: "completed"', content, flags=re.MULTILINE)
+
+if '## Results' in content:
+    content = re.sub(r'^- \*\*Completed by:\*\*.*$', '- **Completed by:** ' + completed_by, content, flags=re.MULTILINE)
+    content = re.sub(r'^- \*\*Completed on:\*\*.*$', '- **Completed on:** ' + completed_on, content, flags=re.MULTILINE)
+    content = re.sub(r'^- \*\*Model:\*\*.*$', '- **Model:** ' + completion_model, content, flags=re.MULTILINE)
+    content = re.sub(r'^- \*\*Output:\*\*.*$', '- **Output:** ' + output, content, flags=re.MULTILINE)
+    if notes:
+        content = re.sub(r'^- \*\*Notes:\*\*.*$', '- **Notes:** ' + notes, content, flags=re.MULTILINE)
+        if '**Notes:**' not in content:
+            content = re.sub(r'(- \*\*Output:\*\*.*$)', r'\1\n- **Notes:** ' + notes, content, flags=re.MULTILINE)
+
+    results_match = re.search(r'^## Results\s*$', content, re.MULTILINE)
+    if results_match:
+        after_results = content[results_match.end():]
+        additions = ''
+        if '**Completed by:**' not in after_results:
+            additions += '\n- **Completed by:** ' + completed_by
+        if '**Completed on:**' not in after_results:
+            additions += '\n- **Completed on:** ' + completed_on
+        if '**Model:**' not in after_results:
+            additions += '\n- **Model:** ' + completion_model
+        if '**Output:**' not in after_results:
+            additions += '\n- **Output:** ' + output
+        if notes and '**Notes:**' not in after_results:
+            additions += '\n- **Notes:** ' + notes
+        if additions:
+            content = content[:results_match.end()] + additions + content[results_match.end():]
+else:
+    notes_line = ''
+    if notes:
+        notes_line = '\n- **Notes:** ' + notes
+    content = content.rstrip() + '\n\n## Results\n\n- **Completed by:** ' + completed_by + '\n- **Completed on:** ' + completed_on + '\n- **Model:** ' + completion_model + '\n- **Output:** ' + output + notes_line + '\n'
+
+content = re.sub(r'^_Filled in by the completing agent\._\s*\n?', '', content, flags=re.MULTILINE)
+
+if impact_raw:
+    parts = impact_raw.split(':', 2)
+    if len(parts) == 3:
+        metric, before, after = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    elif len(parts) == 2:
+        metric, before, after = parts[0].strip(), parts[1].strip(), ''
+    else:
+        metric, before, after = impact_raw.strip(), '', ''
+
+    impact_block = '\n### Impact\n\n'
+    impact_block += '- **Metric:** ' + metric + '\n'
+    if before:
+        impact_block += '- **Before:** ' + before + '\n'
+    if after:
+        impact_block += '- **After:** ' + after + '\n'
+    impact_block += '- **Inferred:** ' + ('yes' if impact_inferred else 'no') + '\n'
+
+    content = re.sub(r'### Impact \(optional\)\s*\n(?:- \*\*(?:Metric|Before|After|Inferred):\*\*.*\n)*', '', content)
+    content = re.sub(r'### Impact\s*\n(?:- \*\*(?:Metric|Before|After|Inferred):\*\*.*\n)*', '', content)
+
+    content = content.rstrip() + '\n' + impact_block
+
+with open(out_file, 'w') as f:
+    f.write(content)
+PYEOF
+
+if [[ ! -s "$COMPLETED_TMP" ]]; then
+  echo "Error: failed to write completed task"
+  exit 1
+fi
+
+# ── VALIDATE TRANSFORMED OUTPUT ───────────────────────────────────
+VALIDATION_ERRORS=0
+
+TMP_STATUS=$(fm_get "$COMPLETED_TMP" "status")
+if [[ "$TMP_STATUS" != "completed" ]]; then
+  echo "Validation error: status is '$TMP_STATUS' (expected completed)"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+TMP_TASK_ID=$(fm_get "$COMPLETED_TMP" "task_id")
+if [[ "$TMP_TASK_ID" != "$TASK_ID" ]]; then
+  echo "Validation error: task_id changed from $TASK_ID to $TMP_TASK_ID"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if ! grep -q '## Results' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: Results section missing"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if ! grep -q '\*\*Completed by:\*\*.*[a-z]' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: Completed by is empty or missing"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if ! grep -q '\*\*Model:\*\*.*[[:alnum:]]' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: Model attribution is empty or missing"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if ! grep -q '\*\*Completed on:\*\*.*[0-9]' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: Completed on is empty or missing"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if ! grep -q '\*\*Output:\*\*.*[a-z0-9]' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: Output is empty or missing"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if grep -q 'Filled in by the completing agent' "$COMPLETED_TMP" 2>/dev/null; then
+  echo "Validation error: placeholder residue remains"
+  VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+fi
+
+if [[ $VALIDATION_ERRORS -gt 0 ]]; then
+  echo ""
+  echo "Completion aborted: $VALIDATION_ERRORS validation error(s)"
+  exit 1
+fi
+
+# ── ATOMIC RENAME + SOURCE DELETE ─────────────────────────────────
+mv "$COMPLETED_TMP" "$COMPLETED_TARGET"
+COMPLETED_TMP=""
+
+if [[ ! -f "$COMPLETED_TARGET" ]]; then
+  echo "Error: destination file missing after rename — aborting source deletion"
+  exit 1
+fi
+
+# Use git rm if inside a git repo so the deletion is tracked in version control.
+if git -C "$(dirname "$TASK_FILE")" rev-parse --is-inside-work-tree &>/dev/null; then
+  git -C "$BRAIN" rm -qf "$TASK_FILE" 2>/dev/null || rm "$TASK_FILE"
+else
+  rm "$TASK_FILE"
+fi
+
+# ── SEAL AND MOVE RUN RECORD IF EXISTS ────────────────────────────
+RUN_RECORD_SRC="$OPS_DIR/active/${TASK_ID}.run.json"
+if [[ -f "$RUN_RECORD_SRC" ]]; then
+  # Update status from "executing" to "completed" before archiving
+  python3 - "$RUN_RECORD_SRC" "$COMPLETED_DATE" <<'PYEOF'
+import json, sys
+path, date = sys.argv[1:3]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    d["status"] = "completed"
+    d["completed_at"] = date
+    with open(path, 'w') as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+except Exception:
+    pass
+PYEOF
+  mv "$RUN_RECORD_SRC" "$OPS_DIR/completed/${TASK_ID}.run.json" 2>/dev/null || true
+fi
+
+# ── ARCHIVE WORKER ARTIFACTS IF PRESENT ───────────────────────────
+for wf in "$OPS_DIR/active/.worker-${TASK_ID}-"*; do
+  [[ -f "$wf" ]] || continue
+  mv "$wf" "$OPS_DIR/completed/" 2>/dev/null || true
+done
+
+# ── COMPUTE TASK DURATION ─────────────────────────────────────────
+# Primary source: claimed_at in frontmatter (written by brain-task-claim)
+# Fallback: TASK_CLAIM event in events.jsonl (for tasks claimed before this instrumentation)
+CLAIMED_AT=$(fm_get "$COMPLETED_TARGET" "claimed_at" 2>/dev/null || echo "")
+if [[ -z "$CLAIMED_AT" ]]; then
+  CLAIMED_AT=$(python3 -c "
+import json, sys
+task_id = sys.argv[1]
+events_path = sys.argv[2]
+try:
+    last_claim = ''
+    with open(events_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                ev = json.loads(line)
+                if ev.get('op') == 'TASK_CLAIM' and ev.get('entity_id') == task_id:
+                    last_claim = ev.get('ts', '')
+            except json.JSONDecodeError:
+                pass
+    print(last_claim)
+except:
+    print('')
+" "$TASK_ID" "$BRAIN/brain/ops/events.jsonl" 2>/dev/null || echo "")
+fi
+ESTIMATE_MIN=$(fm_get "$COMPLETED_TARGET" "estimate_minutes" 2>/dev/null || echo "")
+DURATION_MIN=""
+COMPLETED_AT_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [[ -n "$CLAIMED_AT" ]]; then
+  DURATION_MIN=$(python3 -c "
+from datetime import datetime
+import sys
+try:
+    start = datetime.fromisoformat(sys.argv[1].replace('Z','+00:00'))
+    end = datetime.fromisoformat(sys.argv[2].replace('Z','+00:00'))
+    print(int((end - start).total_seconds() / 60))
+except:
+    print('')
+" "$CLAIMED_AT" "$COMPLETED_AT_ISO" 2>/dev/null || echo "")
+fi
+
+# Write to build-metrics.jsonl
+METRICS_LOG="$BRAIN/work/logs/build-metrics.jsonl"
+python3 -c "
+import json, sys
+task_id = sys.argv[1]
+claimed_at = sys.argv[2]
+completed_at = sys.argv[3]
+duration_min = sys.argv[4]
+estimate_min = sys.argv[5]
+output = sys.argv[6]
+agent = sys.argv[7]
+priority = sys.argv[8]
+metrics_path = sys.argv[9]
+
+record = {
+    'type': 'task_complete',
+    'task_id': task_id,
+    'agent': agent,
+    'priority': priority,
+    'claimed_at': claimed_at or None,
+    'completed_at': completed_at,
+    'duration_minutes': int(duration_min) if duration_min else None,
+    'estimate_minutes': int(estimate_min) if estimate_min else None,
+    'estimate_error': None,
+    'output': output[:200]
+}
+
+if duration_min and estimate_min:
+    try:
+        record['estimate_error'] = int(duration_min) - int(estimate_min)
+    except:
+        pass
+
+with open(metrics_path, 'a') as f:
+    f.write(json.dumps(record, separators=(',', ':')) + '\n')
+" "$TASK_ID" "$CLAIMED_AT" "$COMPLETED_AT_ISO" "$DURATION_MIN" "$ESTIMATE_MIN" "$OUTPUT" "$COMPLETED_BY" "$(fm_get "$COMPLETED_TARGET" "priority" 2>/dev/null || echo "")" "$METRICS_LOG" 2>/dev/null || true
+
+# ── PERSIST COMPLETION PAYLOAD JSON ───────────────────────────────
+COMPLETION_JSON="$OPS_DIR/completed/${TASK_ID}.completion.json"
+python3 - "$TASK_ID" "$OUTPUT" "$NOTES" "$IMPACT" "$PAYLOAD_FILE" "$COMPLETED_DATE" "$COMPLETED_BY" <<'PYEOF'
+import json, sys
+
+task_id, summary, notes, impact, payload_file, date, agent = sys.argv[1:8]
+
+# If a payload file was provided, use it as the base
+if payload_file and payload_file != "":
+    try:
+        with open(payload_file) as f:
+            payload = json.load(f)
+    except Exception:
+        payload = {}
+else:
+    payload = {}
+
+# Ensure canonical fields are set (CLI values override payload)
+payload["task_id"] = task_id
+if summary:
+    payload["completion_summary"] = summary
+if notes:
+    payload["implementation_notes"] = notes
+if impact:
+    payload["impact"] = impact
+payload.setdefault("artifacts_touched", [])
+payload.setdefault("criteria_met", [])
+payload["completed_by"] = agent
+payload["completed_on"] = date
+
+out_path = f"{sys.argv[1]}"  # Will be overridden by shell
+# Write to stdout — shell captures it
+json.dump(payload, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PYEOF
+_TASK_NODE=$(fm_get "$COMPLETED_TARGET" "node" 2>/dev/null || echo "")
+_TASK_ARCH_SCOPE=$(fm_get "$COMPLETED_TARGET" "architecture_scope" 2>/dev/null || echo "")
+_TASK_SCOPE_TAGS=$(fm_get "$COMPLETED_TARGET" "scope_tags" 2>/dev/null || echo "")
+python3 - "$TASK_ID" "$OUTPUT" "$NOTES" "$IMPACT" "$PAYLOAD_FILE" "$COMPLETED_DATE" "$COMPLETED_BY" "$_TASK_NODE" "$_TASK_ARCH_SCOPE" "$_TASK_SCOPE_TAGS" > "$COMPLETION_JSON" <<'PYEOF'
+import json, sys
+
+task_id, summary, notes, impact, payload_file, date, agent, node, arch_scope, scope_tags = sys.argv[1:11]
+
+if payload_file:
+    try:
+        with open(payload_file) as f:
+            payload = json.load(f)
+    except Exception:
+        payload = {}
+else:
+    payload = {}
+
+payload["task_id"] = task_id
+if summary:
+    payload["completion_summary"] = summary
+if notes:
+    payload["implementation_notes"] = notes
+if impact:
+    payload["impact"] = impact
+payload.setdefault("artifacts_touched", [])
+payload.setdefault("criteria_met", [])
+payload["completed_by"] = agent
+payload["completed_on"] = date
+if node:
+    payload["node"] = node
+if arch_scope:
+    payload["architecture_scope"] = arch_scope
+if scope_tags:
+    payload["scope_tags"] = scope_tags
+
+json.dump(payload, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PYEOF
+
+# ── AUTHORITATIVE ARTIFACT TRACKING (baseline diff) ───────────────
+# Use task-snapshot diff if a baseline exists (captured at task-execute time).
+# This produces task-scoped artifacts independent of git commit timing.
+_BASELINE_FILE="$OPS_DIR/completed/.baseline-${TASK_ID}.json"
+_BASELINE_SRC="$OPS_DIR/active/.baseline-${TASK_ID}.json"
+# Move baseline to completed/ if it exists in active/
+[[ -f "$_BASELINE_SRC" ]] && mv "$_BASELINE_SRC" "$_BASELINE_FILE" 2>/dev/null || true
+
+if [[ -f "$_BASELINE_FILE" ]]; then
+  _SNAPSHOT_ARTIFACTS=$(python3 "$TOOLS/lib/task-snapshot.py" diff "$TASK_ID" 2>/dev/null) || true
+  if [[ -n "$_SNAPSHOT_ARTIFACTS" ]]; then
+    # Inject authoritative artifacts into completion JSON
+    python3 -c "
+import json, sys
+comp_path = sys.argv[1]
+artifacts = json.loads(sys.argv[2])
+# Filter noise
+skip = ['.chain-depth', 'state-verdict', 'brain/ops/derived/', '.run.json', '.completion.json', '.baseline-']
+filtered = [f for f in artifacts if not any(s in f for s in skip)]
+d = json.load(open(comp_path))
+d['artifacts_touched'] = filtered[:20]
+d['artifact_source'] = 'baseline-diff'
+with open(comp_path, 'w') as fh:
+    json.dump(d, fh, indent=2)
+    fh.write('\n')
+print(f'Artifacts (baseline): {len(filtered)} files')
+" "$COMPLETION_JSON" "$_SNAPSHOT_ARTIFACTS" 2>/dev/null || true
+  fi
+fi
+
+# ── ENRICH COMPLETION (criteria_met + fallback artifacts) ─────────
+RUN_RECORD_FOR_ENRICH="$OPS_DIR/completed/${TASK_ID}.run.json"
+_ENRICH_FLAGS=""
+[[ -f "$RUN_RECORD_FOR_ENRICH" ]] && _ENRICH_FLAGS="--run-record $RUN_RECORD_FOR_ENRICH"
+python3 "$TOOLS/lib/enrich-completion.py" "$COMPLETION_JSON" $_ENRICH_FLAGS 2>/dev/null || true
+
+# Patch duration + estimate into completion JSON
+if [[ -f "$COMPLETION_JSON" ]]; then
+  python3 -c "
+import json, sys
+f = sys.argv[1]
+claimed = sys.argv[2]
+completed = sys.argv[3]
+dur = sys.argv[4]
+est = sys.argv[5]
+try:
+    d = json.load(open(f))
+    if claimed: d['claimed_at'] = claimed
+    d['completed_at'] = completed
+    if dur: d['duration_minutes'] = int(dur)
+    if est: d['estimate_minutes'] = int(est)
+    if dur and est:
+        try: d['estimate_error_minutes'] = int(dur) - int(est)
+        except: pass
+    with open(f, 'w') as fh:
+        json.dump(d, fh, indent=2)
+        fh.write('\n')
+except: pass
+" "$COMPLETION_JSON" "$CLAIMED_AT" "$COMPLETED_AT_ISO" "$DURATION_MIN" "$ESTIMATE_MIN" 2>/dev/null || true
+fi
+
+# ── EXECUTION PROVENANCE ─────────────────────────────────────────
+# Record what was requested, what was resolved, and what actually ran.
+# Honest: fields left as "unresolved" when actual values cannot be determined.
+if [[ -f "$COMPLETION_JSON" ]]; then
+  python3 -c "
+import json, os, sys, glob, re
+
+comp_path = sys.argv[1]
+run_path = sys.argv[2]
+agent = sys.argv[3]
+home = os.path.expanduser('~')
+
+d = json.load(open(comp_path))
+
+# ── Requested: from run.json ──────────────────────────────────────
+run = {}
+if run_path and os.path.isfile(run_path):
+    try:
+        run = json.load(open(run_path))
+    except Exception:
+        run = {}
+
+profile_requested = run.get('execution_profile_requested', '') or ''
+invocation_path   = run.get('invocation_path', 'brain-task-execute')
+
+# ── Resolved runtime: from agent name ────────────────────────────
+runtime_resolved = 'unresolved'
+if 'claude' in agent.lower():
+    runtime_resolved = 'claude-code'
+elif 'codex' in agent.lower():
+    runtime_resolved = 'codex'
+elif 'gemini' in agent.lower():
+    runtime_resolved = 'gemini'
+
+# ── Actual model: probe based on runtime ─────────────────────────
+model_actual   = 'unresolved'
+model_source   = 'unresolved'
+model_confidence = 'low'
+
+if runtime_resolved == 'claude-code':
+    # Read most-recent JSONL in ~/.claude/projects/<brain-slug>/
+    slug = '-home-arson-gmgn-brain'
+    projects_dir = os.path.join(home, '.claude', 'projects', slug)
+    jsonl_files = sorted(glob.glob(os.path.join(projects_dir, '*.jsonl')), key=os.path.getmtime, reverse=True)
+    found = False
+    for jf in jsonl_files[:3]:
+        try:
+            with open(jf) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        if msg.get('type') == 'assistant' and msg.get('message', {}).get('model'):
+                            model_actual = msg['message']['model']
+                            model_source = f'jsonl:{os.path.basename(jf)}'
+                            model_confidence = 'high'
+                            found = True
+                            break
+                    except Exception:
+                        continue
+            if found:
+                break
+        except Exception:
+            continue
+    if not found:
+        # Fall back to env var
+        env_model = os.environ.get('ANTHROPIC_MODEL', '')
+        if env_model:
+            model_actual = env_model
+            model_source = 'env:ANTHROPIC_MODEL'
+            model_confidence = 'medium'
+
+elif runtime_resolved in ('codex', 'gemini'):
+    model_actual = 'unresolved'
+    model_source = 'no-probe-available'
+    model_confidence = 'none'
+
+provenance = {
+    'execution_profile_requested': profile_requested,
+    'runtime_resolved':   runtime_resolved,
+    'model_resolved':     model_actual,
+    'model_source':       model_source,
+    'model_confidence':   model_confidence,
+    'executor_runtime_actual': runtime_resolved,
+    'executor_model_actual':   model_actual,
+    'completion_actor':   agent,
+    'completion_method':  'brain-task-complete',
+    'invocation_path':    invocation_path,
+}
+
+d['provenance'] = provenance
+with open(comp_path, 'w') as fh:
+    json.dump(d, fh, indent=2)
+    fh.write('\n')
+" "$COMPLETION_JSON" "$OPS_DIR/completed/${TASK_ID}.run.json" "$COMPLETED_BY" 2>/dev/null || true
+fi
+# ── PROOF RECEIPT CHECK ──────────────────────────────────────
+if [[ -n "${_PROOF_RUN_ID:-}" ]]; then
+  _PROOF_FILE="$BRAIN/brain/ops/proof-execution/runs/${_PROOF_RUN_ID}.jsonl"
+  if [[ -f "$_PROOF_FILE" ]]; then
+    _RECEIPT_COUNT=$(grep -c "receipt_id" "$_PROOF_FILE" 2>/dev/null || echo 0)
+    if [[ "$_RECEIPT_COUNT" -le 1 ]]; then
+      echo "WARNING: Proof run $_PROOF_RUN_ID has no execution receipts (only start event)."
+      echo "  Did you forget to log commands or file writes to the proof?"
+    fi
+  fi
+fi
+# Run deterministic probes against completion criteria.
+# Non-blocking: verification failure is reported but doesn't prevent completion.
+_VERIFY_RUN_RECORD="$OPS_DIR/completed/${TASK_ID}.run.json"
+_VERIFY_FLAGS=""
+[[ -f "$_VERIFY_RUN_RECORD" ]] && _VERIFY_FLAGS="--run-record $_VERIFY_RUN_RECORD"
+_VERIFY_RESULT=$(python3 "$TOOLS/lib/verify-outcome.py" "$COMPLETION_JSON" $_VERIFY_FLAGS 2>/dev/null) || true
+_VERIFY_STATUS=""
+if [[ -n "$_VERIFY_RESULT" ]]; then
+  _VERIFY_STATUS=$(echo "$_VERIFY_RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"{d['status']}: {d['pass_count']} pass, {d['fail_count']} fail, {d['unverifiable_count']} unverifiable\")" 2>/dev/null) || true
+fi
+
+# ── HANDOFF REFRESH (fundamental loop changes) ───────────────────
+# If the completed task touched handoff-control surfaces, rebuild the
+# codex-lab handoff artifacts before continuation. Lane-mapped tasks
+# still autosync below; this catches non-lane or cross-cutting changes.
+HANDOFF_REFRESH_CLASSIFIER="$HOME/gmgn-brain/scripts/lib/handoff-system/handoff_refresh_classifier.py"
+_HANDOFF_REFRESH_REQUIRED="no"
+_HANDOFF_REFRESH_REASONS=""
+_HANDOFF_LANE_ID=$(fm_get "$COMPLETED_TARGET" "handoff_lane_id" 2>/dev/null || echo "")
+if [[ -f "$COMPLETION_JSON" && -f "$HANDOFF_REFRESH_CLASSIFIER" ]]; then
+  _HANDOFF_REFRESH_JSON=$(python3 "$HANDOFF_REFRESH_CLASSIFIER" "$COMPLETION_JSON" --run-record "$_RUN_RECORD" 2>/dev/null || true)
+  if [[ -n "$_HANDOFF_REFRESH_JSON" ]]; then
+    _HANDOFF_REFRESH_REQUIRED=$(python3 -c "import json,sys; d=json.load(sys.stdin); print('yes' if d.get('refresh_required') else 'no')" <<< "$_HANDOFF_REFRESH_JSON" 2>/dev/null || echo "no")
+    _HANDOFF_REFRESH_REASONS=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(d.get('reasons', [])))" <<< "$_HANDOFF_REFRESH_JSON" 2>/dev/null || true)
+  fi
+fi
+
+if [[ "$_HANDOFF_REFRESH_REQUIRED" == "yes" ]]; then
+  if [[ -z "$_HANDOFF_LANE_ID" ]]; then
+    echo ""
+    echo "Handoff refresh required — rebuilding active handoff artifacts before continuation."
+    echo "  Reasons: ${_HANDOFF_REFRESH_REASONS:-unknown}"
+    if ! $HOME/bin/brain-handoff-validate >/dev/null 2>&1; then
+      echo "  Warning: handoff refresh validation failed; inspect the regenerated handoff before continuing."
+    fi
+  else
+    echo ""
+    echo "Handoff-sensitive lane completed — lane autosync will refresh active handoff artifacts."
+    echo "  Reasons: ${_HANDOFF_REFRESH_REASONS:-unknown}"
+  fi
+fi
+
+# ── RELEASE LOCK + EVENT + OUTPUT ──────────────────────────────────
+task_lock_release "$TASK_ID"
+trap - EXIT
+
+. "$TOOLS/lib/brain-event.sh"
+_impact_tag=""
+[[ -n "$IMPACT" ]] && _impact_tag=" impact=$IMPACT"
+_verify_tag=""
+[[ -n "$_VERIFY_STATUS" ]] && _verify_tag=" verify=$_VERIFY_STATUS"
+brain_event TASK_COMPLETE "$TASK_ID $COMPLETED_BY${_impact_tag}${_verify_tag}"
+
+TITLE=$(grep '^# ' "$COMPLETED_TARGET" | head -1 | sed 's/^# //')
+
+echo "Task completed: $TASK_ID"
+echo "  Title: $TITLE"
+echo "  Completed by: $COMPLETED_BY"
+echo "  Completed on: $COMPLETED_DATE"
+echo "  Output: $OUTPUT"
+if [[ -n "$DURATION_MIN" ]]; then
+  echo "  Duration: ${DURATION_MIN}m"
+  if [[ -n "$ESTIMATE_MIN" ]]; then
+    _err=$((DURATION_MIN - ESTIMATE_MIN))
+    if [[ $_err -gt 0 ]]; then
+      echo "  Estimate: ${ESTIMATE_MIN}m (over by ${_err}m)"
+    elif [[ $_err -lt 0 ]]; then
+      _abs=$(( -_err ))
+      echo "  Estimate: ${ESTIMATE_MIN}m (under by ${_abs}m)"
+    else
+      echo "  Estimate: ${ESTIMATE_MIN}m (exact)"
+    fi
+  fi
+fi
+[[ -n "$NOTES" ]] && echo "  Notes: $NOTES"
+if [[ -n "$IMPACT" ]]; then
+  echo "  Impact: $IMPACT"
+  [[ "$IMPACT_INFERRED" == "true" ]] && echo "  (inferred)"
+fi
+[[ -n "$PAYLOAD_FILE" ]] && echo "  Payload: $PAYLOAD_FILE"
+echo "  Completion JSON: $COMPLETION_JSON"
+[[ -n "$_VERIFY_STATUS" ]] && echo "  Verification: $_VERIFY_STATUS"
+echo "  Verdict: $_V_STATUS"
+echo ""
+echo "Immutability checksum will be registered on next brain-state-check."
+
+# ── Auto-log win (writes to wins-log.md, no queued message) ────────
+# Every completed task is a win. The output text IS the win description.
+# Writes directly to wins-log.md instead of going through brain-message
+# to avoid queuing "URGENT" messages that are just informational.
+WINS_LOG="$BRAIN/work/logs/wins-log.md"
+if [[ -n "$OUTPUT" && -f "$WINS_LOG" ]]; then
+  _WIN_DATE=$(date '+%Y-%m-%d')
+  _WIN_TEXT="$TASK_ID: ${OUTPUT:0:200}"
+  # Duplicate check: don't log if this task ID is already in the last 5 wins
+  if ! tail -5 "$WINS_LOG" | grep -q "$TASK_ID"; then
+    echo "| $_WIN_DATE | $_WIN_TEXT |" >> "$WINS_LOG"
+    echo ""
+    echo "Win auto-logged to wins-log.md"
+  fi
+fi
+
+# ── WRITE EXECUTION NOTE TO DEVLOG ────────────────────────────────
+if [[ -n "$EXECUTION_NOTE" ]]; then
+  _DEVLOG_DATE=$(date '+%Y-%m-%d')
+  _DEVLOG_DIR="$BRAIN/work/logs/devlog"
+  mkdir -p "$_DEVLOG_DIR"
+  # Find today's existing devlog (convention: YYYY-MM-DD-slug.md)
+  _DEVLOG_FILE=$(ls "$_DEVLOG_DIR/${_DEVLOG_DATE}"*.md 2>/dev/null | head -1)
+  if [[ -z "$_DEVLOG_FILE" ]]; then
+    # No devlog today yet -- create one with execution-notes slug
+    _DEVLOG_FILE="$_DEVLOG_DIR/${_DEVLOG_DATE}-execution-notes.md"
+    cat > "$_DEVLOG_FILE" << DEVEOF
+---
+title: "Execution Notes ${_DEVLOG_DATE}"
+date: "${_DEVLOG_DATE}"
+type: "devlog"
+tags: [execution-notes]
+privacy: internal
+---
+
+# Devlog ${_DEVLOG_DATE}
+DEVEOF
+  fi
+  # Append to Execution Notes section (create if missing)
+  if ! grep -q "## Execution Notes" "$_DEVLOG_FILE" 2>/dev/null; then
+    echo "" >> "$_DEVLOG_FILE"
+    echo "## Execution Notes" >> "$_DEVLOG_FILE"
+    echo "" >> "$_DEVLOG_FILE"
+  fi
+  _DEVLOG_SCOPE=""
+  [[ -n "$_TASK_ARCH_SCOPE" ]] && _DEVLOG_SCOPE=" [${_TASK_ARCH_SCOPE}]"
+  echo "- **${TASK_ID}**${_DEVLOG_SCOPE} (${COMPLETED_BY}): ${EXECUTION_NOTE}" >> "$_DEVLOG_FILE"
+  echo "  Execution note written to devlog: $_DEVLOG_FILE"
+fi
+
+# ── EXTRACT RUNBOOK + PROMOTE (value extraction) ─────────────────
+# Generate a structured runbook, then classify for promotion.
+# Non-blocking: failure doesn't affect completion.
+_RUNBOOK_PATH=$(python3 "$TOOLS/lib/extract-runbook.py" "$TASK_ID" 2>/dev/null) || true
+if [[ -n "$_RUNBOOK_PATH" ]]; then
+  echo "  Runbook: $_RUNBOOK_PATH"
+  _PROMO_RESULT=$(python3 "$TOOLS/lib/promote-runbook.py" "$_RUNBOOK_PATH" 2>/dev/null) || true
+  if [[ -n "$_PROMO_RESULT" ]]; then
+    _PROMO_CLASS=$(echo "$_PROMO_RESULT" | head -1)
+    _PROMO_PATH=$(echo "$_PROMO_RESULT" | grep "Promoted to:" | sed 's/Promoted to: //' || true)
+    echo "  Promotion: $_PROMO_CLASS"
+    [[ -n "$_PROMO_PATH" ]] && echo "  Promoted: $_PROMO_PATH"
+  fi
+fi
+
+# ── AUTO-CREATE WIKI PAGE (if missing) ────────────────────────────
+# Ensures every completed task has a rich wiki entry regardless of which
+# agent (or subagent) completed it. Pulls from task file, completion JSON,
+# and runbook for full context. Non-blocking.
+_WIKI_SLUG=$(echo "$TASK_ID" | tr '-' '_' | tr '[:upper:]' '[:lower:]')
+_WIKI_EXISTS=false
+for _WDIR in systems pages; do
+  [[ -f "$BRAIN/brain/wiki/$_WDIR/${_WIKI_SLUG}.md" ]] && _WIKI_EXISTS=true
+done
+if ! $_WIKI_EXISTS; then
+  _WIKI_PATH="$BRAIN/brain/wiki/systems/${_WIKI_SLUG}.md"
+  _WIKI_TITLE=$(echo "$TITLE" | head -c 80)
+  python3 - "$TASK_ID" "$_WIKI_TITLE" "$OUTPUT" "$OPS_DIR/completed/${TASK_ID}.md" "${_RUNBOOK_PATH:-}" "$_WIKI_PATH" << 'WIKI_PYEOF'
+import sys, os, re, json
+task_id, title, output, task_file, runbook_path, wiki_path = sys.argv[1:]
+today = __import__("datetime").date.today().isoformat()
+
+# Read task file for deps
+depends_on = ""
+try:
+    tc = open(task_file).read()
+    m = re.search(r'^depends_on:\s*"?(.+?)"?\s*$', tc, re.MULTILINE)
+    if m: depends_on = m.group(1).strip('"')
+except: pass
+
+# Read completion JSON for impl notes and impact
+impl_notes = ""
+impact = ""
+completed_by = ""
+cjson = task_file.replace(".md", ".completion.json")
+try:
+    cd = json.load(open(cjson))
+    impl_notes = cd.get("implementation_notes", "")
+    impact = cd.get("impact", "")
+    completed_by = cd.get("completed_by", "")
+except: pass
+
+# Read runbook for files changed
+files_changed = []
+if runbook_path and os.path.exists(runbook_path):
+    in_files = False
+    for line in open(runbook_path):
+        if line.startswith("## Files Changed"):
+            in_files = True; continue
+        if in_files and line.startswith("## "): break
+        if in_files and line.startswith("- "):
+            f = line.strip("- \n`")
+            noise = ("brain/ops/events", "brain/ops/derived/", "work/logs/", "work/exports/", "brain/index/session-resume")
+            if not any(f.startswith(p) for p in noise):
+                files_changed.append(f)
+
+# Build wiki
+lines = [
+    "---",
+    f'title: "{task_id}: {title}"',
+    'type: "wiki"',
+    'category: "systems"',
+    f'created: "{today}"',
+    f'updated: "{today}"',
+    "tags: []",
+    "related: []",
+    "---",
+    "",
+    f"# {task_id}",
+    "",
+    f"> {title}",
+    "",
+]
+if output:
+    lines += ["## What Was Done", "", output, ""]
+if impl_notes:
+    lines += ["## Implementation Details", "", impl_notes, ""]
+if files_changed:
+    lines += ["## Files Affected", ""]
+    for f in files_changed[:15]:
+        lines.append(f"- `{f}`")
+    if len(files_changed) > 15:
+        lines.append(f"- ... and {len(files_changed) - 15} more")
+    lines.append("")
+if depends_on and depends_on not in ("none", ""):
+    lines += ["## Dependencies", "", f"Depends on: {depends_on}", ""]
+if impact:
+    lines += ["## Impact", "", impact, ""]
+meta = []
+if completed_by: meta.append(f"Completed by: {completed_by}")
+meta.append(f"Completed: {today}")
+if meta:
+    lines += ["## Metadata", ""]
+    for m in meta: lines.append(f"- {m}")
+    lines.append("")
+lines += ["## Related", "", "<!-- Add [[page-name]] links to cross-reference -->"]
+
+os.makedirs(os.path.dirname(wiki_path), exist_ok=True)
+with open(wiki_path, 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+WIKI_PYEOF
+  if [[ -f "$_WIKI_PATH" ]]; then
+    echo "  Wiki: auto-created $_WIKI_PATH"
+  else
+    echo "  Wiki: auto-create failed (non-blocking)"
+  fi
+else
+  echo "  Wiki: exists"
+fi
+
+# ── system-state.md "Recently Changed" ───────────────────────────
+# Retired in ADR-0004 Phase 0f. system-state.md is now fully generated by
+# brain-resume from events.jsonl + task file summaries. The TASK_COMPLETE
+# event emitted above (via brain_event) is the source data.
+
+# ── Escalation policy: increment chain depth BEFORE state refresh ──
+CHAIN_DEPTH_FILE="$BRAIN/brain/ops/.chain-depth"
+CHAIN_LIMIT="${BRAIN_CHAIN_LIMIT:-4}"
+
+_CHAIN=0
+[[ -f "$CHAIN_DEPTH_FILE" ]] && _CHAIN=$(cat "$CHAIN_DEPTH_FILE" 2>/dev/null || echo 0)
+_CHAIN=$((_CHAIN + 1))
+echo "$_CHAIN" > "$CHAIN_DEPTH_FILE"
+
+# Refresh all state surfaces after completion mutation
+# BRAIN_SKIP_CHAIN_RESET prevents brain-resume from zeroing the counter we just set
+# (sync-task-counts retired in 0f — brain-resume generates system-state.md directly)
+
+# Read execution contract from the completed task for escalation signals
+_COMPLETED_FILE="$OPS_DIR/completed/${TASK_ID}.md"
+_ESCALATION="CONTINUE"
+_ESCALATION_REASONS=""
+
+# Priority-based escalation
+if [[ -f "$_COMPLETED_FILE" ]]; then
+  _DONE_PRIORITY=$(fm_get "$_COMPLETED_FILE" "priority")
+  if [[ "$_DONE_PRIORITY" == "P1" ]]; then
+    _ESCALATION="STOP"
+    _ESCALATION_REASONS="${_ESCALATION_REASONS}\n  - P1 task completed — human review required"
+  elif [[ "$_DONE_PRIORITY" == "P2" ]]; then
+    [[ "$_ESCALATION" != "STOP" ]] && _ESCALATION="CODEX"
+    _ESCALATION_REASONS="${_ESCALATION_REASONS}\n  - P2 task completed — Codex verification recommended"
+  fi
+fi
+
+# Chain depth escalation
+if [[ "$_CHAIN" -ge "$CHAIN_LIMIT" ]]; then
+  _ESCALATION="STOP"
+  _ESCALATION_REASONS="${_ESCALATION_REASONS}\n  - Chain depth $_CHAIN >= $CHAIN_LIMIT — check in with human"
+fi
+
+# Authority owner escalation
+_RUN_RECORD="$OPS_DIR/completed/${TASK_ID}.run.json"
+if [[ -f "$_RUN_RECORD" ]]; then
+  _AUTH_OWNER=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('execution_pack',{}).get('execution_contract',{}).get('authority_owner',''))
+except:
+    print('')
+" "$_RUN_RECORD" 2>/dev/null)
+  if [[ "$_AUTH_OWNER" == "human" || "$_AUTH_OWNER" == "mixed" ]]; then
+    _ESCALATION="STOP"
+    _ESCALATION_REASONS="${_ESCALATION_REASONS}\n  - authority_owner=$_AUTH_OWNER — human direction required before continuing"
+  fi
+fi
+
+# Governance/safety mutation check
+if [[ -f "$_RUN_RECORD" ]]; then
+  _HAS_GOV=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    surfaces = d.get('execution_pack',{}).get('execution_contract',{}).get('allowed_write_surfaces',[])
+    gov_patterns = ['brain/governance/', 'CLAUDE.md', 'state-verdict', 'safety']
+    hit = any(any(p in s for p in gov_patterns) for s in surfaces)
+    print('yes' if hit else 'no')
+except:
+    print('no')
+" "$_RUN_RECORD" 2>/dev/null)
+  if [[ "$_HAS_GOV" == "yes" ]]; then
+    [[ "$_ESCALATION" != "STOP" ]] && _ESCALATION="CODEX"
+    _ESCALATION_REASONS="${_ESCALATION_REASONS}\n  - Governance/safety files modified — Codex verification recommended"
+  fi
+fi
+
+# may_spawn_tasks enforcement
+_MAY_SPAWN="true"
+if [[ -f "$_RUN_RECORD" ]]; then
+  _MAY_SPAWN=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(str(d.get('execution_pack',{}).get('execution_contract',{}).get('may_spawn_tasks', True)).lower())
+except:
+    print('true')
+" "$_RUN_RECORD" 2>/dev/null)
+fi
+
+# ── Persist escalation signal durably (survives terminal loss/compaction) ──
+# Patch completion JSON with escalation verdict
+if [[ -f "$COMPLETION_JSON" ]]; then
+  python3 -c "
+import json, sys
+f = sys.argv[1]
+esc = sys.argv[2]
+reasons = sys.argv[3]
+try:
+    d = json.load(open(f))
+    d['escalation'] = esc
+    if reasons: d['escalation_reasons'] = [r.strip() for r in reasons.split('\\\\n') if r.strip() and r.strip() != '-']
+    with open(f, 'w') as fh:
+        json.dump(d, fh, indent=2)
+        fh.write('\n')
+except: pass
+" "$COMPLETION_JSON" "$_ESCALATION" "$_ESCALATION_REASONS" 2>/dev/null || true
+fi
+
+# Append escalation to events.log
+. "$TOOLS/lib/brain-event.sh"
+brain_event TASK_ESCALATION "$TASK_ID $_ESCALATION"
+
+echo ""
+echo "=== Escalation: $_ESCALATION ==="
+if [[ -n "$_ESCALATION_REASONS" ]]; then
+  echo -e "$_ESCALATION_REASONS"
+fi
+if [[ "$_ESCALATION" == "CODEX" ]]; then
+  echo "  Recommended: brain-task-handoff $TASK_ID --type verification"
+elif [[ "$_ESCALATION" == "STOP" ]]; then
+  echo "  Action: Stop and check in with human before continuing."
+fi
+if [[ "$_MAY_SPAWN" == "false" ]]; then
+  echo "  Follow-up tasks: SUPPRESSED (may_spawn_tasks: false)"
+else
+  echo "  Follow-up tasks: allowed"
+fi
+if [[ -n "$EXECUTION_NOTE" ]]; then
+  echo ""
+  echo "  Execution note: $EXECUTION_NOTE"
+elif [[ "$SKIP_EXECUTION_NOTE" == "true" ]]; then
+  echo ""
+  echo "  Execution note: (skipped)"
+fi
+
+# ── POST-TASK AUDIT CHECKLIST ────────────────────────────────────
+# Structural integrity + documentation checklist. Prints items the
+# agent must address before moving to the next task.
+# Writes a .pending-audit marker that brain-task-execute checks.
+if [[ -f "$COMPLETION_JSON" ]]; then
+  _AUDIT_OUTPUT=$(python3 "$BRAIN/scripts/lib/post-task-audit.py" "$COMPLETION_JSON" --tools-dir "$TOOLS" 2>/dev/null) || true
+  if [[ -n "$_AUDIT_OUTPUT" ]]; then
+    echo "$_AUDIT_OUTPUT"
+    # Write pending-audit marker -- brain-task-execute will block until cleared
+    _AUDIT_MARKER="$OPS_DIR/.pending-audit.$COMPLETED_BY"
+    echo "{\"task_id\":\"$TASK_ID\",\"completed_by\":\"$COMPLETED_BY\",\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$_AUDIT_MARKER"
+    echo ""
+    echo "AUDIT GATE: Next task execution blocked until audit is confirmed."
+    echo "  Clear with: brain-task-confirm <TASK-ID>"
+    
+    if [[ "$AUTO_VERIFY" == "true" ]]; then
+      echo ""
+      echo "Triggering automated verification..."
+      "$BRAIN/scripts/bin/brain-task-verify" "$TASK_ID" --by "$COMPLETED_BY" || true
+    fi
+
+    # HARD GATE: If audit has findings, fail completion
+    echo ""
+    echo "ERROR: Task completion BLOCKED by post-task audit findings."
+    echo "Resolve the issues above and re-run brain-task-complete."
+    exit 1
+  fi
+fi
+
+# Auto-sync handoff lane if task has handoff_lane_id
+AUTOSYNC="$HOME/gmgn-brain/scripts/lib/handoff-system/handoff_task_lane_autosync.sh"
+_AUTOSYNC_TARGET="$OPS_DIR/completed/${TASK_ID}.md"
+if [[ -f "$AUTOSYNC" ]] && grep -q 'handoff_lane_id:' "$_AUTOSYNC_TARGET" 2>/dev/null; then
+  echo ""
+  "$AUTOSYNC" "$_AUTOSYNC_TARGET" --allow-already-complete 2>&1 || echo "  (autosync skipped: $?)"
+fi
+
+# ── AUTO-CONTINUE (REMOVED 2026-04-12) ────────────────────────────
+# Previously: brain-task-complete auto-launched handoff_run_all.sh on CONTINUE.
+# This caused double-claim races (the tool claimed the next task while the
+# agent also acted on the CONTINUE signal independently). Per MANUAL.md §8.3
+# (updated 2026-04-12), continuation is the CALLER's responsibility, not the
+# completion tool's. The agent or handoff_run_all decides whether to continue
+# based on execution mode (single-task vs batch).
+#
+# To restore old behavior in a controlled way, callers can set
+# BRAIN_AUTO_CONTINUE_RUN_ALL=1 and invoke handoff_run_all.sh themselves
+# after reading the escalation signal from this tool's output.
+if false && [[ "${BRAIN_AUTO_CONTINUE_RUN_ALL:-1}" == "1" && "$_ESCALATION" != "STOP" && "$_MAY_SPAWN" != "false" ]]; then
+  RUN_ALL="$HOME/bin/brain-handoff-run-all"
+  if [[ -x "$RUN_ALL" ]]; then
+    echo ""
+    echo "Auto-continue: launching next runnable handoff work..."
+    if [[ "$_HANDOFF_REFRESH_REQUIRED" == "yes" ]]; then
+      RUN_ALL_AGENT="${COMPLETED_BY:-claude-code}" "$RUN_ALL" --max-priority P3 2>&1 || true
+    else
+      RUN_ALL_AGENT="${COMPLETED_BY:-claude-code}" RUN_ALL_SKIP_REFRESH=1 "$RUN_ALL" --max-priority P3 2>&1 || true
+    fi
+  fi
+fi
+
+
+# Refresh all state surfaces after completion mutation
+# BRAIN_SKIP_CHAIN_RESET prevents brain-resume from zeroing the counter we just set
+BRAIN_SKIP_CHAIN_RESET=1 "$TOOLS/bin/brain-resume" > /dev/null 2>&1 || true
+"$TOOLS/bin/brain-state-check" --quiet > /dev/null 2>&1 || true
+
+exit 0

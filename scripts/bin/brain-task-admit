@@ -1,0 +1,463 @@
+#!/bin/bash
+# brain-task-admit — Only sanctioned path into the task queue; validates required metadata before any task can be autonomously executed
+# Usage:
+#   brain-task-admit <task_file>              # validate and admit to queue
+#   brain-task-admit <task_file> --dry-run    # validate only, don't move
+#   brain-task-admit <task_file> --strict     # require all fields even for manual tasks
+#
+# The ONLY sanctioned path for tasks to enter brain/ops/tasks/queue/.
+# Validates admission metadata, stamps admitted_at, moves file to queue.
+#
+# Required admission fields:
+#   created_by, creation_mode, authority_basis, why_now
+#
+# For auto-generated tasks (creation_mode: impact-seeded, codex-suggested):
+#   All fields are hard-required. Missing = rejected.
+#
+# For manual/follow-up tasks:
+#   Missing fields produce warnings (not blocks) unless --strict is used.
+#
+# Direct writes to queue/ without admission metadata are noncompliant drift.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+
+# Self-dispatch: route through brain-dispatch if not already dispatched.
+# brain-dispatch sets BRAIN_DISPATCH_ACTIVE=1 before calling this tool.
+if [[ -z "${BRAIN_DISPATCH_ACTIVE:-}" ]]; then
+  exec "$TOOLS/bin/brain-dispatch" "brain-task-admit" "$@"
+fi
+
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+QUEUE_DIR="$_OPS_TASKS_DIR/queue"
+. "$TOOLS/lib/frontmatter.sh"
+
+TASK_FILE=""
+DRY_RUN=false
+STRICT=false
+OVERRIDE_REVIEW=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)          DRY_RUN=true; shift ;;
+    --strict)           STRICT=true; shift ;;
+    --override-review)  OVERRIDE_REVIEW=true; shift ;;
+    -*)                 echo "Unknown flag: $1"; exit 1 ;;
+    *)                  TASK_FILE="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_FILE" ]]; then
+  echo "Usage: brain-task-admit <task_file> [--dry-run] [--strict]"
+  echo ""
+  echo "Canonical admission gate for tasks entering the queue."
+  echo "Validates admission metadata, stamps admitted_at, moves to queue/."
+  echo ""
+  echo "Required fields: created_by, creation_mode, authority_basis, why_now"
+  echo "Auto-generated tasks: all fields hard-required"
+  echo "Manual tasks: missing fields produce warnings unless --strict"
+  exit 1
+fi
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Error: file not found: $TASK_FILE"
+  exit 1
+fi
+
+# ── Validate admission metadata ─────────────────────────────────
+STRICT_FLAG=""
+$STRICT && STRICT_FLAG="--strict"
+
+VALIDATION=$(python3 "$TOOLS/lib/task-admission.py" "$TASK_FILE" --json $STRICT_FLAG 2>/dev/null) || true
+
+_VALID=$(echo "$VALIDATION" | python3 -c "import json,sys; print(json.load(sys.stdin).get('valid', False))" 2>/dev/null)
+_ERRORS=$(echo "$VALIDATION" | python3 -c "import json,sys; errs=json.load(sys.stdin).get('errors',[]); print('\n'.join(f'  ERROR: {e}' for e in errs))" 2>/dev/null)
+_WARNINGS=$(echo "$VALIDATION" | python3 -c "import json,sys; warns=json.load(sys.stdin).get('warnings',[]); print('\n'.join(f'  WARNING: {w}' for w in warns))" 2>/dev/null)
+
+if [[ "$_VALID" != "True" ]]; then
+  echo "REJECTED: $(basename "$TASK_FILE")"
+  [[ -n "$_ERRORS" ]] && echo "$_ERRORS"
+  [[ -n "$_WARNINGS" ]] && echo "$_WARNINGS"
+  echo ""
+  echo "Fix the admission metadata and retry."
+  exit 1
+fi
+
+# ── Review-freshness binding (auto-generated tasks only) ─────────
+CREATION_MODE=$(fm_get "$TASK_FILE" "creation_mode")
+_IS_AUTO=false
+[[ "$CREATION_MODE" == "impact-seeded" || "$CREATION_MODE" == "codex-suggested" ]] && _IS_AUTO=true
+
+if $_IS_AUTO && ! $OVERRIDE_REVIEW; then
+  REVIEW_STATE="$BRAIN/brain/ops/review-state.md"
+  REVIEW_STATE_JSON="$BRAIN/brain/ops/review-state.json"
+  _REVIEW_CHECK=$(python3 - "$REVIEW_STATE_JSON" "$REVIEW_STATE" <<'PYEOF'
+import json, re, sys
+from datetime import datetime, timedelta
+
+json_path, md_path = sys.argv[1:3]
+now = datetime.now()
+
+# ── Try JSON sidecar first (reliable) ─────────────────────────────
+weekly_date_str = ''
+next_due_str = ''
+triage_date_str = ''
+_loaded = False
+
+try:
+    with open(json_path) as f:
+        data = json.load(f)
+    weekly_date_str = data.get('weekly', {}).get('date', '')
+    next_due_str = data.get('weekly', {}).get('next_due', '')
+    triage_date_str = data.get('triage', {}).get('date', '')
+    _loaded = True
+except:
+    pass
+
+# ── Fallback: parse markdown ──────────────────────────────────────
+if not _loaded:
+    try:
+        with open(md_path, 'r') as f:
+            content = f.read()
+    except:
+        print("BLOCK\tno review-state.md found\tWARN\tunknown")
+        sys.exit(0)
+
+    def extract(section, field):
+        pattern = rf'## {section}\n\n(?:.*\n)*?- \*\*{field}:\*\* (.*)'
+        m = re.search(pattern, content)
+        return m.group(1).strip() if m else ''
+
+    weekly_date_str = extract('Last Weekly Review', 'date')
+    next_due_str = extract('Last Weekly Review', 'next_due')
+    triage_date_str = extract('Last Inbox Triage', 'date')
+
+# ── Evaluate review freshness ─────────────────────────────────────
+weekly_status = 'OK'
+weekly_msg = ''
+
+if not weekly_date_str or weekly_date_str.startswith('_'):
+    weekly_status = 'BLOCK'
+    weekly_msg = 'weekly review has never been completed'
+elif next_due_str and not next_due_str.startswith('_'):
+    try:
+        next_due = datetime.strptime(next_due_str[:10], '%Y-%m-%d')
+        if now > next_due:
+            days_overdue = (now - next_due).days
+            weekly_status = 'BLOCK'
+            weekly_msg = f'weekly review overdue by {days_overdue}d (next_due: {next_due_str})'
+    except:
+        pass
+else:
+    # Fallback: age-based (>7 days)
+    try:
+        weekly_dt = datetime.strptime(weekly_date_str[:10], '%Y-%m-%d')
+        age = (now - weekly_dt).days
+        if age > 7:
+            weekly_status = 'BLOCK'
+            weekly_msg = f'weekly review is {age}d old (>7d threshold)'
+    except:
+        weekly_status = 'BLOCK'
+        weekly_msg = 'cannot parse weekly review date'
+
+# Inbox triage freshness (warning only)
+triage_status = 'OK'
+triage_msg = ''
+
+if not triage_date_str or triage_date_str.startswith('_'):
+    triage_status = 'WARN'
+    triage_msg = 'inbox triage has never been completed'
+else:
+    try:
+        triage_dt = datetime.strptime(triage_date_str[:10], '%Y-%m-%d')
+        age_hours = (now - triage_dt).total_seconds() / 3600
+        if age_hours > 48:
+            triage_status = 'WARN'
+            triage_msg = f'inbox triage is {int(age_hours)}h old (>48h threshold)'
+    except:
+        pass
+
+# Use '-' placeholder for empty fields to prevent bash read field collapse
+print(f'{weekly_status}\t{weekly_msg or "-"}\t{triage_status}\t{triage_msg or "-"}')
+PYEOF
+  ) || true
+
+  if [[ -n "$_REVIEW_CHECK" ]]; then
+    IFS=$'\t' read -r _WEEKLY_STATUS _WEEKLY_MSG _TRIAGE_STATUS _TRIAGE_MSG <<< "$_REVIEW_CHECK"
+
+    if [[ "$_WEEKLY_STATUS" == "BLOCK" ]]; then
+      echo "REJECTED (review binding): $(basename "$TASK_FILE")"
+      echo "  Auto-generated task blocked: $_WEEKLY_MSG"
+      echo ""
+      echo "  Options:"
+      echo "    1. Complete a weekly review: brain-review weekly"
+      echo "    2. Override: brain-task-admit $TASK_FILE --override-review"
+      exit 1
+    fi
+
+    if [[ "$_TRIAGE_STATUS" == "WARN" && -n "$_TRIAGE_MSG" && "$_TRIAGE_MSG" != "-" ]]; then
+      echo "  REVIEW WARNING: $_TRIAGE_MSG"
+    fi
+  fi
+fi
+
+# ── Extract task_id for queue filename ───────────────────────────
+TASK_ID=$(fm_get "$TASK_FILE" "task_id")
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: no task_id found in frontmatter"
+  exit 1
+fi
+
+# ── Dry run ──────────────────────────────────────────────────────
+if $DRY_RUN; then
+  echo "PASS (dry-run): $(basename "$TASK_FILE")"
+  [[ -n "$_WARNINGS" ]] && echo "$_WARNINGS"
+  echo "  Would admit as: $TASK_ID"
+  echo "  Would stamp: admitted_at, admission_version"
+  exit 0
+fi
+
+# ── Stamp admission marker ──────────────────────────────────────
+ADMITTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+QUEUE_TARGET="$QUEUE_DIR/${TASK_ID}.md"
+
+# Destination guard — skip when source is already the same file (in-place re-admission)
+_INPLACE=false
+if [[ "$(realpath "$TASK_FILE" 2>/dev/null)" == "$(realpath "$QUEUE_TARGET" 2>/dev/null)" ]]; then
+  _INPLACE=true
+elif [[ -f "$QUEUE_TARGET" ]]; then
+  echo "Error: $TASK_ID already exists in queue/"
+  exit 1
+fi
+
+# Add admission stamp to frontmatter (atomic: temp + rename)
+ADMIT_TMP=$(mktemp "$QUEUE_DIR/.${TASK_ID}.md.XXXXXX")
+python3 - "$TASK_FILE" "$ADMIT_TMP" "$ADMITTED_AT" <<'PYEOF'
+import re, sys
+
+src, dst, admitted_at = sys.argv[1:4]
+with open(src, 'r') as f:
+    content = f.read()
+
+# Insert admission stamp before closing ---
+# Find the end of frontmatter
+lines = content.split('\n')
+fm_end = -1
+found_first = False
+for i, line in enumerate(lines):
+    if line.strip() == '---':
+        if not found_first:
+            found_first = True
+        else:
+            fm_end = i
+            break
+
+if fm_end > 0:
+    # Check if admitted_at is already set to a non-empty value at line start.
+    # Conditions requiring a write:
+    #   1. key is absent entirely
+    #   2. key exists but value is empty string ("")
+    # A line containing "admitted_at:" elsewhere (e.g. in a why_now value) must
+    # not be treated as the real key — match only at line start.
+    _at_set = any(re.match(r'^admitted_at:\s*".+"', l) for l in lines[:fm_end])
+    if not _at_set:
+        # Remove any existing empty-placeholder line before inserting the real value
+        lines = [l for l in lines if not re.match(r'^admitted_at:\s*(""|)\s*$', l)]
+        fm_end = next(i for i, l in enumerate(lines) if l.strip() == '---' and i > 0)
+        lines.insert(fm_end, f'admitted_at: "{admitted_at}"')
+        fm_end += 1
+    _ver_set = any(re.match(r'^admission_version:\s*".+"', l) for l in lines[:fm_end])
+    if not _ver_set:
+        lines = [l for l in lines if not re.match(r'^admission_version:\s*(""|)\s*$', l)]
+        fm_end = next(i for i, l in enumerate(lines) if l.strip() == '---' and i > 0)
+        lines.insert(fm_end, 'admission_version: "1"')
+
+with open(dst, 'w') as f:
+    f.write('\n'.join(lines))
+PYEOF
+
+if [[ ! -s "$ADMIT_TMP" ]]; then
+  rm -f "$ADMIT_TMP"
+  echo "Error: failed to write admitted task"
+  exit 1
+fi
+
+# If source is already in queue, just replace in place
+if $_INPLACE; then
+  mv "$ADMIT_TMP" "$QUEUE_TARGET"
+  echo "ADMITTED (in-place): $TASK_ID"
+else
+  mv "$ADMIT_TMP" "$QUEUE_TARGET"
+  # Remove source file so it doesn't persist as an orphan outside queue/
+  [[ -f "$TASK_FILE" ]] && rm -f "$TASK_FILE"
+  echo "ADMITTED: $TASK_ID → queue/"
+fi
+
+[[ -n "$_WARNINGS" ]] && echo "$_WARNINGS"
+echo "  admitted_at: $ADMITTED_AT"
+
+# Surface dependency info if present
+_DEP=$(fm_get "$QUEUE_TARGET" "depends_on" 2>/dev/null || true)
+_BLK=$(fm_get "$QUEUE_TARGET" "blocks" 2>/dev/null || true)
+_SUP=$(fm_get "$QUEUE_TARGET" "supersedes" 2>/dev/null || true)
+_UNL=$(fm_get "$QUEUE_TARGET" "unlocks" 2>/dev/null || true)
+_REL=$(fm_get "$QUEUE_TARGET" "related" 2>/dev/null || true)
+[[ -n "$_DEP" && "$_DEP" != "[]" ]] && echo "  depends_on: $_DEP"
+[[ -n "$_BLK" && "$_BLK" != "[]" ]] && echo "  blocks: $_BLK"
+[[ -n "$_SUP" && "$_SUP" != "[]" ]] && echo "  supersedes: $_SUP"
+[[ -n "$_UNL" && "$_UNL" != "[]" ]] && echo "  unlocks: $_UNL"
+[[ -n "$_REL" ]] && echo "  related: $_REL"
+echo "  admission_version: 1"
+
+# ── Relationship overlap detection (advisory) ─────────────────────
+# If no graph edges are declared AND the new title shares ≥2 significant
+# words with existing open tasks, suggest candidate edges so the graph
+# stays connected. See feedback_wiki_management_sop.
+if [[ (-z "$_DEP" || "$_DEP" == "[]") && (-z "$_BLK" || "$_BLK" == "[]") && \
+      (-z "$_SUP" || "$_SUP" == "[]") && (-z "$_UNL" || "$_UNL" == "[]") ]]; then
+  _CANDIDATES=$(python3 - "$QUEUE_TARGET" "$QUEUE_DIR" <<'PYOVR' 2>/dev/null || true
+import os, re, sys, glob, time
+from collections import Counter
+new_file, queue_dir = sys.argv[1], sys.argv[2]
+completed_dir = os.path.join(os.path.dirname(queue_dir.rstrip('/')), 'completed')
+STOP = set("""
+a an the and or but for to of in on at by with from as is was be this that task p1 p2 p3 p4
+tasks brain new add update fix make build run check test all any one two single many more less
+""".split())
+def title_words(path):
+    try:
+        with open(path) as f:
+            text = f.read()
+    except Exception:
+        return "", set()
+    m = re.search(r'^title:\s*"?([^"\n]+)', text, re.MULTILINE)
+    title = m.group(1).strip() if m else os.path.basename(path)
+    tid_m = re.search(r'^task_id:\s*(\S+)', text, re.MULTILINE)
+    tid = tid_m.group(1).strip() if tid_m else os.path.basename(path).replace('.md','')
+    words = re.findall(r'[a-z][a-z0-9_-]{3,}', title.lower())
+    return tid, set(w for w in words if w not in STOP)
+new_tid, new_words = title_words(new_file)
+if len(new_words) < 3:
+    sys.exit(0)
+overlaps = []
+cutoff = time.time() - 60 * 86400  # last 60 days
+for f in glob.glob(os.path.join(queue_dir, 'TASK-*.md')):
+    if os.path.realpath(f) == os.path.realpath(new_file):
+        continue
+    tid, words = title_words(f)
+    shared = new_words & words
+    if len(shared) >= 2:
+        overlaps.append((len(shared), tid, sorted(shared)[:5], 'queue'))
+for f in glob.glob(os.path.join(completed_dir, 'TASK-*.md')):
+    try:
+        if os.path.getmtime(f) < cutoff:
+            continue
+    except OSError:
+        continue
+    tid, words = title_words(f)
+    shared = new_words & words
+    if len(shared) >= 2:
+        overlaps.append((len(shared), tid, sorted(shared)[:5], 'completed'))
+overlaps.sort(reverse=True)
+for score, tid, shared, source in overlaps[:4]:
+    print(f"{tid}|{score}|{','.join(shared)}|{source}")
+PYOVR
+  )
+  if [[ -n "$_CANDIDATES" ]]; then
+    _HAS_COMPLETED_OVERLAP=false
+    while IFS='|' read -r tid score shared source; do
+      [[ "$source" == "completed" ]] && _HAS_COMPLETED_OVERLAP=true
+    done <<< "$_CANDIDATES"
+    echo ""
+    echo "  RELATIONSHIP SUGGESTION: title overlaps with existing tasks:"
+    while IFS='|' read -r tid score shared source; do
+      [[ -z "$tid" ]] && continue
+      if [[ "$source" == "completed" ]]; then
+        echo "    - $tid [completed] (shared: $shared) — premise may already be addressed"
+      else
+        echo "    - $tid (shared: $shared)"
+      fi
+    done <<< "$_CANDIDATES"
+    if [[ "$_HAS_COMPLETED_OVERLAP" == "true" ]]; then
+      echo "    WARNING: Overlap with completed task(s) — verify this task's premise is still valid"
+    fi
+    echo "    Consider adding one of: depends_on, blocks, supersedes, unlocks"
+    echo "    See: brain-wiki show wiki-management"
+  fi
+fi
+
+# ── use_context_pack advisory ──────────────────────────────────────
+# Advisory only — never mutates the task. Fires when heuristic conditions
+# indicate context-pack would add signal and the field is not already set.
+_UCP=$(fm_get "$QUEUE_TARGET" "use_context_pack" 2>/dev/null || true)
+if [[ "$_UCP" != "true" ]]; then
+  _UCP_REASON=$(python3 - "$QUEUE_TARGET" "$_DEP" "$_REL" <<'PYUCP' 2>/dev/null || true
+import re, sys
+
+task_file, dep_raw, rel_raw = sys.argv[1], sys.argv[2], sys.argv[3]
+reasons = []
+
+# Condition 1: real depends_on or related
+def has_real_ids(val):
+    val = val.strip()
+    if not val or val in ('[]', '""', "''", '""'):
+        return False
+    try:
+        import json
+        items = json.loads(val)
+        return bool([i for i in items if str(i).strip().strip('"\'') not in ('', '[]')])
+    except Exception:
+        pass
+    return bool(val.strip().strip('"\'[]'))
+
+if has_real_ids(dep_raw):
+    reasons.append("has depends_on task IDs — sibling contract may affect execution")
+if has_real_ids(rel_raw):
+    reasons.append("has related task IDs — sibling context available")
+
+with open(task_file) as f:
+    content = f.read()
+
+# Condition 2: inline [[wiki_refs]] in body
+wiki_refs = re.findall(r'\[\[(\w+)\]\]', content)
+if wiki_refs:
+    reasons.append(f"has [[wiki_refs]]: {', '.join(wiki_refs[:3])}")
+
+# Condition 3: broad multi-path surfaces spanning brain/ or governance/
+surfaces_match = re.search(r'allowed_write_surfaces.*?\[(.*?)\]', content, re.DOTALL)
+if surfaces_match:
+    raw = surfaces_match.group(1)
+    parts = [p.strip().strip('"\'') for p in raw.split(',') if p.strip().strip('"\'')]
+    top_paths = set(p.split('/')[0] for p in parts if '/' in p)
+    if len(parts) >= 3 and ('brain' in top_paths or 'governance' in top_paths or 'scripts' in top_paths):
+        reasons.append(f"broad write surfaces ({len(parts)} paths across {', '.join(sorted(top_paths)[:3])})")
+
+# Condition 4: touches core execution/governance scripts
+exec_chain = ['brain-task-execute', 'brain-agent-bootstrap', 'brain-resume',
+              'brain-meditate', 'brain/governance', 'brain/MANUAL']
+# Only fire exec-chain condition if surfaces actually reach outside work/
+surfaces_are_work_only = True
+if surfaces_match:
+    raw = surfaces_match.group(1)
+    parts = [p.strip().strip('"\'') for p in raw.split(',') if p.strip().strip('"\'')]
+    surfaces_are_work_only = all(p.startswith('work/') or p == 'work' for p in parts if p)
+if not surfaces_are_work_only:
+    for token in exec_chain:
+        if token in content:
+            reasons.append(f"touches execution/governance chain ({token})")
+            break
+
+if reasons:
+    print('; '.join(reasons))
+PYUCP
+  )
+  if [[ -n "$_UCP_REASON" ]]; then
+    echo ""
+    echo "  CONTEXT-PACK HINT: consider adding 'use_context_pack: true' to this task"
+    echo "    Reason: $_UCP_REASON"
+    echo "    Effect: brain-task-execute will retrieve related task contracts + wiki refs before execution"
+  fi
+fi

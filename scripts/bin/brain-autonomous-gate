@@ -1,0 +1,143 @@
+#!/bin/bash
+# brain-autonomous-gate — Check whether an autonomous session should proceed
+#
+# Enforces all eligibility requirements for autonomous task execution:
+#   - Verdict gate: OK or STALE (warn+allow); DRIFT/CONFLICT block
+#   - Task must be: queued, P3/P4, claude-code owned, admitted, may_spawn_tasks=false
+#   - Write surfaces must exclude: production, governance, safety, financial, the-lab
+#
+# Exit codes:
+#   0 + task ID on stdout = eligible task found, proceed
+#   0 + "NO_TASK" on stdout = no eligible task, stop cleanly
+#   1 = gate failure, stop immediately
+#
+# Usage: brain-autonomous-gate [--json]
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+QUEUE="$BRAIN/brain/ops/tasks/queue"
+JSON_MODE=false
+[[ "${1:-}" == "--json" ]] && JSON_MODE=true
+
+. "$TOOLS/lib/brain-paths.sh"
+. "$TOOLS/lib/verdict-gate.sh"
+. "$TOOLS/lib/frontmatter.sh"
+
+# ── Step 1: Verdict gate (shared library) ─────────────────────────
+verdict_read
+
+if ! verdict_gate_allow; then
+  echo "GATE_FAIL: verdict is $_V_STATUS (blocked)" >&2
+  exit 1
+fi
+[[ "$_V_STATUS" == "STALE" ]] && echo "GATE_WARN: verdict is STALE (proceeding with warning)" >&2
+
+# Autonomous freshness: verdict must be < 60 min old (stricter than gate default)
+if [[ -n "${_V_TIMESTAMP:-}" ]]; then
+  _auto_epoch=$(date -d "$_V_TIMESTAMP" +%s 2>/dev/null || echo 0)
+  _auto_now=$(date +%s)
+  _auto_age_min=$(( (_auto_now - _auto_epoch) / 60 ))
+  if (( _auto_age_min > 60 )); then
+    echo "GATE_FAIL: verdict is ${_auto_age_min}m old (max 60m for autonomous)" >&2
+    exit 1
+  fi
+fi
+
+# ── Step 2: Scan queue for eligible tasks ─────────────────────────
+
+BLOCKED_SURFACES="production|governance|safety|financial|the-lab"
+
+best_task=""
+best_rank=99
+best_created="9999-99-99"
+best_title=""
+
+for f in "$QUEUE"/TASK-*.md; do
+  [[ -f "$f" ]] || continue
+  fname=$(basename "$f" .md)
+
+  # Status must be "queued"
+  task_status=$(fm_get "$f" "status")
+  if [[ "$task_status" != "queued" ]]; then
+    continue
+  fi
+
+  # Priority must be P3 or P4
+  priority=$(fm_get "$f" "priority")
+  case "$priority" in
+    P3) rank=3 ;;
+    P4) rank=4 ;;
+    *) continue ;;  # P1/P2 require human
+  esac
+
+  # Must be admitted
+  admitted=$(fm_get "$f" "admitted_at")
+  if [[ -z "$admitted" ]]; then
+    continue
+  fi
+
+  # Authority owner must be claude-code
+  auth_owner=$(grep -oP '(?<=authority_owner:\s).*' "$f" 2>/dev/null | head -1 | tr -d ' *' || true)
+  if [[ -z "$auth_owner" ]]; then
+    # Try frontmatter format
+    auth_owner=$(fm_get "$f" "authority_owner" 2>/dev/null || true)
+  fi
+  if [[ "$auth_owner" != "claude-code" ]]; then
+    continue
+  fi
+
+  # may_spawn_tasks must be false
+  spawn=$(grep -oP '(?<=may_spawn_tasks:\s).*' "$f" 2>/dev/null | head -1 | tr -d ' *' || true)
+  if [[ "$spawn" != "false" ]]; then
+    continue
+  fi
+
+  # Write surfaces must not contain blocked patterns
+  surfaces=$(grep -oP '(?<=write_surfaces:\s).*' "$f" 2>/dev/null | head -1 || true)
+  if [[ -z "$surfaces" ]]; then
+    # Try alternate format
+    surfaces=$(grep 'write_surfaces' "$f" 2>/dev/null | head -1 || true)
+  fi
+  if echo "$surfaces" | grep -qiE "$BLOCKED_SURFACES"; then
+    continue
+  fi
+
+  # Dependency check
+  depends_on=$(fm_get "$f" "depends_on")
+  if [[ -n "$depends_on" && "$depends_on" != '""' && "$depends_on" != "''" ]]; then
+    if [[ ! -f "$BRAIN/brain/ops/tasks/completed/${depends_on}.md" ]]; then
+      continue
+    fi
+  fi
+
+  # Rank by priority then creation date
+  created=$(fm_get "$f" "created")
+  [[ -z "$created" ]] && created="9999-99-99"
+  title=$(grep '^# ' "$f" 2>/dev/null | head -1 | sed 's/^# //')
+
+  if (( rank < best_rank )) || { (( rank == best_rank )) && [[ "$created" < "$best_created" ]]; }; then
+    best_task="$fname"
+    best_rank=$rank
+    best_created="$created"
+    best_title="$title"
+  fi
+done
+
+# ── Step 3: Report result ─────────────────────────────────────────
+if [[ -z "$best_task" ]]; then
+  if $JSON_MODE; then
+    echo "{\"status\":\"no_task\",\"message\":\"No eligible tasks for autonomous execution\"}"
+  else
+    echo "NO_TASK"
+  fi
+  exit 0
+fi
+
+if $JSON_MODE; then
+  echo "{\"status\":\"eligible\",\"task_id\":\"$best_task\",\"title\":\"$best_title\",\"priority\":\"P${best_rank}\"}"
+else
+  echo "$best_task"
+fi
+exit 0

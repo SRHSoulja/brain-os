@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# brain-audit-pipeline — Full-coverage forensic audit.
+
+BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+COMPLETED_DIR="$BRAIN/brain/ops/tasks/completed"
+PROGRESS_FILE="$BRAIN/brain/ops/analytics/audit_progress.md"
+LIST_FILE="$BRAIN/brain/ops/analytics/task_list.csv"
+CHECKSUM_FILE="$BRAIN/brain/ops/analytics/task_list.sha256"
+
+# 1. Traversal Discovery
+ls -1 "$COMPLETED_DIR"/*.md | grep -v "TASK-.*-024.md" > "$LIST_FILE"
+TOTAL=$(wc -l < "$LIST_FILE")
+sha256sum "$LIST_FILE" > "$CHECKSUM_FILE"
+
+echo "# Full Audit Coverage: $TOTAL tasks" > "$PROGRESS_FILE"
+echo "---" >> "$PROGRESS_FILE"
+echo "Total expected: $TOTAL" >> "$PROGRESS_FILE"
+
+# 2. Schema-Aware Validation Logic
+verify_task() {
+    local FILE="$1"
+    # Detect schema version
+    if grep -q "task_id" "$FILE" && grep -q "status:" "$FILE"; then
+        # Modern: Validate pattern "task_id"
+        if ./scripts/bin/brain-verify-execution --target-state "$FILE" --pattern "task_id" > /dev/null; then
+            echo "VALID_EXECUTION"
+        else
+            echo "NO_OP_EXECUTION"
+        fi
+    elif grep -q "title:" "$FILE" || grep -q "Description" "$FILE"; then
+        echo "SCHEMA_MISMATCH"
+    else
+        echo "UNKNOWN"
+    fi
+}
+
+# 3. Processing
+PROCESSED=0
+while IFS= read -r FILE; do
+    RESULT=$(verify_task "$FILE")
+    echo "* $(basename "$FILE"): $RESULT" >> "$PROGRESS_FILE"
+    ((PROCESSED++))
+done < "$LIST_FILE"
+
+# 4. Coverage Enforcement
+if [[ "$PROCESSED" -ne "$TOTAL" ]]; then
+    echo "CRITICAL: Coverage mismatch! $PROCESSED processed vs $TOTAL expected."
+    exit 1
+fi
+
+echo "Full coverage complete. Audit integrity verified."

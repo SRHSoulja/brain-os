@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# brain-proof-log -- Append a receipt-bearing event to a proof-of-execution run
+# Usage: brain-proof-log --run RUN_ID --event <type> --payload-json '<json>' [--actor <agent-id>] [--signer-id <signer-id>]
+#
+# Event types:
+#   Core:      command, file_write, verification, run_completed, run_failed
+#   Audit:     audit_complete, audit_finding, fixes_applied, remediation_applied
+#   Results:   verification_pass, verification_fail
+#   General:   checkpoint, receipt_note, task_note
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
+PROOF_DIR="$BRAIN/brain/ops/proof-execution"
+KEYGEN_TOOL="$HOME/bin/brain-proof-keygen"
+
+RUN_ID=""
+EVENT_TYPE=""
+PAYLOAD_JSON="{}"
+ACTOR=""
+SIGNER_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run) RUN_ID="$2"; shift 2 ;;
+    --event) EVENT_TYPE="$2"; shift 2 ;;
+    --payload-json) PAYLOAD_JSON="$2"; shift 2 ;;
+    --actor) ACTOR="$2"; shift 2 ;;
+    --signer-id) SIGNER_ID="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$RUN_ID" || -z "$EVENT_TYPE" ]]; then
+  echo "Usage: brain-proof-log --run RUN_ID --event <type> --payload-json '<json>' [--actor <agent-id>] [--signer-id <signer-id>]" >&2
+  exit 1
+fi
+
+RUN_FILE="$RUNS_DIR/${RUN_ID}.jsonl"
+if [[ ! -f "$RUN_FILE" ]]; then
+  echo "Run file not found: $RUN_FILE" >&2
+  exit 1
+fi
+
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Validate event type
+case "$EVENT_TYPE" in
+  # Core execution events
+  command|file_write|verification|run_completed|run_failed) ;;
+  # Audit and remediation events (TASK-114: expanded for semantic richness)
+  audit_complete|audit_finding|fixes_applied|remediation_applied) ;;
+  # Verification result events
+  verification_pass|verification_fail) ;;
+  # General-purpose notes
+  checkpoint|receipt_note|task_note) ;;
+  *) echo "Invalid event type: $EVENT_TYPE" >&2
+     echo "Valid types: command, file_write, verification, run_completed, run_failed," >&2
+     echo "             audit_complete, audit_finding, fixes_applied, remediation_applied," >&2
+     echo "             verification_pass, verification_fail, checkpoint, receipt_note, task_note" >&2
+     exit 1 ;;
+esac
+
+if [[ -n "$SIGNER_ID" && -x "$KEYGEN_TOOL" ]]; then
+  "$KEYGEN_TOOL" --agent-id "$SIGNER_ID" >/dev/null 2>&1
+fi
+
+python3 - "$RUN_FILE" "$PROOF_DIR" "$NOW" "$RUN_ID" "$EVENT_TYPE" "$PAYLOAD_JSON" "$ACTOR" "$SIGNER_ID" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import sys
+
+from cryptography.hazmat.primitives import serialization
+
+run_file, proof_dir, now, run_id, event_type, payload_raw, actor_arg, signer_arg = sys.argv[1:]
+payload = json.loads(payload_raw)
+
+with open(run_file, "r", encoding="utf-8") as f:
+    rows = [json.loads(line) for line in f if line.strip()]
+
+first = rows[0]
+task_id = first.get("task_id")
+executor = first.get("executor")
+schema_version = first.get("schema_version", "legacy-v1")
+actor = actor_arg or executor
+signer_id = signer_arg or first.get("signer_id") or executor
+prev = rows[-1]
+prev_hash = prev.get("receipt_hash")
+sequence = int(prev.get("sequence", len(rows) - 1)) + 1
+
+payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+event = {
+    "schema_version": schema_version,
+    "ts": now,
+    "run_id": run_id,
+    "task_id": task_id,
+    "executor": executor,
+    "actor": actor,
+    "signer_id": signer_id,
+    "event": event_type,
+    "sequence": sequence,
+    "receipt_id": f"{run_id}:{sequence}",
+    "prev_receipt_hash": prev_hash,
+    "payload_hash": payload_hash,
+    "payload": payload,
+}
+receipt_basis = {
+    "schema_version": event["schema_version"],
+    "run_id": event["run_id"],
+    "task_id": event["task_id"],
+    "executor": event["executor"],
+    "actor": event["actor"],
+    "signer_id": event["signer_id"],
+    "event": event["event"],
+    "sequence": event["sequence"],
+    "receipt_id": event["receipt_id"],
+    "prev_receipt_hash": event["prev_receipt_hash"],
+    "payload_hash": event["payload_hash"],
+    "ts": event["ts"],
+}
+receipt_bytes = json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode()
+event["receipt_hash"] = hashlib.sha256(receipt_bytes).hexdigest()
+
+registry_path = os.path.join(proof_dir, "keys", "registry.json")
+with open(registry_path, "r", encoding="utf-8") as f:
+    registry = json.load(f)
+key_meta = registry.get(signer_id)
+if not key_meta:
+    raise SystemExit(f"missing signer key for {signer_id}")
+with open(key_meta["private_key"], "rb") as f:
+    private_key = serialization.load_pem_private_key(f.read(), password=None)
+signature = private_key.sign(receipt_bytes)
+event["signature_alg"] = "ed25519"
+event["signature_b64"] = base64.b64encode(signature).decode("ascii")
+event["public_key_fingerprint"] = key_meta.get("public_key_fingerprint")
+
+with open(run_file, "a", encoding="utf-8") as f:
+    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+PY
+
+echo "logged: $EVENT_TYPE -> $RUN_ID"

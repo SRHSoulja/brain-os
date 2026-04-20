@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# brain-terminal-watch-read — Stream new GPT prompt files from brain-terminal-events.log
+#
+# Designed to be the sole command inside a persistent Monitor call.
+# Manages its own PID file so restarts always kill the previous instance cleanly.
+# Uses tail -n 0 -f (start from end — zero history) to avoid replaying old events.
+#
+# Usage: brain-terminal-watch-read
+
+LOG_FILE="/tmp/brain-terminal-events.log"
+PID_FILE="/tmp/brain-terminal-watch-read.pid"
+
+# ── Kill any previous instance of this script ────────────────────
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 0.2
+  fi
+  rm -f "$PID_FILE"
+fi
+
+# Write own PID so next invocation can clean us up
+echo $$ > "$PID_FILE"
+
+# ── Wait for log file if not yet present ─────────────────────────
+until [[ -f "$LOG_FILE" ]]; do sleep 1; done
+
+# ── Stream new events only (no historical replay) ─────────────────
+# -n 0: start from the current end of the file — never reads existing lines
+exec tail -n 0 -f "$LOG_FILE" | grep --line-buffered '\.md$'

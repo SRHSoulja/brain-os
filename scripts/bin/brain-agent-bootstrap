@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# brain-agent-bootstrap -- Unified session bootstrap for ALL agents
+# Usage: brain-agent-bootstrap --agent <name> [--mode interactive|bridge|standby] [--seat laptop|ve] [--quiet] [--skip-resume]
+#
+# Canonical session entry point. Every agent runs this at session start.
+# Sequence: [pre: git pull --rebase (laptop, gated)] -> orphan detect -> seat claim -> session start -> heartbeat -> brain-resume -> governance -> verdict
+#
+# Phase 1 (one-time onboarding) is handled by brain-agent-onboard.
+# See: brain/governance/agent-lifecycle-policy.md
+set -euo pipefail
+
+# Resolve through symlinks so ~/bin wrappers can source libs reliably.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+TOOLS="$_SELF_DIR"
+TOOLS_LIB="$_SELF_DIR/../lib"
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+AGENT=""
+MODE="interactive"
+SEAT="laptop"
+QUIET=false
+SKIP_RESUME=false
+TIMING_LOG="$BRAIN/work/logs/bootstrap-timing.jsonl"
+
+# canonical_agent sourced from shared lib (brain-paths.sh)
+# Do not duplicate here -- single definition in brain-paths.sh
+. "$TOOLS_LIB/brain-paths.sh"
+ensure_runtime_surfaces
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --seat) SEAT="$2"; shift 2 ;;
+    --quiet) QUIET=true; shift ;;
+    --skip-resume) SKIP_RESUME=true; shift ;;
+    -h|--help)
+      echo "Usage: brain-agent-bootstrap --agent <name> [--mode interactive|bridge|standby] [--seat laptop|ve] [--quiet] [--skip-resume]"
+      echo ""
+      echo "Unified session bootstrap. Runs at start of every session for ALL agents."
+      echo ""
+      echo "  --quiet        Suppress interactive output (for hook mode)"
+      echo "  --skip-resume  Skip brain-resume state generation step"
+      echo ""
+      echo "For first-time setup, run brain-agent-onboard first."
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$AGENT" ]]; then
+  echo "Error: --agent <name> required" >&2
+  echo "Usage: brain-agent-bootstrap --agent <name> [--mode interactive|bridge|standby]" >&2
+  exit 1
+fi
+
+AGENT="$(canonical_agent "$AGENT")"
+export BRAIN_AGENT="$AGENT"
+export BRAIN_DIR="$BRAIN"
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+_log() {
+  $QUIET || echo "$@"
+}
+
+_ms_since() {
+  # Returns milliseconds elapsed since the epoch-nanosecond timestamp $1
+  local start_ns="$1"
+  local end_ns
+  end_ns=$(date +%s%N 2>/dev/null || echo "0")
+  echo $(( (end_ns - start_ns) / 1000000 ))
+}
+
+_step_start() {
+  date +%s%N 2>/dev/null || echo "0"
+}
+
+BOOTSTRAP_START=$(_step_start)
+
+# ── Timing accumulator ──────────────────────────────────────────────
+
+declare -A STEP_TIMES=()
+
+_record_step() {
+  local name="$1" start_ns="$2"
+  STEP_TIMES["$name"]=$(_ms_since "$start_ns")
+}
+
+# ── Check: agent must be onboarded ──────────────────────────────────
+
+CAPS_FILE="$BRAIN/brain/governance/capability-profiles/${AGENT}.json"
+REGISTRY="$BRAIN/brain/governance/agent-registry.json"
+
+# Export canonical seat model for downstream tooling (task entries, events).
+# Precedence: existing BRAIN_MODEL env > onboarded capability profile model.
+if [[ -z "${BRAIN_MODEL:-}" && -f "$CAPS_FILE" ]]; then
+  _BOOT_MODEL=$(python3 -c "import json; print(json.load(open('$CAPS_FILE')).get('model',''))" 2>/dev/null || echo "")
+  if [[ -n "$_BOOT_MODEL" ]]; then
+    export BRAIN_MODEL="$_BOOT_MODEL"
+    export BRAIN_MODEL_SOURCE="capability-profile:${AGENT}"
+  fi
+fi
+if [[ ! -f "$CAPS_FILE" && ! -f "$REGISTRY" ]]; then
+  _log "WARN: $AGENT not onboarded. Run: brain-agent-onboard --agent $AGENT --model <model>"
+  _log "Continuing with session bootstrap (backward compat)..."
+  _log ""
+fi
+
+_log "=== brain-agent-bootstrap: $AGENT ($SEAT/$MODE) ==="
+_log ""
+
+# ── Pre-step: git pull --rebase (laptop only, gated) ────────────────
+# Gate: laptop seat only (VE syncs via lsyncd), clean working tree,
+# and no active session file (another seat may be mid-session).
+# Non-fatal: pull failure logs a warning and continues bootstrap.
+if [[ "$SEAT" == "laptop" ]]; then
+  _PULL_SKIP_REASON=""
+  if [[ -f "$BRAIN/brain/ops/.active-session.json" ]]; then
+    _PULL_SKIP_REASON="active session present (another seat may be working)"
+  else
+    _GIT_DIRTY=$(cd "$BRAIN" && git status --porcelain 2>/dev/null | grep -v "^??" | wc -l | tr -d ' ')
+    if [[ "$_GIT_DIRTY" -gt 0 ]]; then
+      _PULL_SKIP_REASON="working tree has $_GIT_DIRTY uncommitted change(s)"
+    fi
+  fi
+
+  if [[ -n "$_PULL_SKIP_REASON" ]]; then
+    _log "[pre] git pull --rebase: SKIPPED ($_PULL_SKIP_REASON)"
+    _log ""
+  else
+    _log "[pre] git pull --rebase..."
+    _PULL_START=$(_step_start)
+    _PULL_OUT=""
+    _PULL_RC=0
+    _PULL_OUT=$(cd "$BRAIN" && git pull --rebase 2>&1) || _PULL_RC=$?
+    _PULL_MS=$(_ms_since "$_PULL_START")
+    if [[ $_PULL_RC -eq 0 ]]; then
+      _PULL_SUMMARY=$(echo "$_PULL_OUT" | grep -E "^(Already up to date|Fast-forward|Successfully rebased)" | head -1 || echo "done")
+      _log "  $_PULL_SUMMARY (${_PULL_MS}ms)"
+    else
+      _log "  [warn] git pull --rebase failed (non-fatal, continuing)"
+      _log "  $_PULL_OUT" | head -3
+    fi
+    STEP_TIMES["git_pull"]=$_PULL_MS
+    _log ""
+  fi
+fi
+
+# ── Pre-step: promptbox status reset (stale running state) ───────────
+# If a previous session crashed mid-execution, status.json may be stuck
+# at state=running. Reset to stale-crashed so the advisor can detect it.
+_STATUS_JSON="$BRAIN/brain/ops/promptbox/terminal/status.json"
+if [[ -f "$_STATUS_JSON" ]]; then
+  _ST_STATE=$(python3 -c "import json; print(json.load(open('$_STATUS_JSON')).get('state',''))" 2>/dev/null || echo "")
+  if [[ "$_ST_STATE" == "running" ]]; then
+    _ST_PROMPT=$(python3 -c "import json; print(json.load(open('$_STATUS_JSON')).get('last_prompt_file','unknown'))" 2>/dev/null || echo "unknown")
+    _NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf '{\n  "state": "stale-crashed",\n  "last_prompt_file": "%s",\n  "running_since": null,\n  "last_response_file": null,\n  "last_response_ts": null,\n  "safe_to_send": false,\n  "lint_result": null,\n  "reset_reason": "session start detected stale running state",\n  "updated_at": "%s"\n}\n' \
+      "$_ST_PROMPT" "$_NOW_ISO" > "$_STATUS_JSON"
+    _log "[pre] promptbox status: stale 'running' → stale-crashed (was: $_ST_PROMPT)"
+    _log ""
+  fi
+fi
+
+# ── Step 1: Orphan session detection ────────────────────────────────
+
+S1=$(_step_start)
+_log "[1/7] Orphan detection..."
+SESSION_FILE="$BRAIN/brain/ops/.active-session.json"
+if [[ -f "$SESSION_FILE" ]]; then
+  STALE_ID=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('session_id','unknown'))" 2>/dev/null || echo "unknown")
+  STALE_AGENT=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('agent','unknown'))" 2>/dev/null || echo "unknown")
+  STALE_TS=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('started_at','unknown'))" 2>/dev/null || echo "unknown")
+
+  _log "  orphan found: $STALE_ID ($STALE_AGENT, started $STALE_TS)"
+
+  # Log SESSION_ORPHAN event
+  TS_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  EVT_ID="evt-$(date +%Y%m%d-%H%M%S)-$(head -c3 /dev/urandom | xxd -p)"
+  HOSTNAME=$(hostname -s 2>/dev/null || echo "unknown")
+
+  echo "$TS_NOW SESSION_ORPHAN $STALE_ID agent=$STALE_AGENT replaced_by=$AGENT" >> "$BRAIN/brain/ops/events.log"
+
+  python3 -c "
+import json
+evt = {
+    'event_id': '$EVT_ID',
+    'ts': '$TS_NOW',
+    'source': 'local',
+    'source_host': '$HOSTNAME',
+    'op': 'SESSION_ORPHAN',
+    'entity_id': '$STALE_ID',
+    'surface': 'brain/ops/.active-session.json',
+    'meta': {
+        'stale_agent': '$STALE_AGENT',
+        'stale_started': '$STALE_TS',
+        'replaced_by': '$AGENT'
+    }
+}
+print(json.dumps(evt, separators=(',', ':')))
+" >> "$BRAIN/brain/ops/events.jsonl"
+else
+  _log "  no stale session"
+fi
+_record_step "orphan_detect" "$S1"
+_log ""
+
+# ── Step 2: Claim seat ──────────────────────────────────────────────
+
+S2=$(_step_start)
+_log "[2/7] Claiming seat..."
+if $QUIET; then
+  "$TOOLS/brain-seat-claim" --seat "$SEAT" --assistant "$AGENT" --mode "$MODE" >/dev/null
+else
+  "$TOOLS/brain-seat-claim" --seat "$SEAT" --assistant "$AGENT" --mode "$MODE"
+fi
+_record_step "seat_claim" "$S2"
+_log ""
+
+# ── Step 3: Session start event ─────────────────────────────────────
+
+S3=$(_step_start)
+_log "[3/7] Session start..."
+if $QUIET; then
+  "$TOOLS/brain-session-start" --agent "$AGENT" --seat "$SEAT" --mode "$MODE" >/dev/null
+else
+  "$TOOLS/brain-session-start" --agent "$AGENT" --seat "$SEAT" --mode "$MODE"
+fi
+_record_step "session_start" "$S3"
+_log ""
+
+# ── Step 4: Heartbeat ───────────────────────────────────────────────
+
+S4=$(_step_start)
+_log "[4/7] Heartbeat..."
+"$TOOLS/brain-heartbeat" >/dev/null 2>/dev/null || _log "[warn] heartbeat failed (non-fatal)"
+_record_step "heartbeat" "$S4"
+_log ""
+
+# ── Step 5: State generation (brain-resume) ────────────────────���────
+
+S5=$(_step_start)
+if $SKIP_RESUME; then
+  _log "[5/7] State generation... SKIPPED (--skip-resume)"
+  STEP_TIMES["brain_resume"]=0
+else
+  _log "[5/7] State generation (brain-resume)..."
+  if $QUIET; then
+    "$TOOLS/brain-resume" --new-session >/dev/null 2>&1 || true
+  else
+    RESUME_OUTPUT=$("$TOOLS/brain-resume" --new-session 2>&1) || {
+      _log "  [warn] brain-resume failed (non-fatal)"
+      _log "  state files may be stale"
+    }
+    # Show the summary lines from brain-resume
+    echo "$RESUME_OUTPUT" | grep -E "^(Brain Verdict|Suggested action|Task Queue|Attention):" | head -4 | sed 's/^/  /'
+  fi
+  _record_step "brain_resume" "$S5"
+fi
+_log ""
+
+# ── Step 5b: Hook sync (narrow, bounded) ────────────────────────────
+
+if command -v brain-hooks-sync >/dev/null 2>&1; then
+  brain-hooks-sync >/dev/null 2>&1 || true
+elif [[ -x "$TOOLS/brain-hooks-sync" ]]; then
+  python3 "$TOOLS/brain-hooks-sync" >/dev/null 2>&1 || true
+fi
+
+# ── Step 6: Governance ──────────────────────────────────────────────
+
+S6=$(_step_start)
+_log "[6/7] Governance..."
+# Map agent to seat file
+case "$AGENT" in
+  claude-code) AGENT_MD="$BRAIN/CLAUDE.md" ;;
+  codex)       AGENT_MD="$BRAIN/AGENTS.md" ;;
+  gemini)      AGENT_MD="$BRAIN/GEMINI.md" ;;
+  *)           AGENT_MD="$BRAIN/$(echo "$AGENT" | tr '[:lower:]' '[:upper:]' | tr '-' '_').md" ;;
+esac
+if [[ -f "$AGENT_MD" ]]; then
+  _log "  seat file: $(basename "$AGENT_MD")"
+else
+  _log "  seat file: $(basename "$AGENT_MD") (NOT FOUND)"
+fi
+
+[[ -f "$BRAIN/brain/MANUAL.md" ]] && _log "  manual: brain/MANUAL.md"
+[[ -f "$BRAIN/brain/governance/execution-routing-policy.md" ]] && _log "  policy: execution-routing-policy.md (deterministic first)"
+[[ -f "$BRAIN/brain/governance/agent-lifecycle-policy.md" ]] && _log "  policy: agent-lifecycle-policy.md (bootstrap/exit modes)"
+[[ -f "$BRAIN/brain/wiki/tools/MAP.md" ]] && _log "  tools: brain/wiki/tools/MAP.md"
+
+# Load capability profile if available
+if [[ -f "$CAPS_FILE" ]]; then
+  CAPS_MODEL=$(python3 -c "import json; print(json.load(open('$CAPS_FILE')).get('model','unknown'))" 2>/dev/null || echo "unknown")
+  CAPS_CTX=$(python3 -c "import json; print(json.load(open('$CAPS_FILE')).get('context_window',0))" 2>/dev/null || echo "0")
+  _log "  capabilities: model=$CAPS_MODEL ctx=${CAPS_CTX}"
+fi
+_record_step "governance" "$S6"
+_log ""
+
+# ── Step 7: Verdict check ───────────────────────────────────────────
+
+S7=$(_step_start)
+_log "[7/7] State verdict..."
+VERDICT="unknown"
+if [[ -f "$BRAIN/brain/ops/derived/state-verdict.json" ]]; then
+  VERDICT=$(python3 -c "import json; d=json.load(open('$BRAIN/brain/ops/derived/state-verdict.json')); print(d.get('status', d.get('verdict','unknown')))" 2>/dev/null || echo "unknown")
+  _log "  verdict: $VERDICT"
+  if [[ "$VERDICT" == "DRIFT" || "$VERDICT" == "CONFLICT" ]]; then
+    _log "  WARNING: $VERDICT detected. Run brain-state-check for details."
+  fi
+else
+  _log "  verdict: unknown (state-verdict.json missing)"
+fi
+_record_step "verdict" "$S7"
+_log ""
+
+# ── Terminal monitor status ──────────────────────────────────────────
+# Check if the brain-watch-terminal watcher leaked from a prior session.
+# It should only run during explicit terminal sessions (/brain-watch-terminal).
+# This check is agent-agnostic — applies to all brain agents.
+if command -v brain-terminal-status >/dev/null 2>&1 && ! brain-terminal-status --quiet 2>/dev/null; then
+  _TERM_LINE=$(brain-terminal-status 2>/dev/null | head -1 || echo "Terminal monitor: ON (unknown pid)")
+  _log "WARNING: $_TERM_LINE (leaked from prior session)"
+  _log "  To stop: brain-terminal-watch-stop"
+fi
+
+# ── Gemini Guidance Pointer ──────────────────────────────────────────
+if [[ "$AGENT" == "gemini" ]]; then
+  _log "Gemini Seat Guidance:"
+  _log "  Self-contention rules active. Refer to:"
+  _log "  brain/governance/gemini-seat-guidance.md"
+  _log ""
+fi
+
+# ── Timing summary ──────────────────────────────────────────────────
+
+TOTAL_MS=$(_ms_since "$BOOTSTRAP_START")
+
+_log "=== Bootstrap complete: $AGENT ready (${TOTAL_MS}ms) ==="
+_log ""
+if ! $QUIET; then
+  _log "Timing:"
+  for step in orphan_detect seat_claim session_start heartbeat brain_resume governance verdict; do
+    printf "  %-16s %6sms\n" "$step" "${STEP_TIMES[$step]:-0}"
+  done
+  printf "  %-16s %6sms\n" "TOTAL" "$TOTAL_MS"
+fi
+
+# ── Log timing to JSONL ─────────────────────────────────────────────
+
+mkdir -p "$(dirname "$TIMING_LOG")"
+python3 -c "
+import json
+from datetime import datetime, timezone
+entry = {
+    'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'agent': '$AGENT',
+    'seat': '$SEAT',
+    'mode': '$MODE',
+    'quiet': $( $QUIET && echo 'True' || echo 'False' ),
+    'skip_resume': $( $SKIP_RESUME && echo 'True' || echo 'False' ),
+    'verdict': '$VERDICT',
+    'steps_ms': {
+        'orphan_detect': ${STEP_TIMES[orphan_detect]:-0},
+        'seat_claim': ${STEP_TIMES[seat_claim]:-0},
+        'session_start': ${STEP_TIMES[session_start]:-0},
+        'heartbeat': ${STEP_TIMES[heartbeat]:-0},
+        'brain_resume': ${STEP_TIMES[brain_resume]:-0},
+        'governance': ${STEP_TIMES[governance]:-0},
+        'verdict': ${STEP_TIMES[verdict]:-0}
+    },
+    'total_ms': $TOTAL_MS
+}
+print(json.dumps(entry, separators=(',', ':')))
+" >> "$TIMING_LOG"
+
+# ── Quiet mode JSON output ──────────────────────────────────────────
+
+if $QUIET; then
+  python3 -c "
+import json
+result = {
+    'status': 'ok',
+    'agent': '$AGENT',
+    'seat': '$SEAT',
+    'verdict': '$VERDICT',
+    'total_ms': $TOTAL_MS,
+    'steps_ms': {
+        'orphan_detect': ${STEP_TIMES[orphan_detect]:-0},
+        'seat_claim': ${STEP_TIMES[seat_claim]:-0},
+        'session_start': ${STEP_TIMES[session_start]:-0},
+        'heartbeat': ${STEP_TIMES[heartbeat]:-0},
+        'brain_resume': ${STEP_TIMES[brain_resume]:-0},
+        'governance': ${STEP_TIMES[governance]:-0},
+        'verdict': ${STEP_TIMES[verdict]:-0}
+    }
+}
+print(json.dumps(result, indent=2))
+"
+fi

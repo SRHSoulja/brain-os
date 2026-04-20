@@ -1,0 +1,190 @@
+#!/bin/bash
+# brain-task-reconcile — Verify task filesystem state matches event history
+# Usage:
+#   brain-task-reconcile [--fix] [--json]
+#
+# Replays events.jsonl to determine canonical task state, then compares
+# against the filesystem (which directory each task file lives in).
+# Reports mismatches.
+#
+# --fix: move files to match event history (only for clear mismatches)
+# --json: output results as JSON
+#
+# ADR-0004 Phase 0g. Safe to run in dry-run (default) mode at any time.
+
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+
+FIX=false
+JSON_OUT=false
+for arg in "$@"; do
+  case "$arg" in
+    --fix) FIX=true ;;
+    --json) JSON_OUT=true ;;
+  esac
+done
+
+python3 - "$BRAIN" "$_EVENTS_JSONL" "$_OPS_TASKS_DIR" "$FIX" "$JSON_OUT" <<'PYEOF'
+import json, os, sys
+
+brain = sys.argv[1]
+events_path = sys.argv[2]
+tasks_dir = sys.argv[3]
+fix_mode = sys.argv[4] == "True"
+json_out = sys.argv[5] == "True"
+
+# ── Replay events to determine canonical task states ──
+# Last event for each task_id determines its canonical state
+task_states = {}  # task_id → {"last_op", "last_ts", "agent"}
+
+if os.path.exists(events_path):
+    with open(events_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            op = ev.get("op", "")
+            eid = ev.get("entity_id")
+            if not eid or not eid.startswith("TASK-"):
+                continue
+            if op in ("TASK_CLAIM", "TASK_EXECUTE", "TASK_COMPLETE", "TASK_ARCHIVE", "TASK_RELEASE", "TASK_CANCEL"):
+                task_states[eid] = {
+                    "last_op": op,
+                    "last_ts": ev.get("ts", ""),
+                    "agent": ev.get("meta", {}).get("agent", ""),
+                    "event_id": ev.get("event_id", "")
+                }
+
+# ── Map ops to expected directories ──
+OP_TO_DIR = {
+    "TASK_CLAIM": "active",
+    "TASK_EXECUTE": "active",
+    "TASK_COMPLETE": "completed",
+    "TASK_ARCHIVE": None,  # archived tasks may be in completed/archive/
+    "TASK_RELEASE": "queue",  # stale claim released back to queue
+    "TASK_CANCEL": "completed"  # cancelled tasks land in completed/ with status: cancelled
+}
+
+# ── Scan filesystem ──
+fs_tasks = {}  # task_id → {"dir": "queue"|"active"|"completed"|"archive/..."}
+for subdir in ("queue", "active", "completed"):
+    dirpath = os.path.join(tasks_dir, subdir)
+    if not os.path.isdir(dirpath):
+        continue
+    for fname in os.listdir(dirpath):
+        if fname.startswith("TASK-") and fname.endswith(".md"):
+            tid = fname.replace(".md", "")
+            fs_tasks[tid] = {"dir": subdir, "path": os.path.join(dirpath, fname)}
+
+# Also scan archive
+archive_base = os.path.join(tasks_dir, "completed", "archive")
+if os.path.isdir(archive_base):
+    for month_dir in os.listdir(archive_base):
+        month_path = os.path.join(archive_base, month_dir)
+        if not os.path.isdir(month_path):
+            continue
+        for fname in os.listdir(month_path):
+            if fname.startswith("TASK-") and fname.endswith(".md"):
+                tid = fname.replace(".md", "")
+                fs_tasks[tid] = {"dir": f"archive/{month_dir}", "path": os.path.join(month_path, fname)}
+
+# ── Compare ──
+mismatches = []
+ok_count = 0
+no_events = []
+
+for tid, fs_info in sorted(fs_tasks.items()):
+    if tid not in task_states:
+        # Task exists on filesystem but has no events — pre-JSONL task
+        no_events.append(tid)
+        continue
+
+    state = task_states[tid]
+    expected_dir = OP_TO_DIR.get(state["last_op"])
+
+    if expected_dir is None:
+        # TASK_ARCHIVE — could be in completed/ or archive/
+        if fs_info["dir"].startswith("archive") or fs_info["dir"] == "completed":
+            ok_count += 1
+        else:
+            mismatches.append({
+                "task_id": tid,
+                "expected": "completed or archive",
+                "actual": fs_info["dir"],
+                "last_op": state["last_op"],
+                "last_ts": state["last_ts"]
+            })
+    elif fs_info["dir"] == expected_dir:
+        ok_count += 1
+    elif fs_info["dir"].startswith("archive") and expected_dir == "completed":
+        # Archived after completion — acceptable
+        ok_count += 1
+    else:
+        mismatches.append({
+            "task_id": tid,
+            "expected": expected_dir,
+            "actual": fs_info["dir"],
+            "last_op": state["last_op"],
+            "last_ts": state["last_ts"]
+        })
+
+# Check for events referencing tasks not on filesystem
+orphan_events = []
+for tid, state in sorted(task_states.items()):
+    if tid not in fs_tasks and state["last_op"] != "TASK_ARCHIVE":
+        orphan_events.append({
+            "task_id": tid,
+            "last_op": state["last_op"],
+            "last_ts": state["last_ts"]
+        })
+
+# ── Fix mode ──
+fixed = []
+if fix_mode and mismatches:
+    for mm in mismatches:
+        tid = mm["task_id"]
+        expected = mm["expected"]
+        if expected in ("queue", "active", "completed"):
+            src = fs_tasks[tid]["path"]
+            dst_dir = os.path.join(tasks_dir, expected)
+            dst = os.path.join(dst_dir, f"{tid}.md")
+            if os.path.exists(src) and os.path.isdir(dst_dir):
+                os.rename(src, dst)
+                fixed.append(tid)
+
+# ── Output ──
+result = {
+    "ok": ok_count,
+    "mismatches": mismatches,
+    "no_events": len(no_events),
+    "orphan_events": orphan_events,
+    "fixed": fixed
+}
+
+if json_out:
+    print(json.dumps(result, indent=2))
+else:
+    print(f"Task Reconciliation:")
+    print(f"  Consistent: {ok_count}")
+    print(f"  Pre-JSONL (no events): {len(no_events)}")
+    if mismatches:
+        print(f"  Mismatches ({len(mismatches)}):")
+        for mm in mismatches:
+            print(f"    {mm['task_id']}: expected={mm['expected']}, actual={mm['actual']} (last: {mm['last_op']} at {mm['last_ts'][:10]})")
+    else:
+        print(f"  Mismatches: 0")
+    if orphan_events:
+        print(f"  Orphan events ({len(orphan_events)}):")
+        for oe in orphan_events:
+            print(f"    {oe['task_id']}: {oe['last_op']} at {oe['last_ts'][:10]} — no file on filesystem")
+    if fixed:
+        print(f"  Fixed: {', '.join(fixed)}")
+
+PYEOF

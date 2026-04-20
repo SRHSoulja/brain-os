@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# brain-proof-status -- Show recent proof-of-execution runs and verdicts
+# Usage: brain-proof-status [--limit N]
+set -euo pipefail
+
+BRAIN="$HOME/gmgn-brain"
+RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
+INDEX_DIR="$BRAIN/brain/ops/proof-execution/index"
+LIMIT=10
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --limit) LIMIT="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ ! -d "$RUNS_DIR" ]]; then
+  echo "No proof runs found."
+  exit 0
+fi
+
+# Show latest pointer
+if [[ -f "$INDEX_DIR/latest.json" ]]; then
+  echo "=== Latest ==="
+  python3 -c "
+import json
+with open('$INDEX_DIR/latest.json') as f:
+    d = json.load(f)
+verdict = d.get('verdict', d.get('status', 'unknown'))
+sigfail = d.get('signature_failures', 0)
+print(f\"{verdict} | {d['run_id']} | task={d['task_id']} executor={d['executor']} sigfail={sigfail}\")
+"
+  echo ""
+fi
+
+# List recent summaries
+echo "=== Recent Runs (limit $LIMIT) ==="
+SUMMARIES=$(ls -t "$RUNS_DIR"/*.summary.json 2>/dev/null | head -"$LIMIT")
+if [[ -z "$SUMMARIES" ]]; then
+  echo "No summary files found."
+  exit 0
+fi
+
+python3 - "$LIMIT" <<'PYSTATUS' $SUMMARIES
+import json, sys
+
+limit = int(sys.argv[1])
+files = sys.argv[2:]
+
+for sf in files[:limit]:
+    try:
+        with open(sf) as f:
+            d = json.load(f)
+        verdict = d.get("verdict", "?")
+        run_id = d.get("run_id", "?")
+        task_id = d.get("task_id", "?")
+        executor = d.get("executor", "?")
+        signer = d.get("signer_id", "?")
+        cmds = d.get("commands_total", 0)
+        fails = d.get("commands_failed", 0)
+        violations = len(d.get("surface_violations", []))
+        receipts = d.get("receipts_total", 0)
+        chain = d.get("chain_valid", None)
+        tamper = int(bool(d.get("tamper_detected", False)))
+        replay = int(bool(d.get("replay_detected", False)))
+        sigfail = d.get("signature_failures", 0)
+        ehash = (d.get("evidence_hash") or "")[:12]
+        if chain is None:
+            chain_label = "legacy"
+        else:
+            chain_label = "ok" if chain else "broken"
+        print(f"  {verdict:5s} | {run_id} | task={task_id} exec={executor}/{signer} cmds={cmds} fail={fails} viol={violations} rcpts={receipts} chain={chain_label} tamper={tamper} replay={replay} sigfail={sigfail} hash={ehash}")
+    except Exception as e:
+        print(f"  ERROR | {sf}: {e}")
+PYSTATUS

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# brain-session-end -- Agent-agnostic session close logger
+# Usage: brain-session-end --agent <name> [--summary "what happened"]
+#
+# Logs SESSION_END to events.log + events.jsonl, computes session metrics
+# (duration, tasks completed, commits made), writes wiki session entry.
+# Any agent can call this. Does NOT run brain-meditate (that's Claude-specific).
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+EVENTS_LOG="$BRAIN/brain/ops/events.log"
+EVENTS_JSONL="$BRAIN/brain/ops/events.jsonl"
+SESSION_FILE="$BRAIN/brain/ops/.active-session.json"
+WIKI_DIR="$BRAIN/brain/wiki/sessions"
+
+AGENT=""
+SUMMARY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="$2"; shift 2 ;;
+    --summary) SUMMARY="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: brain-session-end --agent <name> [--summary \"what happened\"]"
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$AGENT" ]]; then
+  echo "Error: --agent <name> required" >&2
+  exit 1
+fi
+
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EVT_ID="evt-$(date +%Y%m%d-%H%M%S)-$(head -c3 /dev/urandom | xxd -p)"
+HOSTNAME=$(hostname -s 2>/dev/null || echo "unknown")
+
+# Read session start marker
+SESSION_ID=""
+STARTED_AT=""
+TASKS_Q_START=0
+TASKS_A_START=0
+TASKS_C_START=0
+COMMITS_START=0
+
+if [[ -f "$SESSION_FILE" ]]; then
+  SESSION_ID=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('session_id',''))" 2>/dev/null || echo "")
+  STARTED_AT=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('started_at',''))" 2>/dev/null || echo "")
+  TASKS_Q_START=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('tasks_at_start',{}).get('queued',0))" 2>/dev/null || echo "0")
+  TASKS_A_START=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('tasks_at_start',{}).get('active',0))" 2>/dev/null || echo "0")
+  TASKS_C_START=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('tasks_at_start',{}).get('completed',0))" 2>/dev/null || echo "0")
+  COMMITS_START=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('commits_at_start',0))" 2>/dev/null || echo "0")
+fi
+
+if [[ -f "$SESSION_FILE" ]]; then
+  ACTUAL_SESS_AGENT=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('agent',''))" 2>/dev/null || echo "")
+  if [[ "$ACTUAL_SESS_AGENT" != "$AGENT" ]]; then
+    echo "[warn] Active session belongs to $ACTUAL_SESS_AGENT, but closing for $AGENT. Ignoring stale metadata."
+    SESSION_ID=""
+    STARTED_AT=""
+    TASKS_C_START=0
+    COMMITS_START=0
+  fi
+fi
+
+if [[ -z "$SESSION_ID" ]]; then
+  SESSION_ID="sess-$(date +%Y%m%d-%H%M%S)-${AGENT}-untracked"
+  echo "[warn] No active session marker found for $AGENT. Using generated ID."
+fi
+
+# Compute current state
+QUEUED=$(find "$BRAIN/brain/ops/tasks/queue/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+ACTIVE=$(find "$BRAIN/brain/ops/tasks/active/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+COMPLETED=$(find "$BRAIN/brain/ops/tasks/completed/" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l || echo 0)
+COMMITS_NOW=$(cd "$BRAIN" && git rev-list --count HEAD 2>/dev/null || echo 0)
+
+# Compute deltas
+TASKS_COMPLETED_DELTA=$((COMPLETED - TASKS_C_START))
+COMMITS_DELTA=$((COMMITS_NOW - COMMITS_START))
+
+# Compute duration
+DURATION_MIN=""
+if [[ -n "$STARTED_AT" ]]; then
+  DURATION_MIN=$(python3 -c "
+from datetime import datetime, timezone
+start = datetime.fromisoformat('$STARTED_AT'.replace('Z','+00:00'))
+end = datetime.fromisoformat('$TS'.replace('Z','+00:00'))
+print(int((end - start).total_seconds() / 60))
+" 2>/dev/null || echo "")
+fi
+
+# Log to events.log
+DURATION_STR=""
+[[ -n "$DURATION_MIN" ]] && DURATION_STR=" duration=${DURATION_MIN}min"
+echo "$TS SESSION_END $AGENT tasks_done=${TASKS_COMPLETED_DELTA} commits=${COMMITS_DELTA}${DURATION_STR}" >> "$EVENTS_LOG"
+
+# Log to events.jsonl
+python3 -c "
+import json
+evt = {
+    'event_id': '$EVT_ID',
+    'ts': '$TS',
+    'source': 'local',
+    'source_host': '$HOSTNAME',
+    'op': 'SESSION_END',
+    'entity_id': '$SESSION_ID',
+    'surface': 'brain/ops/.active-session.json',
+    'meta': {
+        'agent': '$AGENT',
+        'started_at': '$STARTED_AT' or None,
+        'duration_min': ${DURATION_MIN:-0},
+        'tasks_completed': $TASKS_COMPLETED_DELTA,
+        'commits': $COMMITS_DELTA,
+        'tasks_queued': $QUEUED,
+        'tasks_active': $ACTIVE,
+        'tasks_completed_total': $COMPLETED,
+        'summary': '''$SUMMARY''' if '''$SUMMARY''' else None
+    }
+}
+print(json.dumps(evt, separators=(',', ':')))
+" >> "$EVENTS_JSONL"
+
+# Write wiki session entry
+mkdir -p "$WIKI_DIR"
+DATE_SLUG=$(date +%Y-%m-%d-%H%M)
+WIKI_FILE="$WIKI_DIR/${DATE_SLUG}-${AGENT}-session.md"
+
+cat > "$WIKI_FILE" <<EOF
+---
+title: "$AGENT session - $(date +%Y-%m-%d)"
+type: "session-digest"
+session_id: "$SESSION_ID"
+agent: "$AGENT"
+date: "$(date +%Y-%m-%d)"
+duration_min: ${DURATION_MIN:-0}
+tasks_completed: $TASKS_COMPLETED_DELTA
+commits: $COMMITS_DELTA
+---
+
+# $AGENT session - $(date '+%Y-%m-%d %H:%M')
+
+**Agent:** $AGENT
+**Session:** \`$SESSION_ID\`
+**Duration:** ${DURATION_MIN:-unknown} minutes
+**Tasks completed:** $TASKS_COMPLETED_DELTA
+**Commits:** $COMMITS_DELTA
+**Queue at end:** $QUEUED queued, $ACTIVE active, $COMPLETED completed
+
+## Summary
+
+${SUMMARY:-No summary provided. The agent should describe what was accomplished.}
+EOF
+
+# Clean up session marker
+rm -f "$SESSION_FILE"
+
+echo "session-end: $SESSION_ID"
+echo "  duration: ${DURATION_MIN:-?}min | tasks: +$TASKS_COMPLETED_DELTA | commits: +$COMMITS_DELTA"
+echo "  wiki: $(basename "$WIKI_FILE")"

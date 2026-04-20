@@ -1,0 +1,1018 @@
+#!/usr/bin/env bash
+# brain-subagent-dispatch -- Composable cross-agent dispatch with skill drawer
+# Usage: brain-subagent-dispatch [--agent <target>] --question "..." [options]
+#
+# Routing priority: --agent (explicit) > --profile > --auto-profile > auto-select by --op
+#
+# Skill drawer: --skills and --bundle layer behavior/model/tool add-ons on top of any profile.
+# Profile chaining: --chain p1,p2,p3 runs profiles in sequence, piping output forward.
+# Browse: --browse shows all profiles and skills without dispatching.
+#
+# Supported targets: claude-code, codex, gemini
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/bin"
+TARGET=""
+PROFILE=""
+CHAIN_PROFILES=""      # comma-separated profile list for --chain
+SKILLS_RAW=""          # comma-separated skill/bundle ids for --skills
+BUNDLE_RAW=""          # single bundle id for --bundle
+OPERATION="execution"
+QUESTION=""
+FILES=()
+TASK_ID=""
+TIMEOUT=120
+TIMEOUT_EXPLICIT=false
+DRY_RUN=false
+BROWSE=false
+AUTO_PROFILE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent)        TARGET="$2"; shift 2 ;;
+    --profile)      PROFILE="$2"; shift 2 ;;
+    --chain)        CHAIN_PROFILES="$2"; shift 2 ;;
+    --skills)       SKILLS_RAW="$2"; shift 2 ;;
+    --bundle)       BUNDLE_RAW="$2"; shift 2 ;;
+    --op)           OPERATION="$2"; shift 2 ;;
+    --question)     QUESTION="$2"; shift 2 ;;
+    --files)        shift; while [[ $# -gt 0 && "$1" != --* ]]; do FILES+=("$1"); shift; done ;;
+    --task)         TASK_ID="$2"; shift 2 ;;
+    --timeout)      TIMEOUT="$2"; TIMEOUT_EXPLICIT=true; shift 2 ;;
+    --dry-run)      DRY_RUN=true; shift ;;
+    --browse)       BROWSE=true; shift ;;
+    --auto-profile) AUTO_PROFILE=true; shift ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: brain-subagent-dispatch [--agent <target>] --question "..." [options]
+
+  --agent <name>        Target agent (claude-code, codex, gemini). Omit for auto-selection.
+  --profile <id>        Execution profile (brain/ops/execution-profiles.json).
+  --chain p1,p2,p3      Run profiles in sequence; each step receives prior output.
+  --auto-profile        Auto-select profile from task's task_type (requires --task).
+  --skills s1,s2        Comma-separated skills or bundle ids to layer on the profile.
+  --bundle <id>         Single bundle shorthand (sugar for --skills with a named set).
+  --op <operation>      Operation type for auto-selection (default: execution).
+  --question "..."      The question to ask (required unless --browse).
+  --files f1 f2 ...     Files to include as context (paths relative to brain).
+  --task <TASK-ID>      Task context via brain-context-pack --subagent.
+  --timeout <sec>       Response timeout per step (default: 120).
+  --dry-run             Show prompt without sending.
+  --browse              List all profiles and skills; exit without dispatching.
+
+Skill drawer: brain/ops/skill-registry.json defines skills and bundles.
+Profile chaining feeds each step's result as context into the next step.
+HELP
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ── Browse mode (early exit) ─────────────────────────────────────────
+
+_PROFILES="$BRAIN/brain/ops/execution-profiles.json"
+_SKILL_REGISTRY="$BRAIN/brain/ops/skill-registry.json"
+_REGISTRY="$BRAIN/brain/ops/capability-registry.json"
+
+if $BROWSE; then
+  python3 - "$_PROFILES" "$_SKILL_REGISTRY" <<'PYBROWSE'
+import json, sys
+
+profiles_path = sys.argv[1]
+skills_path   = sys.argv[2]
+
+profiles = json.load(open(profiles_path)).get("profiles", []) if __import__("os").path.exists(profiles_path) else []
+skill_data = json.load(open(skills_path)) if __import__("os").path.exists(skills_path) else {}
+skills  = skill_data.get("skills", [])
+bundles = skill_data.get("bundles", [])
+
+print("\n=== Execution Profiles (dressing room) ===\n")
+print(f"{'Profile':<28} {'Target':<14} {'Trigger / Use'}")
+print("-" * 78)
+for p in profiles:
+    target = ", ".join(p.get("preferred_runtimes", []))
+    notes  = p.get("notes", p.get("description", ""))[:50]
+    print(f"{p['profile_id']:<28} {target:<14} {notes}")
+
+print("\n=== Skills (skill drawer) ===\n")
+print(f"{'Skill':<22} {'Type':<18} {'Gate':<28} Description")
+print("-" * 90)
+for s in skills:
+    gate = s.get("gate", "always_available")[:26]
+    desc = s.get("description", "")[:40]
+    print(f"{s['skill_id']:<22} {s['type']:<18} {gate:<28} {desc}")
+
+print("\n=== Bundles ===\n")
+for b in bundles:
+    skills_list = ", ".join(b["skills"])
+    print(f"  {b['bundle_id']:<22} = {skills_list}")
+    print(f"    {b.get('description','')}")
+print()
+PYBROWSE
+  exit 0
+fi
+
+# ── Validate ─────────────────────────────────────────────────────────
+
+if [[ -z "$QUESTION" && -z "$CHAIN_PROFILES" ]]; then
+  echo "Error: --question required (or use --chain for profile pipeline)" >&2
+  exit 1
+fi
+
+# ── Seat context (for logging + auto-selection exclusion) ─────────
+CURRENT_AGENT=""
+if [[ -f "$BRAIN/brain/ops/.brain-active-seat.json" ]]; then
+  CURRENT_AGENT=$(python3 -c "import json; print(json.load(open('$BRAIN/brain/ops/.brain-active-seat.json')).get('assistant',''))" 2>/dev/null || true)
+fi
+
+# ── Chain mode: expand --chain into a sequential dispatch loop ───────
+# If --chain p1,p2,p3 is given, iterate: dispatch p1, pipe result as
+# "## Previous Step" context into p2, etc. Print final step result.
+if [[ -n "$CHAIN_PROFILES" ]]; then
+  IFS=',' read -ra _CHAIN_LIST <<< "$CHAIN_PROFILES"
+  _CHAIN_PRIOR=""
+  _CHAIN_STEP=0
+  for _CHAIN_PROFILE in "${_CHAIN_LIST[@]}"; do
+    _CHAIN_STEP=$((_CHAIN_STEP + 1))
+    _CHAIN_Q="$QUESTION"
+    if [[ -n "$_CHAIN_PRIOR" ]]; then
+      _CHAIN_Q="$QUESTION
+
+## Previous Step Results (step $((_CHAIN_STEP - 1)) — profile: ${_CHAIN_LIST[_CHAIN_STEP - 2]})
+$_CHAIN_PRIOR
+
+Apply the above findings as context for your analysis."
+    fi
+    echo "[dispatch] chain step $_CHAIN_STEP/${#_CHAIN_LIST[@]}: profile=$_CHAIN_PROFILE" >&2
+    # Build flags for recursive call (preserve --skills, --task, --files, --dry-run)
+    _CHAIN_ARGS=(--profile "$_CHAIN_PROFILE" --question "$_CHAIN_Q")
+    [[ -n "$TASK_ID" ]]    && _CHAIN_ARGS+=(--task "$TASK_ID")
+    [[ -n "$SKILLS_RAW" ]] && _CHAIN_ARGS+=(--skills "$SKILLS_RAW")
+    [[ -n "$BUNDLE_RAW" ]] && _CHAIN_ARGS+=(--bundle "$BUNDLE_RAW")
+    [[ ${#FILES[@]} -gt 0 ]] && _CHAIN_ARGS+=(--files "${FILES[@]}")
+    $DRY_RUN && _CHAIN_ARGS+=(--dry-run)
+    _CHAIN_OUT=$(BRAIN_DISPATCH_ACTIVE="" "$0" "${_CHAIN_ARGS[@]}" 2>/dev/null || true)
+    # Extract the result field for piping; cap at 3000 chars to prevent compounding token growth
+    _CHAIN_PRIOR=$(echo "$_CHAIN_OUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null || echo "$_CHAIN_OUT")
+    _CHAIN_PRIOR="${_CHAIN_PRIOR:0:3000}"
+    if $DRY_RUN; then echo "$_CHAIN_OUT"; fi
+  done
+  # Emit final step as the output
+  if ! $DRY_RUN; then
+    python3 -c "
+import json, sys
+print(json.dumps({'chain': '$CHAIN_PROFILES', 'steps': ${#_CHAIN_LIST[@]}, 'result': sys.argv[1]}, ensure_ascii=False, indent=2))
+" "$_CHAIN_PRIOR"
+  fi
+  exit 0
+fi
+
+# ── Auto-profile: resolve profile from task's task_type ──────────────
+if $AUTO_PROFILE && [[ -n "$TASK_ID" && -z "$PROFILE" ]]; then
+  PROFILE=$(python3 - "$TASK_ID" "$BRAIN" "$_PROFILES" <<'PYAUTO'
+import json, os, sys, re
+
+task_id  = sys.argv[1]
+brain    = sys.argv[2]
+prof_path = sys.argv[3]
+
+# Find task file
+task_file = None
+for subdir in ["active", "queue", "completed"]:
+    candidate = os.path.join(brain, "brain/ops/tasks", subdir, f"{task_id}.md")
+    if os.path.exists(candidate):
+        task_file = candidate
+        break
+
+if not task_file:
+    sys.exit(1)
+
+content = open(task_file).read()
+# Extract task_type from frontmatter
+m = re.search(r'^task_type:\s*["\']?(\S+?)["\']?\s*$', content, re.MULTILINE)
+if not m:
+    sys.exit(1)
+
+task_type = m.group(1).strip('"\'')
+profiles = json.load(open(prof_path)).get("profiles", [])
+
+# Find profiles that list this task_type
+matches = [p["profile_id"] for p in profiles if task_type in p.get("task_types", [])]
+if len(matches) == 1:
+    print(matches[0])
+elif len(matches) > 1:
+    # Prefer non-stub profiles (have preamble_file) first
+    with_preamble = [m for m in matches if any(p.get("preamble_file") for p in profiles if p["profile_id"] == m)]
+    print(with_preamble[0] if with_preamble else matches[0])
+else:
+    sys.exit(1)
+PYAUTO
+  ) || true
+  [[ -n "$PROFILE" ]] && echo "[dispatch] auto-profile: task_type match → profile=$PROFILE" >&2
+fi
+
+# ── Skill resolution ──────────────────────────────────────────────────
+# Expand bundle ids, resolve skills, collect prompt addenda and model overrides.
+SKILL_ADDENDA=""
+SKILL_MODEL_OVERRIDE=""
+SKILL_TARGET_OVERRIDE=""
+SKILL_FORCE_TARGET=""
+
+if [[ -n "$SKILLS_RAW" || -n "$BUNDLE_RAW" ]]; then
+  _SKILLS_INPUT="${SKILLS_RAW}${SKILLS_RAW:+,}${BUNDLE_RAW}"
+  _SKILL_JSON=$(python3 - "$_SKILLS_INPUT" "$_SKILL_REGISTRY" "$BRAIN" <<'PYSKILLS'
+import json, os, sys, subprocess
+
+skills_input = sys.argv[1]   # comma-separated skill/bundle ids
+registry_path = sys.argv[2]
+brain = sys.argv[3]
+
+if not os.path.exists(registry_path):
+    print(json.dumps({"addenda": "", "model": "", "target": ""}))
+    sys.exit(0)
+
+reg = json.load(open(registry_path))
+skill_map  = {s["skill_id"]: s for s in reg.get("skills", [])}
+bundle_map = {b["bundle_id"]: b for b in reg.get("bundles", [])}
+
+# Expand input: bundle ids → skill lists, skill ids → direct
+resolved_ids = []
+for raw_id in skills_input.split(","):
+    raw_id = raw_id.strip()
+    if not raw_id:
+        continue
+    if raw_id in bundle_map:
+        resolved_ids.extend(bundle_map[raw_id]["skills"])
+    elif raw_id in skill_map:
+        resolved_ids.append(raw_id)
+    else:
+        print(f"[skills] WARN: unknown skill/bundle '{raw_id}'", file=sys.stderr)
+
+def gate_ok(skill):
+    gate = skill.get("gate", "always_available")
+    if gate == "always_available":
+        return True
+    if gate.startswith("check_model_registry:"):
+        model_id = gate.split(":", 1)[1]
+        reg_path = os.path.join(brain, "brain/ops/model-registry.json")
+        if os.path.exists(reg_path):
+            mreg = json.load(open(reg_path))
+            for m in mreg.get("models", []):
+                if m.get("model_id") == model_id and m.get("auto_dispatch_forbidden"):
+                    print(f"[skills] GATE BLOCKED: {skill['skill_id']} — model {model_id} is auto_dispatch_forbidden", file=sys.stderr)
+                    return False
+        return True
+    if gate.startswith("check_capability:"):
+        cap_id = gate.split(":", 1)[1].replace("-", "_")
+        try:
+            cap_reg = json.load(open(os.path.join(brain, "brain/ops/capability-registry.json")))
+            cap = cap_reg.get("capabilities", {}).get(cap_id, {})
+            cmd = cap.get("dispatch_health_check") or cap.get("health_check", "true")
+            r = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+            if r.returncode != 0:
+                print(f"[skills] GATE BLOCKED: {skill['skill_id']} — capability {cap_id} not healthy", file=sys.stderr)
+                return False
+        except Exception as e:
+            print(f"[skills] GATE WARN: {skill['skill_id']} capability check failed: {e}", file=sys.stderr)
+        return True
+    if gate.startswith("check_mcp_health:"):
+        # Best-effort: just warn, don't hard-block
+        server = gate.split(":", 1)[1]
+        print(f"[skills] GATE INFO: {skill['skill_id']} requires MCP server '{server}' — verify it is healthy", file=sys.stderr)
+        return True
+    return True  # unknown gate type — allow
+
+addenda = []
+model_override = ""
+target_override = ""
+force_target = False
+model_override_skill = ""  # track which skill set the model (for conflict detection)
+
+for sid in resolved_ids:
+    if sid not in skill_map:
+        continue
+    skill = skill_map[sid]
+    if not gate_ok(skill):
+        continue
+    if skill.get("type") == "model_override":
+        new_model = skill.get("model", "")
+        if model_override and model_override != new_model:
+            print(f"[skills] CONFLICT: '{model_override_skill}' set model={model_override}, '{sid}' wants model={new_model} — last wins", file=sys.stderr)
+        model_override = new_model
+        model_override_skill = sid
+        target_override = skill.get("target", "")
+        if target_override:
+            force_target = True  # model skills must land on their required agent
+    elif skill.get("type") == "routing_override":
+        new_target = skill.get("override_target", "")
+        if force_target and new_target and new_target != target_override:
+            print(f"[skills] CONFLICT: model skill already forced target={target_override}, routing_override wants {new_target} — model skill wins", file=sys.stderr)
+        elif new_target:
+            target_override = new_target
+            force_target = True  # explicit routing override beats profile routing
+        if not model_override:
+            model_override = skill.get("override_model", "")
+    if skill.get("prompt_addendum"):
+        addenda.append(skill["prompt_addendum"])
+
+print(json.dumps({"addenda": "\n\n".join(addenda), "model": model_override, "target": target_override, "force_target": force_target}))
+PYSKILLS
+  )
+  SKILL_ADDENDA=$(echo "$_SKILL_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['addenda'])" 2>/dev/null || true)
+  SKILL_MODEL_OVERRIDE=$(echo "$_SKILL_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['model'])" 2>/dev/null || true)
+  SKILL_TARGET_OVERRIDE=$(echo "$_SKILL_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['target'])" 2>/dev/null || true)
+  SKILL_FORCE_TARGET=$(echo "$_SKILL_JSON" | python3 -c "import json,sys; print('1' if json.load(sys.stdin).get('force_target') else '')" 2>/dev/null || true)
+fi
+
+# ── Profile resolution (if --profile given and no explicit --agent) ──
+# Reads brain/ops/execution-profiles.json, finds the profile, tries each
+# preferred_runtime in order (cheapest-first), picks first healthy one.
+# Falls through to auto-selection if no healthy preferred runtime found.
+ROUTE_METHOD=""
+ROUTE_REASON=""
+
+if [[ -n "$PROFILE" && -z "$TARGET" ]]; then
+  if [[ ! -f "$_PROFILES" ]]; then
+    echo "[dispatch] WARN: --profile $PROFILE given but execution-profiles.json not found — falling back to auto-selection" >&2
+  else
+    _PROFILE_TARGET=$(python3 - "$PROFILE" "$_PROFILES" "$_REGISTRY" <<'PYPROFILE'
+import json, subprocess, sys, time
+
+profile_id   = sys.argv[1]
+profiles_path = sys.argv[2]
+registry_path = sys.argv[3]
+
+HEALTH_CACHE = "/tmp/brain-capability-health.json"
+HEALTH_TTL   = 300
+
+def is_healthy(runtime):
+    cid = runtime.replace("-", "_")
+    # Disabled capabilities are never healthy — short-circuit before cache + live check.
+    try:
+        reg_for_enabled = json.load(open(registry_path))
+        cap_for_enabled = reg_for_enabled["capabilities"].get(cid, {})
+        if cap_for_enabled.get("enabled", True) is False:
+            print(f"[dispatch] SKIP: {runtime} disabled in capability-registry", file=sys.stderr)
+            return False
+    except Exception:
+        pass
+    # Check cache next
+    try:
+        cache = json.load(open(HEALTH_CACHE))
+        entry = cache.get(cid, {})
+        if entry.get("ts", 0) > time.time() - HEALTH_TTL:
+            return entry["status"] == "available"
+    except Exception:
+        pass
+    # Live check via dispatch_health_check or health_check
+    try:
+        reg = json.load(open(registry_path))
+        cap = reg["capabilities"].get(cid, {})
+        cmd = cap.get("dispatch_health_check") or cap.get("health_check", "true")
+        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+try:
+    data = json.load(open(profiles_path))
+except Exception as e:
+    print(f"parse-error:{e}", file=sys.stderr)
+    sys.exit(1)
+
+profile = next((p for p in data.get("profiles", []) if p["profile_id"] == profile_id), None)
+if not profile:
+    known = [p["profile_id"] for p in data.get("profiles", [])]
+    print(f"unknown-profile:{profile_id} known={known}", file=sys.stderr)
+    sys.exit(1)
+
+for runtime in profile.get("preferred_runtimes", []):
+    if is_healthy(runtime):
+        print(runtime)
+        sys.exit(0)
+
+# No healthy preferred runtime — signal caller to fall through to auto-select
+sys.exit(2)
+PYPROFILE
+    ) || _PROFILE_EXIT=$?
+
+    if [[ -n "$_PROFILE_TARGET" ]]; then
+      TARGET="$_PROFILE_TARGET"
+      ROUTE_METHOD="profile"
+      ROUTE_REASON="profile=$PROFILE preferred runtime=$TARGET"
+    elif [[ "${_PROFILE_EXIT:-0}" -eq 2 ]]; then
+      echo "[dispatch] WARN: profile=$PROFILE has no healthy preferred runtime — falling back to auto-selection" >&2
+    fi
+    # Exit code 1 = unknown profile or parse error — already printed to stderr, fall through
+  fi
+fi
+
+# ── Normalize explicit target or auto-select ──────────────────────
+if [[ -n "$TARGET" && "$ROUTE_METHOD" != "profile" ]]; then
+  # Explicit --agent override — normalize and use directly
+  case "$TARGET" in
+    claude|claude-code) TARGET="claude-code" ;;
+    codex)              TARGET="codex" ;;
+    gemini|gemini-cli)  TARGET="gemini" ;;
+    ollama)             TARGET="ollama" ;;
+    *) echo "Error: unknown agent '$TARGET'" >&2; exit 1 ;;
+  esac
+  ROUTE_METHOD="explicit"
+  ROUTE_REASON="caller specified --agent $TARGET"
+elif [[ -n "$TARGET" && "$ROUTE_METHOD" == "profile" ]]; then
+  # Profile-resolved target — normalize without overwriting ROUTE_METHOD
+  case "$TARGET" in
+    claude|claude-code) TARGET="claude-code" ;;
+    codex)              TARGET="codex" ;;
+    gemini|gemini-cli)  TARGET="gemini" ;;
+    ollama)             TARGET="ollama" ;;
+    *) echo "Error: profile resolved unknown agent '$TARGET'" >&2; exit 1 ;;
+  esac
+else
+  # Auto-select: cheapest healthy non-advisory remote agent supporting $OPERATION.
+  # Excludes: advisory_only=true (local LLMs), type=deterministic, current seated agent.
+  # Registry IDs use underscores; dispatch targets use hyphens — mapped explicitly below.
+  _SELECT_OUT=$("$TOOLS/brain-capability" select --op "$OPERATION" 2>/dev/null || true)
+  if [[ -z "$_SELECT_OUT" ]]; then
+    echo "[dispatch] ERROR: capability registry unavailable for auto-selection (op=$OPERATION)" >&2
+    exit 1
+  fi
+
+  TARGET=$(python3 - "$CURRENT_AGENT" "$OPERATION" <<PYROUTE
+import json, sys
+
+# registry-id → dispatch target name
+ID_MAP = {"claude_code": "claude-code", "codex": "codex", "gemini": "gemini"}
+
+current_agent = sys.argv[1]   # seated agent (may be empty)
+operation     = sys.argv[2]
+
+# Map current agent name back to registry ID for exclusion
+REVERSE_MAP = {v: k for k, v in ID_MAP.items()}
+exclude_id = REVERSE_MAP.get(current_agent, "")
+
+try:
+    data = json.loads("""${_SELECT_OUT}""")
+except Exception as e:
+    print(f"parse-error:{e}", file=sys.stderr)
+    sys.exit(1)
+
+for c in data.get("candidates", []):
+    cid = c["id"]
+    if cid == exclude_id:
+        continue   # skip self
+    if cid not in ID_MAP:
+        continue   # not a dispatchable remote agent
+    if c.get("advisory_only", False):
+        continue   # local model, can't dispatch to
+    # First match is cheapest healthy (already sorted by brain-capability select)
+    print(ID_MAP[cid])
+    sys.exit(0)
+
+# Nothing found
+sys.exit(2)
+PYROUTE
+  ) || _SELECT_EXIT=$?
+
+  if [[ -z "$TARGET" ]]; then
+    _SELECT_EXIT="${_SELECT_EXIT:-2}"
+    # Build reason from degraded list
+    _DEGRADED=$(python3 -c "
+import json, sys
+try:
+    d = json.loads('''${_SELECT_OUT}''')
+    degraded = [x['id'] for x in d.get('degraded', [])]
+    print('degraded: ' + ', '.join(degraded) if degraded else 'none registered')
+except:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+    echo "[dispatch] ERROR: no healthy capable agent for op=$OPERATION ($_DEGRADED)" >&2
+    TS_NOROUTE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "$TS_NOROUTE SUBAGENT_DISPATCH_NOROUTE op=$OPERATION agent=$CURRENT_AGENT degraded=$_DEGRADED" >> "$BRAIN/brain/ops/events.log"
+    exit 1
+  fi
+
+  ROUTE_METHOD="auto"
+  ROUTE_REASON="cheapest healthy for op=$OPERATION"
+fi
+
+# ── Route-selection log ──────────────────────────────────────────
+echo "[dispatch] route: target=$TARGET method=$ROUTE_METHOD reason=\"$ROUTE_REASON\" op=$OPERATION"
+
+# ── Ollama: advisory-op guard (early, runs before dry-run) ───────
+# Planning/architecture/task_generation must never route to Ollama.
+# This guard runs before dry-run so --dry-run also surfaces the error.
+if [[ "$TARGET" == "ollama" ]]; then
+  _ADVISORY_OPS="planning architecture task_generation governance"
+  for _ADV_OP in $_ADVISORY_OPS; do
+    if [[ "$OPERATION" == "$_ADV_OP" ]]; then
+      echo "[dispatch] BLOCK: operation '$OPERATION' is advisory/planning — Ollama cannot serve it" >&2
+      exit 1
+    fi
+  done
+fi
+
+# ── Head-seat contention detection ───────────────────────────────
+# If the head seat is gemini and we are dispatching to gemini, warn/block
+# per brain/governance/gemini-seat-guidance.md.
+if [[ "$CURRENT_AGENT" == "gemini" && "$TARGET" == "gemini" ]]; then
+  echo "[dispatch] BLOCK: head-seat contention detected (gemini-to-gemini)" >&2
+  echo "[dispatch] Refer to: brain/governance/gemini-seat-guidance.md" >&2
+  TS_CONTENTION=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  echo "$TS_CONTENTION SUBAGENT_DISPATCH_BLOCKED reason=head_seat_contention target=gemini agent=gemini" >> "$BRAIN/brain/ops/events.log"
+  exit 1
+fi
+
+# ── Recursive dispatch detection via chain env var ───────────────
+# BRAIN_DISPATCH_CHAIN is set on every spawn so subprocesses can detect loops.
+# A fresh same-family dispatch from an active session is valid (spawns new process).
+# A same-family dispatch FROM WITHIN a spawned subprocess is a recursive loop — block it.
+#
+# Cases:
+#   chain empty  + any target   -> first dispatch, always allowed
+#   chain set    + target NOT in chain -> cross-family hop, allowed
+#   chain set    + target IN chain     -> recursive loop, BLOCK
+_DISPATCH_CHAIN="${BRAIN_DISPATCH_CHAIN:-}"
+if [[ -n "$_DISPATCH_CHAIN" ]]; then
+  # We are inside a subprocess already spawned by brain-subagent-dispatch
+  if echo ":${_DISPATCH_CHAIN}:" | grep -q ":${TARGET}:"; then
+    echo "[dispatch] BLOCK: recursive self-dispatch — $TARGET already in chain ($_DISPATCH_CHAIN)" >&2
+    TS_BLOCK=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "$TS_BLOCK SUBAGENT_DISPATCH_BLOCKED reason=recursive target=$TARGET chain=$_DISPATCH_CHAIN agent=$CURRENT_AGENT" >> "$BRAIN/brain/ops/events.log"
+    exit 1
+  fi
+fi
+
+# ── Capability health check (explicit target only) ───────────────
+# Auto-routed targets are already confirmed healthy by brain-capability select.
+# Explicit targets get a targeted health check here; warn but proceed (CLI may
+# still be available even if the health probe fails).
+if [[ "$ROUTE_METHOD" == "explicit" ]]; then
+  # Map dispatch name → registry ID for health lookup
+  case "$TARGET" in
+    claude-code) _REG_ID="claude_code" ;;
+    codex)       _REG_ID="codex" ;;
+    gemini)      _REG_ID="gemini" ;;
+    *)           _REG_ID="$TARGET" ;;
+  esac
+  HEALTH=$("$TOOLS/brain-capability" select --op "$OPERATION" 2>/dev/null | python3 -c "
+import json, sys
+d = json.loads(sys.stdin.read())
+for c in d.get('candidates', []) + d.get('degraded', []):
+    if c['id'] == '$_REG_ID':
+        print('healthy' if c.get('healthy', True) else 'degraded')
+        break
+else:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+  if [[ "$HEALTH" == "degraded" ]]; then
+    echo "[dispatch] WARN: $TARGET health check failed (op=$OPERATION) — proceeding, CLI may still respond" >&2
+  fi
+fi
+
+# ── Build prompt ─────────────────────────────────────────────────────
+
+# Resolve preamble and context_tier via brain-profile-meta (canonical tool)
+PREAMBLE_CONTENT=""
+CONTEXT_TIER=""
+if [[ -n "$PROFILE" ]]; then
+  PREAMBLE_FILE=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field preamble_file 2>/dev/null || true)
+  CONTEXT_TIER=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field context_tier 2>/dev/null || true)
+  if [[ -n "$PREAMBLE_FILE" ]]; then
+    PREAMBLE_PATH="$BRAIN/$PREAMBLE_FILE"
+    [[ -f "$PREAMBLE_PATH" ]] && PREAMBLE_CONTENT=$(head -c 4096 "$PREAMBLE_PATH")
+  fi
+fi
+
+# Fallback: derive context_tier from task priority via brain-task-meta
+if [[ -z "$CONTEXT_TIER" && -n "$TASK_ID" ]]; then
+  CONTEXT_TIER=$("$TOOLS/brain-task-meta" "$TASK_ID" --tier 2>/dev/null || echo "standard")
+fi
+CONTEXT_TIER="${CONTEXT_TIER:-standard}"
+
+# Per-profile timeout: profile's timeout_seconds overrides 120s default unless caller passed --timeout
+if [[ -n "$PROFILE" && -f "$_PROFILES" ]] && ! $TIMEOUT_EXPLICIT; then
+  _PROFILE_TIMEOUT=$(python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+p = next((p for p in data.get('profiles', []) if p['profile_id'] == sys.argv[2]), None)
+print(p.get('timeout_seconds', '') if p else '')
+" "$_PROFILES" "$PROFILE" 2>/dev/null || true)
+  if [[ -n "$_PROFILE_TIMEOUT" && "$_PROFILE_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    TIMEOUT="$_PROFILE_TIMEOUT"
+    echo "[dispatch] profile timeout: ${TIMEOUT}s (profile=$PROFILE)" >&2
+  fi
+fi
+
+if [[ -n "$PREAMBLE_CONTENT" ]]; then
+  PROMPT="$PREAMBLE_CONTENT
+
+"
+else
+  PROMPT="You are answering a sub-agent query from the Brain system. Be concise and direct. Answer the question below.
+
+"
+fi
+
+# Tier → token budget and per-item cap
+case "${CONTEXT_TIER:-standard}" in
+  minimal)  _CTX_BUDGET=1500; _CTX_CAP=1500; _ITEM_CAP=1500 ;;
+  full)     _CTX_BUDGET=8000; _CTX_CAP=8000; _ITEM_CAP=2000 ;;
+  *)        _CTX_BUDGET=3000; _CTX_CAP=6000; _ITEM_CAP=2000 ;;  # standard
+esac
+
+# Add task context if provided — budget scales with context tier
+if [[ -n "$TASK_ID" ]]; then
+  CONTEXT=$("$TOOLS/brain-context-pack" --task "$TASK_ID" --subagent \
+    --question "$QUESTION" --budget "$_CTX_BUDGET" 2>/dev/null || true)
+  if [[ -n "$CONTEXT" ]]; then
+    CONTEXT_BLOCK=$(echo "$CONTEXT" | python3 -c "
+import json, sys
+d = json.loads(sys.stdin.read())
+parts = []
+total = 0
+CAP = int('$_CTX_CAP')
+ITEM_CAP = int('$_ITEM_CAP')
+for item in d.get('retrieved_context', []):
+    if item.get('reason') == 'subagent question':
+        continue
+    content = (item.get('content') or '').strip()
+    if not content:
+        continue
+    source = item.get('source', '?')
+    key = item.get('key', '')
+    label = f'{source}/{key}' if key else source
+    snippet = content[:ITEM_CAP]
+    entry = f'### {label}\n{snippet}'
+    if total + len(entry) > CAP:
+        break
+    parts.append(entry)
+    total += len(entry)
+if parts:
+    print('\n\n'.join(parts))
+" 2>/dev/null || true)
+    if [[ -n "$CONTEXT_BLOCK" ]]; then
+      PROMPT+="## Task & Retrieved Context
+$CONTEXT_BLOCK
+
+"
+    fi
+  fi
+
+  # Full tier: also inject relevant memory digest + operational state
+  if [[ "${CONTEXT_TIER:-standard}" == "full" ]]; then
+    _DIGEST=$("$TOOLS/brain-retrieve" --type digest --key "$QUESTION" \
+      --max-tokens 500 --text 2>/dev/null | grep -v "^===" | grep -v "^Path:\|^Tokens:\|^---$" || true)
+    _STATE=$("$TOOLS/brain-retrieve" --type state \
+      --max-tokens 400 --text 2>/dev/null | grep -v "^===" | grep -v "^Path:\|^Tokens:\|^---$" || true)
+    if [[ -n "$_DIGEST" || -n "$_STATE" ]]; then
+      PROMPT+="## Brain Context
+"
+      [[ -n "$_DIGEST" ]] && PROMPT+="### Memory Digest (relevant rules)
+$_DIGEST
+
+"
+      [[ -n "$_STATE" ]] && PROMPT+="### Operational State
+$_STATE
+
+"
+    fi
+  fi
+fi
+
+# Add file contents
+if [[ ${#FILES[@]} -gt 0 ]]; then
+  PROMPT+="## Referenced Files
+"
+  for f in "${FILES[@]}"; do
+    FULL_PATH="$f"
+    # Try relative to brain
+    [[ ! -f "$FULL_PATH" && -f "$BRAIN/$f" ]] && FULL_PATH="$BRAIN/$f"
+    if [[ -f "$FULL_PATH" ]]; then
+      # Token-bounded: max 2000 tokens (~8KB) per file
+      FILE_CONTENT=$(head -c 8000 "$FULL_PATH")
+      PROMPT+="
+### $f
+\`\`\`
+$FILE_CONTENT
+\`\`\`
+"
+    else
+      PROMPT+="
+### $f
+[FILE NOT FOUND]
+"
+    fi
+  done
+fi
+
+PROMPT+="## Question
+$QUESTION
+
+## Instructions
+- Answer concisely (under 500 words)
+- If you need more context, say what's missing
+- Do not modify any files
+- Return your answer as plain text"
+
+# ── Model resolution ─────────────────────────────────────────────────
+# If a --profile was given, look up the preferred model for TARGET in
+# execution-profiles.json, then verify it is not auto_dispatch_forbidden
+# in model-registry.json.  Outputs RESOLVED_MODEL (may be empty).
+RESOLVED_MODEL=""
+if [[ -n "$PROFILE" ]]; then
+  RESOLVED_MODEL=$(python3 - "$PROFILE" "$TARGET" "$_PROFILES" "$BRAIN/brain/ops/model-registry.json" <<'PYMODEL'
+import json, sys
+
+profile_id    = sys.argv[1]
+target        = sys.argv[2]   # dispatch target: claude-code / codex / gemini
+profiles_path = sys.argv[3]
+registry_path = sys.argv[4]
+
+try:
+    profiles_data = json.load(open(profiles_path))
+except Exception as e:
+    print(f"[dispatch] WARN: model-resolution: could not read profiles: {e}", file=sys.stderr)
+    sys.exit(0)
+
+profile = next((p for p in profiles_data.get("profiles", []) if p["profile_id"] == profile_id), None)
+if not profile:
+    sys.exit(0)  # unknown profile — already logged by PYPROFILE block
+
+preferred_models = profile.get("preferred_models", {})
+model_id = preferred_models.get(target, "")
+if not model_id:
+    sys.exit(0)  # no preferred model for this runtime — proceed with CLI default
+
+# Guard: check auto_dispatch_forbidden in model-registry
+try:
+    registry = json.load(open(registry_path))
+    runtime_entry = registry.get("runtimes", {}).get(target, {})
+    model_entry = runtime_entry.get("models", {}).get(model_id, {})
+    if model_entry.get("auto_dispatch_forbidden", False):
+        print(
+            f"[dispatch] BLOCK: model '{model_id}' has auto_dispatch_forbidden=true "
+            f"(profile={profile_id}, target={target}) — operator must explicitly authorize",
+            file=sys.stderr,
+        )
+        sys.exit(0)  # output nothing → caller uses CLI default
+    if model_entry.get("requires_operator_approval", False):
+        print(
+            f"[dispatch] WARN: model '{model_id}' requires_operator_approval=true "
+            f"(profile={profile_id}, target={target}) — dispatching only because profile requested it",
+            file=sys.stderr,
+        )
+except Exception as e:
+    print(f"[dispatch] WARN: model-resolution: could not read registry: {e}", file=sys.stderr)
+    sys.exit(0)
+
+print(model_id)
+PYMODEL
+  ) || true
+fi
+
+# ── Apply skill overrides (model + target) ────────────────────────────
+# Skills can override the profile-resolved model or switch to a different target.
+# Skill overrides take precedence over profile resolution.
+if [[ -n "$SKILL_MODEL_OVERRIDE" ]]; then
+  RESOLVED_MODEL="$SKILL_MODEL_OVERRIDE"
+  ROUTE_REASON="$ROUTE_REASON + skill-model=$SKILL_MODEL_OVERRIDE"
+fi
+if [[ -n "$SKILL_TARGET_OVERRIDE" ]]; then
+  # model_override skills (opus, haiku) force the target — they can only run on specific agents
+  # routing_override skills (long-context) are advisory and don't override an explicit profile target
+  if [[ -n "$SKILL_FORCE_TARGET" || -z "$TARGET" ]]; then
+    TARGET="$SKILL_TARGET_OVERRIDE"
+    ROUTE_REASON="$ROUTE_REASON + skill-target=$SKILL_TARGET_OVERRIDE"
+  fi
+fi
+
+# ── Append skill addenda to prompt ───────────────────────────────────
+if [[ -n "$SKILL_ADDENDA" ]]; then
+  PROMPT+="
+## Active Skills
+$SKILL_ADDENDA
+"
+fi
+
+# ── Dry run ──────────────────────────────────────────────────────────
+
+if $DRY_RUN; then
+  PROMPT_TOKENS=$(printf '%s' "$PROMPT" | wc -c)
+  PROMPT_TOKENS=$((PROMPT_TOKENS / 4))
+  echo "=== Dry Run: brain-subagent-dispatch ==="
+  echo "Target:       $TARGET"
+  echo "Route method: $ROUTE_METHOD"
+  echo "Route reason: $ROUTE_REASON"
+  [[ -n "$PROFILE" ]] && echo "Profile:      $PROFILE"
+  [[ -n "$RESOLVED_MODEL" ]] && echo "Model:        $RESOLVED_MODEL"
+  [[ -n "$SKILLS_RAW$BUNDLE_RAW" ]] && echo "Skills:       ${SKILLS_RAW}${SKILLS_RAW:+,}${BUNDLE_RAW}"
+  echo "Operation:    $OPERATION"
+  echo "Prompt tokens: ~$PROMPT_TOKENS"
+  echo "Timeout: ${TIMEOUT}s"
+  echo "---"
+  echo "$PROMPT"
+  exit 0
+fi
+
+# ── Ollama: background_only metadata check ───────────────────────────
+if [[ "$TARGET" == "ollama" ]]; then
+  _OLLAMA_MODELS="$BRAIN/brain/ops/ollama-models.json"
+  if [[ -f "$_OLLAMA_MODELS" ]]; then
+    read -r _OLLAMA_MODEL_ID _OLLAMA_IS_BG < <(python3 -c "
+import json
+data = json.load(open('$_OLLAMA_MODELS'))
+for mid, m in data.get('models', {}).items():
+    bg = m.get('background_only', False)
+    print(mid, 'true' if bg else 'false')
+    break
+" 2>/dev/null || echo "unknown false")
+    if [[ "$_OLLAMA_IS_BG" == "true" && "${PROFILE:-}" != "ollama-background" ]]; then
+      echo "[dispatch] WARN: model '$_OLLAMA_MODEL_ID' has background_only=true — use --profile ollama-background" >&2
+    fi
+    if [[ "$_OLLAMA_IS_BG" == "false" && "${PROFILE:-}" == "ollama-background" ]]; then
+      echo "[dispatch] WARN: ollama-background profile used but '$_OLLAMA_MODEL_ID' is interactive-capable (background_only=false)" >&2
+    fi
+    echo "[dispatch] ollama: model=$_OLLAMA_MODEL_ID background_only=$_OLLAMA_IS_BG" >&2
+  fi
+fi
+
+# ── Dispatch to target CLI ───────────────────────────────────────────
+
+# Signal subagent mode to wrappers to skip bootstrap/seat-claim
+export BRAIN_DISPATCH_ACTIVE=1
+
+# Extend chain before spawning so the subprocess can detect loops
+export BRAIN_DISPATCH_CHAIN="${_DISPATCH_CHAIN:+${_DISPATCH_CHAIN}:}${TARGET}"
+
+RESULT_FILE=$(mktemp /tmp/brain-subagent-XXXXXX.txt)
+TS_START=$(date +%s)
+DISPATCH_RC=0
+
+case "$TARGET" in
+  claude-code)
+    # -p = non-interactive print mode. --no-input does not exist in this CLI version.
+    # --model is passed only when a profile-resolved model is set (non-empty).
+    # --permission-mode plan: never ask for permissions (read-only)
+    if [[ -n "$RESOLVED_MODEL" ]]; then
+      timeout "$TIMEOUT" claude --model "$RESOLVED_MODEL" --permission-mode plan -p "$PROMPT" > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    else
+      timeout "$TIMEOUT" claude --permission-mode plan -p "$PROMPT" > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    fi
+    ;;
+  codex)
+    # < /dev/null closes stdin so codex does not block on "Reading additional input from stdin..."
+    if [[ -n "$RESOLVED_MODEL" ]]; then
+      timeout "$TIMEOUT" codex --model "$RESOLVED_MODEL" exec "$PROMPT" < /dev/null > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    else
+      timeout "$TIMEOUT" codex exec "$PROMPT" < /dev/null > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    fi
+    ;;
+  gemini)
+    # GEMINI_NO_WRAP=1: bypass gemini-wrapper's --yolo injection; dispatch is non-interactive.
+    # --approval-mode=plan: never ask for approval (read-only)
+    if [[ -n "$RESOLVED_MODEL" ]]; then
+      GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini --model "$RESOLVED_MODEL" -p "$PROMPT" --approval-mode=plan > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    else
+      GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini -p "$PROMPT" --approval-mode=plan > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    fi
+    ;;
+  ollama)
+    # Direct Ollama API call — no external CLI needed.
+    # Model: use RESOLVED_MODEL if set; else read first non-background_only model from ollama-models.json.
+    _OL_MODELS_FILE="$BRAIN/brain/ops/ollama-models.json"
+    _OL_ENDPOINT="http://127.0.0.1:11436"
+    _OL_MODEL="${RESOLVED_MODEL:-}"
+    if [[ -z "$_OL_MODEL" && -f "$_OL_MODELS_FILE" ]]; then
+      _OL_MODEL=$(python3 -c "
+import json
+data = json.load(open('$_OL_MODELS_FILE'))
+prefer_bg = '${PROFILE:-}' == 'ollama-background'
+op = '${OPERATION:-}'
+
+# Op-aware selection: pick model whose preferred_for list includes the operation.
+# Fall back to first non-background_only model if no preferred_for match.
+preferred = None
+fallback = None
+for mid, m in data.get('models', {}).items():
+    bg = m.get('background_only', False)
+    if prefer_bg and not bg:
+        continue
+    if not prefer_bg and bg:
+        continue
+    if op and op in m.get('preferred_for', []):
+        preferred = mid
+        break
+    if fallback is None:
+        fallback = mid
+
+print(preferred or fallback or '')
+" 2>/dev/null || true)
+    fi
+    _OL_MODEL="${_OL_MODEL:-qwen2.5:7b}"
+    # Build JSON payload and call Ollama generate API
+    _OL_PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({'model': sys.argv[1], 'prompt': sys.argv[2], 'stream': False}))
+" "$_OL_MODEL" "$PROMPT" 2>/dev/null)
+    _OL_RESPONSE=$(timeout "$TIMEOUT" curl -sf -X POST "$_OL_ENDPOINT/api/generate" \
+      -H "Content-Type: application/json" \
+      -d "$_OL_PAYLOAD" 2>/dev/null) || DISPATCH_RC=$?
+    if [[ "$DISPATCH_RC" -eq 0 && -n "$_OL_RESPONSE" ]]; then
+      python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('response', ''))
+" <<< "$_OL_RESPONSE" > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    else
+      echo "[ollama] no response from $_OL_ENDPOINT (RC=$DISPATCH_RC)" > "$RESULT_FILE"
+    fi
+    ;;
+esac
+
+TS_END=$(date +%s)
+DURATION=$((TS_END - TS_START))
+
+# Timeout detection: exit code 124 = killed by timeout(1)
+TIMED_OUT=false
+SALVAGED_TAIL=""
+if [[ "$DISPATCH_RC" -eq 124 ]]; then
+  TIMED_OUT=true
+  echo "[dispatch] WARN: $TARGET timed out after ${TIMEOUT}s — result is partial (RC=124)" >&2
+  TS_TIMEOUT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  echo "$TS_TIMEOUT SUBAGENT_DISPATCH_TIMEOUT target=$TARGET timeout=${TIMEOUT}s profile=${PROFILE:-none} task=${TASK_ID:-none}" >> "$BRAIN/brain/ops/events.log"
+  # Salvage: extract last meaningful lines, skipping exec-log noise
+  SALVAGED_TAIL=$(python3 - < "$RESULT_FILE" <<'PYSALVAGE'
+import sys, re
+lines = sys.stdin.read().splitlines()
+# Skip lines that look like codex exec-log framing, JSON artifacts, or pure noise
+skip_pat = re.compile(r'^\s*$|^[\[{<]|^={3,}|^---+$|^\s*"[a-z_]+":\s|^Reading additional')
+meaningful = [l for l in lines if not skip_pat.match(l)]
+tail = "\n".join(meaningful[-60:])
+print(tail[:4000])
+PYSALVAGE
+  )
+fi
+
+RESULT=$(cat "$RESULT_FILE")
+rm -f "$RESULT_FILE"
+
+# ── Log dispatch event ───────────────────────────────────────────────
+
+TS_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EVT_ID="evt-$(date +%Y%m%d-%H%M%S)-$(head -c3 /dev/urandom | xxd -p)"
+echo "$TS_NOW SUBAGENT_DISPATCH from=$CURRENT_AGENT to=$TARGET route=$ROUTE_METHOD op=$OPERATION task=${TASK_ID:-none} model=${RESOLVED_MODEL:-default} duration=${DURATION}s" >> "$BRAIN/brain/ops/events.log"
+
+python3 -c "
+import json
+evt = {
+    'event_id': '$EVT_ID',
+    'ts': '$TS_NOW',
+    'source': 'local',
+    'op': 'SUBAGENT_DISPATCH',
+    'entity_id': '${TASK_ID:-subagent}',
+    'meta': {
+        'from': '$CURRENT_AGENT',
+        'to': '$TARGET',
+        'route_method': '$ROUTE_METHOD',
+        'route_reason': '$ROUTE_REASON',
+        'operation': '$OPERATION',
+        'task': '${TASK_ID:-}',
+        'model': '${RESOLVED_MODEL:-default}',
+        'duration_s': $DURATION,
+        'question_tokens': $(printf '%s' "$QUESTION" | wc -c | awk '{print int($1/4)}'),
+        'result_tokens': $(printf '%s' "$RESULT" | wc -c | awk '{print int($1/4)}')
+    }
+}
+print(json.dumps(evt, separators=(',', ':')))
+" >> "$BRAIN/brain/ops/events.jsonl" 2>/dev/null || true
+
+# ── Output result ────────────────────────────────────────────────────
+
+RESULT_TOKENS=$(printf '%s' "$RESULT" | wc -c)
+RESULT_TOKENS=$((RESULT_TOKENS / 4))
+
+python3 -c "
+import json, sys
+
+timed_out = '$TIMED_OUT' == 'true'
+salvaged  = sys.argv[2] if timed_out else ''
+
+result = {
+    'agent': '$TARGET',
+    'model': '${RESOLVED_MODEL:-default}',
+    'profile': '${PROFILE:-}',
+    'question': sys.argv[1],
+    'duration_s': $DURATION,
+    'timeout_s': $TIMEOUT,
+    'timed_out': timed_out,
+    'result_tokens': $RESULT_TOKENS,
+    'result': sys.stdin.read(),
+}
+if timed_out:
+    result['partial'] = True
+    result['salvaged_tail'] = salvaged
+    result['note'] = f'Dispatch timed out after \$TIMEOUT s. Full output may be incomplete. salvaged_tail contains last meaningful lines.'
+print(json.dumps(result, ensure_ascii=False, indent=2))
+" "$QUESTION" "$SALVAGED_TAIL" <<< "$RESULT"

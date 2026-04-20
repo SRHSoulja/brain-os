@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# brain-codex-run-next -- Codex-native task preview/execute wrapper
+# Usage:
+#   brain-codex-run-next [TASK-ID]
+#   brain-codex-run-next --execute [TASK-ID]
+#   brain-codex-run-next --dry-run [TASK-ID]
+
+EXECUTE=false
+DRY_RUN=false
+TASK_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --execute) EXECUTE=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *) TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]] && command -v brain-next-task >/dev/null 2>&1; then
+  TASK_ID=$(brain-next-task codex --dry-run --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_id",""))' 2>/dev/null || true)
+fi
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "No TASK-ID provided and no next task resolved." >&2
+  exit 1
+fi
+
+echo "Task: $TASK_ID"
+if command -v brain-task-pack >/dev/null 2>&1; then
+  echo "Pack summary:"
+  brain-task-pack "$TASK_ID" 2>/dev/null | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+print("  priority:", p.get("priority","?"))
+print("  title:", p.get("title","?"))
+print("  node:", p.get("node","(none)"))
+print("  criteria:", len(p.get("completion_criteria",[])))
+' || true
+fi
+
+if [[ "$EXECUTE" == true ]]; then
+  echo "Executing via brain-task-execute..."
+  brain-task-execute "$TASK_ID" --by codex
+elif [[ "$DRY_RUN" == true ]]; then
+  echo "Dry run via brain-task-execute..."
+  brain-task-execute "$TASK_ID" --by codex --dry-run
+else
+  echo "Preview only."
+  echo "To execute: brain-codex-run-next --execute $TASK_ID"
+fi

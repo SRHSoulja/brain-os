@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""brain-task-schema-repair — Auto-repair completed tasks with trivially fixable schema violations.
+
+Scans brain/ops/tasks/completed/ for schema issues that brain-state-check would flag as DRIFT,
+and repairs them in-place before state-check runs. Non-destructive: only fills missing fields,
+never overwrites content that is already present.
+
+Repairs applied (all non-destructive):
+  - task_id: missing → derive from filename
+  - id: present but task_id: absent → add task_id: from id:
+  - status: wrong → set to completed
+  - ## Results section missing → add with placeholder values
+  - **Completed by:** missing inside Results → add "unknown"
+  - **Completed on:** missing inside Results → add file mtime date
+  - **Output:** missing inside Results → add title from task body
+
+Usage:
+    brain-task-schema-repair [--dry-run] [--quiet] [<ops_tasks_dir>]
+
+Exit codes:
+    0 = clean (no repairs needed or repairs applied)
+    1 = error (could not repair a file)
+"""
+
+import os
+import re
+import sys
+import datetime
+
+TASK_ID_PATTERN = re.compile(r'^TASK-\d{4}-\d{2}-\d{2}-\d{3}[A-Z]?$')
+
+
+def extract_frontmatter_range(content):
+    """Returns (fields_dict, fm_end_line_index) or (None, -1)."""
+    lines = content.split('\n')
+    if not lines or lines[0].strip() != '---':
+        return None, -1
+    fm_lines = []
+    end_idx = -1
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == '---':
+            end_idx = i
+            break
+        fm_lines.append(line)
+    if end_idx == -1:
+        return None, -1
+    fields = {}
+    for line in fm_lines:
+        m = re.match(r'^(\w+):\s*"?([^"]*)"?\s*$', line)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+    return fields, end_idx
+
+
+def get_frontmatter_block(lines, end_idx):
+    """Return the raw frontmatter lines (between the two ---)."""
+    return lines[1:end_idx]
+
+
+def file_mtime_date(filepath):
+    try:
+        mtime = os.path.getmtime(filepath)
+        return datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d')
+    except Exception:
+        return datetime.date.today().isoformat()
+
+
+def extract_title(content):
+    """Extract the first # heading from content as a short title."""
+    for line in content.split('\n'):
+        line = line.strip()
+        if line.startswith('# ') and not line.startswith('## '):
+            return line[2:].strip()[:150]
+    return ''
+
+
+def repair_file(filepath, dry_run=False, quiet=False):
+    """Repair a single completed task file. Returns (changed, repairs_applied)."""
+    fname = os.path.basename(filepath)
+    stem = fname.replace('.md', '')
+
+    try:
+        with open(filepath, 'r') as f:
+            original = f.read()
+    except OSError as e:
+        print(f"  ERROR {fname}: cannot read: {e}", file=sys.stderr)
+        return False, []
+
+    content = original
+    repairs = []
+    lines = content.split('\n')
+
+    fm, end_idx = extract_frontmatter_range(content)
+    if fm is None:
+        # Can't repair without frontmatter
+        if not quiet:
+            print(f"  SKIP {fname}: no parseable frontmatter")
+        return False, []
+
+    fm_lines = get_frontmatter_block(lines, end_idx)
+
+    # ── 1. Derive task_id from filename if missing ─────────────────
+    task_id_val = fm.get('task_id', '')
+    id_val = fm.get('id', '')
+
+    if not task_id_val:
+        # Use id: field if available, else filename
+        derived = id_val if id_val and TASK_ID_PATTERN.match(id_val) else stem
+        # Insert task_id: as first frontmatter field
+        new_fm_lines = [f'task_id: {derived}'] + fm_lines
+        repairs.append(f'task_id: added ({derived})')
+        task_id_val = derived
+    else:
+        new_fm_lines = fm_lines[:]
+
+    # ── 2. Fix status ──────────────────────────────────────────────
+    status_val = fm.get('status', '')
+    if status_val != 'completed':
+        updated = []
+        status_fixed = False
+        for line in new_fm_lines:
+            if re.match(r'^status:\s*', line):
+                updated.append('status: completed')
+                status_fixed = True
+            else:
+                updated.append(line)
+        if not status_fixed:
+            updated.append('status: completed')
+        new_fm_lines = updated
+        repairs.append(f'status: {status_val!r} → completed')
+
+    # ── 3. Rebuild content with updated frontmatter ────────────────
+    if new_fm_lines != fm_lines:
+        body_lines = lines[end_idx + 1:]
+        content = '---\n' + '\n'.join(new_fm_lines) + '\n---\n' + '\n'.join(body_lines)
+
+    # ── 4. Results section ─────────────────────────────────────────
+    date_str = file_mtime_date(filepath)
+
+    if '## Results' not in content:
+        title = extract_title(content) or stem
+        block = (
+            '\n\n## Results\n\n'
+            f'- **Completed by:** unknown\n'
+            f'- **Completed on:** {date_str}\n'
+            f'- **Output:** {title}\n'
+        )
+        content = content.rstrip() + block
+        repairs.append('## Results: added (placeholder)')
+    else:
+        results_m = re.search(r'^## Results\s*$', content, re.MULTILINE)
+        if results_m:
+            after = content[results_m.end():]
+            additions = ''
+            if not re.search(r'\*\*Completed by:\*\*.*[a-zA-Z]', after):
+                additions += '\n- **Completed by:** unknown'
+                repairs.append('Completed by: added (unknown)')
+            if not re.search(r'\*\*Completed on:\*\*.*[0-9]', after):
+                additions += f'\n- **Completed on:** {date_str}'
+                repairs.append(f'Completed on: added ({date_str})')
+            if not re.search(r'\*\*Output:\*\*.*[a-z0-9]', after):
+                title = extract_title(content) or stem
+                additions += f'\n- **Output:** {title}'
+                repairs.append('Output: added (title)')
+            if additions:
+                insert_pos = results_m.end()
+                content = content[:insert_pos] + additions + content[insert_pos:]
+
+    changed = content != original
+    if changed and not dry_run:
+        try:
+            with open(filepath, 'w') as f:
+                f.write(content)
+        except OSError as e:
+            print(f"  ERROR {fname}: cannot write: {e}", file=sys.stderr)
+            return False, repairs
+
+    if repairs and not quiet:
+        tag = 'DRY-RUN' if dry_run else 'REPAIRED'
+        print(f"  {tag} {fname}: {'; '.join(repairs)}")
+
+    return changed, repairs
+
+
+def main():
+    dry_run = '--dry-run' in sys.argv
+    quiet = '--quiet' in sys.argv
+
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if args:
+        ops_dir = args[0]
+    else:
+        brain = os.environ.get('BRAIN', os.path.expanduser('~/gmgn-brain'))
+        ops_dir = os.path.join(brain, 'brain', 'ops', 'tasks')
+
+    completed_dir = os.path.join(ops_dir, 'completed')
+    if not os.path.isdir(completed_dir):
+        print(f"ERROR: completed dir not found: {completed_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    total = 0
+    repaired = 0
+    errored = 0
+
+    for fname in sorted(os.listdir(completed_dir)):
+        if not fname.startswith('TASK-') or not fname.endswith('.md'):
+            continue
+        total += 1
+        fp = os.path.join(completed_dir, fname)
+        changed, repairs = repair_file(fp, dry_run=dry_run, quiet=quiet)
+        if repairs:
+            if changed or dry_run:
+                repaired += 1
+        # changed=False with repairs means write failed
+        if repairs and not changed and not dry_run:
+            errored += 1
+
+    if not quiet:
+        action = 'would repair' if dry_run else 'repaired'
+        print(f"brain-task-schema-repair: {total} tasks scanned, {repaired} {action}, {errored} errors")
+
+    sys.exit(1 if errored else 0)
+
+
+if __name__ == '__main__':
+    main()

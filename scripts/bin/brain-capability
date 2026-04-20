@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# brain-capability -- Capability registry management
+# Usage: brain-capability <command> [args]
+#
+# Commands:
+#   list                    Show all capabilities with health status
+#   status [--id <id>]      Run health checks, report available/unavailable
+#   register <id> [opts]    Register a new capability
+#   remove <id>             Remove a capability (destructive — use disable for toggle)
+#   enable <id>             Mark capability enabled (set enabled: true)
+#   disable <id>            Mark capability disabled (non-destructive skip)
+#   discover                Probe known endpoints, auto-register
+#   select --op <operation> Select best capability for operation type
+#
+# Enabled semantics:
+#   enabled: true (or missing) -> capability participates in select/dispatch
+#   enabled: false             -> skipped by select, treated as unavailable by status
+#
+# Public-version users can disable providers they have not configured
+# (e.g. disable gemini if GEMINI_API_KEY is unset) without removing the
+# registration entirely.
+#
+# Layer 4: capability-aware execution routing.
+# See: brain/wiki/systems/capability_layer_and_execution_routing.md
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+REGISTRY="$BRAIN/brain/ops/capability-registry.json"
+HEALTH_CACHE="/tmp/brain-capability-health.json"
+HEALTH_TTL=300  # 5 minutes
+
+if [[ ! -f "$REGISTRY" ]]; then
+  echo "Error: capability registry not found at $REGISTRY" >&2
+  exit 1
+fi
+
+CMD="${1:-help}"
+shift || true
+
+# ── Health check with caching ────────────────────────────────────────
+
+_check_health() {
+  local cap_id="$1" health_cmd="$2"
+  local now
+  now=$(date +%s)
+
+  # Check cache
+  if [[ -f "$HEALTH_CACHE" ]]; then
+    local cached
+    cached=$(python3 -c "
+import json, sys
+try:
+    with open('$HEALTH_CACHE') as f:
+        cache = json.load(f)
+    entry = cache.get('$cap_id', {})
+    if entry.get('ts', 0) > $now - $HEALTH_TTL:
+        print(entry['status'])
+    else:
+        print('expired')
+except:
+    print('expired')
+" 2>/dev/null)
+    if [[ "$cached" != "expired" ]]; then
+      echo "$cached"
+      return
+    fi
+  fi
+
+  # Run health check
+  if eval "$health_cmd" >/dev/null 2>&1; then
+    _update_cache "$cap_id" "available" "$now"
+    echo "available"
+  else
+    _update_cache "$cap_id" "unavailable" "$now"
+    echo "unavailable"
+  fi
+}
+
+_update_cache() {
+  local cap_id="$1" status="$2" ts="$3"
+  python3 -c "
+import json, os
+cache_path = '$HEALTH_CACHE'
+try:
+    with open(cache_path) as f:
+        cache = json.load(f)
+except:
+    cache = {}
+cache['$cap_id'] = {'status': '$status', 'ts': $ts}
+with open(cache_path, 'w') as f:
+    json.dump(cache, f)
+" 2>/dev/null || true
+}
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+case "$CMD" in
+
+  list)
+    python3 -c "
+import json, subprocess, os, time
+
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+
+caps = reg.get('capabilities', {})
+print(f'=== Capability Registry ({len(caps)} capabilities) ===')
+print()
+print(f'{\"ID\":20s} {\"On\":4s} {\"Type\":15s} {\"Provider\":12s} {\"Cost\":6s} {\"Strength\":8s} {\"Operations\":30s}')
+print('-' * 100)
+for cid, cap in sorted(caps.items()):
+    ops = ', '.join(cap.get('operations', []))[:30]
+    on_flag = 'yes' if cap.get('enabled', True) else 'NO'
+    print(f'{cid:20s} {on_flag:4s} {cap[\"type\"]:15s} {cap.get(\"provider\",\"?\"):12s} {cap.get(\"cost\",\"?\"):6s} {cap.get(\"strength\",\"?\"):8s} {ops:30s}')
+"
+    ;;
+
+  status)
+    CAP_ID=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) CAP_ID="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    python3 - "$CAP_ID" "$REGISTRY" <<'PYSTATUS'
+import json, subprocess, sys, os, time
+
+cap_id_filter = sys.argv[1] if len(sys.argv) > 1 else ""
+registry_path = sys.argv[2]
+
+with open(registry_path) as f:
+    reg = json.load(f)
+
+caps = reg.get("capabilities", {})
+if cap_id_filter:
+    caps = {k: v for k, v in caps.items() if k == cap_id_filter}
+    if not caps:
+        print(f"Error: capability '{cap_id_filter}' not found")
+        sys.exit(1)
+
+print("=== Capability Health Status ===")
+print()
+
+available = 0
+unavailable = 0
+disabled = 0
+for cid, cap in sorted(caps.items()):
+    if cap.get("enabled", True) is False:
+        status = "disabled"
+        icon = "OFF"
+        disabled += 1
+    else:
+        health_cmd = cap.get("health_check", "true")
+        try:
+            result = subprocess.run(health_cmd, shell=True, capture_output=True, timeout=5)
+            status = "available" if result.returncode == 0 else "unavailable"
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+        except Exception:
+            status = "error"
+        icon = "UP" if status == "available" else "DOWN"
+        if status == "available":
+            available += 1
+        else:
+            unavailable += 1
+
+    adv = " (advisory)" if cap.get("advisory_only") else ""
+    print(f"  [{icon:4s}] {cid:20s} {cap['type']:15s} {cap.get('provider','?'):12s}{adv}")
+
+print()
+print(f"  {available} available, {unavailable} unavailable, {disabled} disabled")
+PYSTATUS
+    ;;
+
+  register)
+    REG_ID="${1:-}"
+    shift || true
+    if [[ -z "$REG_ID" ]]; then
+      echo "Error: register requires <id>" >&2
+      exit 1
+    fi
+
+    REG_TYPE="" REG_PROVIDER="" REG_ENDPOINT="" REG_COST="zero" REG_STRENGTH="low"
+    REG_OPS="" REG_ADVISORY="false" REG_HEALTH="true" REG_MODEL=""
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --type)         REG_TYPE="$2"; shift 2 ;;
+        --provider)     REG_PROVIDER="$2"; shift 2 ;;
+        --endpoint)     REG_ENDPOINT="$2"; shift 2 ;;
+        --cost)         REG_COST="$2"; shift 2 ;;
+        --strength)     REG_STRENGTH="$2"; shift 2 ;;
+        --operations)   REG_OPS="$2"; shift 2 ;;
+        --advisory-only) REG_ADVISORY="true"; shift ;;
+        --health-check) REG_HEALTH="$2"; shift 2 ;;
+        --model)        REG_MODEL="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    if [[ -z "$REG_TYPE" ]]; then
+      echo "Error: --type required (local_llm|remote_agent|remote_api|deterministic)" >&2
+      exit 1
+    fi
+
+    python3 -c "
+import json
+from datetime import datetime, timezone
+
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+
+ops = [o.strip() for o in '$REG_OPS'.split(',') if o.strip()] if '$REG_OPS' else []
+
+cap = {
+    'type': '$REG_TYPE',
+    'provider': '$REG_PROVIDER' or 'unknown',
+    'endpoint': '$REG_ENDPOINT' or 'local',
+    'cost': '$REG_COST',
+    'strength': '$REG_STRENGTH',
+    'latency': 'moderate',
+    'availability': 'on_demand',
+    'health_check': '$REG_HEALTH',
+    'advisory_only': '$REG_ADVISORY'.lower() == 'true',
+    'operations': ops
+}
+if '$REG_MODEL':
+    cap['model'] = '$REG_MODEL'
+
+reg['capabilities']['$REG_ID'] = cap
+reg['last_updated'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+reg['version'] = reg.get('version', 0) + 1
+
+with open('$REGISTRY', 'w') as f:
+    json.dump(reg, f, indent=2)
+
+print(f'Registered: $REG_ID (type=$REG_TYPE, ops={ops})')
+"
+    ;;
+
+  remove)
+    REM_ID="${1:-}"
+    if [[ -z "$REM_ID" ]]; then
+      echo "Error: remove requires <id>" >&2
+      exit 1
+    fi
+
+    python3 -c "
+import json
+from datetime import datetime, timezone
+
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+
+if '$REM_ID' not in reg.get('capabilities', {}):
+    print('Error: $REM_ID not in registry')
+    exit(1)
+
+del reg['capabilities']['$REM_ID']
+reg['last_updated'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+reg['version'] = reg.get('version', 0) + 1
+
+with open('$REGISTRY', 'w') as f:
+    json.dump(reg, f, indent=2)
+
+print(f'Removed: $REM_ID')
+"
+    ;;
+
+  enable|disable)
+    TOGGLE_ID="${1:-}"
+    if [[ -z "$TOGGLE_ID" ]]; then
+      echo "Error: $CMD requires <id>" >&2
+      exit 1
+    fi
+    TOGGLE_VALUE="true"
+    [[ "$CMD" == "disable" ]] && TOGGLE_VALUE="false"
+
+    python3 - "$REGISTRY" "$TOGGLE_ID" "$TOGGLE_VALUE" "$HEALTH_CACHE" <<'PYTOGGLE'
+import json, os, sys
+from datetime import datetime, timezone
+
+registry_path, cap_id, value_str, health_cache = sys.argv[1:5]
+new_enabled = (value_str == "true")
+
+with open(registry_path) as f:
+    reg = json.load(f)
+
+caps = reg.get("capabilities", {})
+if cap_id not in caps:
+    print(f"Error: {cap_id} not in registry", file=sys.stderr)
+    sys.exit(1)
+
+prior = caps[cap_id].get("enabled", True)
+caps[cap_id]["enabled"] = new_enabled
+reg["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+reg["version"] = reg.get("version", 0) + 1
+
+with open(registry_path, "w") as f:
+    json.dump(reg, f, indent=2)
+
+# Invalidate health cache entry so next probe reflects current state.
+try:
+    with open(health_cache) as cf:
+        cache = json.load(cf)
+    cache.pop(cap_id, None)
+    with open(health_cache, "w") as cf:
+        json.dump(cache, cf)
+except Exception:
+    pass
+
+state = "enabled" if new_enabled else "disabled"
+if prior == new_enabled:
+    print(f"{cap_id}: already {state} (no change)")
+else:
+    print(f"{cap_id}: {'enabled' if prior else 'disabled'} -> {state}")
+PYTOGGLE
+    ;;
+
+  discover)
+    echo "=== Capability Discovery ==="
+    echo ""
+
+    # Probe Ollama
+    OLLAMA_MODELS_FILE="$BRAIN/brain/ops/ollama-models.json"
+    echo "[1/2] Probing Ollama..."
+    if curl -sf http://127.0.0.1:11436/api/tags >/dev/null 2>&1; then
+      OLLAMA_RAW=$(curl -sf http://127.0.0.1:11436/api/tags 2>/dev/null || true)
+      MODELS=$(echo "$OLLAMA_RAW" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for m in data.get('models', []):
+    print(m['name'])
+" 2>/dev/null || true)
+      if [[ -n "$MODELS" ]]; then
+        echo "  Found Ollama models:"
+        echo "$MODELS" | while read model; do echo "    $model"; done
+        # Auto-register discovered models not already in capability-registry
+        echo "$MODELS" | while read model; do
+          SAFE_ID="ollama_$(echo "$model" | tr ':.' '_' | tr '[:upper:]' '[:lower:]')"
+          EXISTS=$(python3 -c "import json; r=json.load(open('$REGISTRY')); print('yes' if '$SAFE_ID' in r.get('capabilities',{}) else 'no')" 2>/dev/null)
+          if [[ "$EXISTS" != "yes" ]]; then
+            "$0" register "$SAFE_ID" --type local_llm --provider ollama \
+              --endpoint "http://127.0.0.1:11436" --model "$model" \
+              --cost zero --strength low --operations "classification,summarization" \
+              --advisory-only --health-check "curl -sf http://127.0.0.1:11436/api/tags >/dev/null 2>&1" 2>/dev/null
+            echo "  Registered: $SAFE_ID ($model)"
+          fi
+        done
+        # Upsert per-model metadata into ollama-models.json
+        DISCOVER_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        _OLLAMA_TMP=$(mktemp /tmp/ollama-raw-XXXXXX.json)
+        echo "$OLLAMA_RAW" > "$_OLLAMA_TMP"
+        python3 - "$OLLAMA_MODELS_FILE" "$DISCOVER_TS" "$_OLLAMA_TMP" <<'PYUPSERT'
+import json, os, sys, re
+
+raw   = json.load(open(sys.argv[3]))
+path  = sys.argv[1]
+ts    = sys.argv[2]
+
+# Load existing metadata (preserve user-set fields)
+if os.path.exists(path):
+    try:
+        existing = json.load(open(path))
+    except Exception:
+        existing = {}
+else:
+    existing = {}
+
+models_meta = existing.get("models", {})
+
+for m in raw.get("models", []):
+    mid    = m.get("name", "")
+    if not mid:
+        continue
+    details = m.get("details", {})
+    size_gb = round(m.get("size", 0) / 1e9, 1)
+    params_str = details.get("parameter_size", "")
+    params_b = None
+    if params_str:
+        try:
+            params_b = float(re.sub(r"[^0-9.]", "", params_str))
+        except Exception:
+            pass
+    family  = details.get("family", mid.split(":")[0])
+    quant   = details.get("quantization_level", "")
+
+    existing_entry = models_meta.get(mid, {})
+    # Preserve user/harness-set fields; update discovery fields
+    entry = {
+        "model_id":              mid,
+        "family":                family,
+        "params_b":              params_b,
+        "size_gb":               size_gb,
+        "quantization":          quant,
+        "quality_tier":          existing_entry.get("quality_tier", "medium" if params_b and params_b >= 7 else "low"),
+        "latency_p50_ms":        existing_entry.get("latency_p50_ms"),
+        "latency_p95_ms":        existing_entry.get("latency_p95_ms"),
+        "background_only":       existing_entry.get("background_only", False),
+        "pinned":                existing_entry.get("pinned", False),
+        "last_tested":           existing_entry.get("last_tested"),
+        "last_discovered":       ts,
+        "operations":            existing_entry.get("operations", ["classification", "summarization"]),
+        "capability_registry_ids": existing_entry.get("capability_registry_ids", []),
+        "notes":                 existing_entry.get("notes", ""),
+    }
+    models_meta[mid] = entry
+
+existing["models"] = models_meta
+existing.setdefault("schema_version", 1)
+existing["metadata"] = existing.get("metadata", {})
+existing["metadata"]["last_discovered"] = ts
+
+with open(path, "w") as f:
+    json.dump(existing, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+
+print(f"  Upserted {len(raw.get('models',[]))} model(s) into ollama-models.json")
+PYUPSERT
+        rm -f "$_OLLAMA_TMP"
+      else
+        echo "  Ollama running but no models found"
+      fi
+    else
+      echo "  Ollama not available"
+    fi
+    echo ""
+
+    # Probe agent CLIs
+    echo "[2/2] Probing agent CLIs..."
+    for agent in claude codex gemini; do
+      if which "$agent" >/dev/null 2>&1; then
+        echo "  $agent: found at $(which $agent)"
+      else
+        echo "  $agent: not found"
+      fi
+    done
+    echo ""
+    echo "Discovery complete."
+    ;;
+
+  select)
+    OPERATION=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --op) OPERATION="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    if [[ -z "$OPERATION" ]]; then
+      echo "Error: --op <operation> required" >&2
+      exit 1
+    fi
+
+    python3 - "$OPERATION" "$REGISTRY" <<'PYSELECT'
+import json, subprocess, sys, os
+
+operation = sys.argv[1]
+registry_path = sys.argv[2]
+
+with open(registry_path) as f:
+    reg = json.load(f)
+
+# Cost ordering for sorting
+cost_order = {"zero": 0, "low": 1, "medium": 2, "high": 3}
+strength_order = {"n/a": 0, "low": 1, "medium": 2, "high": 3}
+
+import time
+HEALTH_CACHE = "/tmp/brain-capability-health.json"
+HEALTH_TTL   = 300  # seconds — matches bash TTL
+
+def _cached_health(cid):
+    """Return 'available'|'unavailable' if cache is fresh, else None."""
+    try:
+        with open(HEALTH_CACHE) as cf:
+            cache = json.load(cf)
+        entry = cache.get(cid, {})
+        if entry.get("ts", 0) > time.time() - HEALTH_TTL:
+            return entry["status"]
+    except Exception:
+        pass
+    return None
+
+candidates = []
+disabled_skipped = []
+for cid, cap in reg.get("capabilities", {}).items():
+    if operation in cap.get("operations", []):
+        # Disabled capabilities are skipped entirely — not health-checked,
+        # not listed as candidates, surfaced in degraded with reason=disabled.
+        if cap.get("enabled", True) is False:
+            disabled_skipped.append({"id": cid, "reason": "disabled"})
+            continue
+        # Check cache first; fall back to live health check
+        cached = _cached_health(cid)
+        if cached is not None:
+            healthy = (cached == "available")
+        else:
+            # Prefer dispatch_health_check when present — it tests CLI
+            # availability/dispatchability rather than interactive session state.
+            # Example: claude_code has health_check=pgrep (session running) but
+            # dispatch_health_check=which claude (CLI callable), which is the
+            # correct signal for non-interactive subagent routing.
+            health_cmd = cap.get("dispatch_health_check") or cap.get("health_check", "true")
+            try:
+                result = subprocess.run(health_cmd, shell=True, capture_output=True, timeout=5)
+                healthy = result.returncode == 0
+            except Exception:
+                healthy = False
+
+        candidates.append({
+            "id": cid,
+            "type": cap["type"],
+            "provider": cap.get("provider", "?"),
+            "cost": cap.get("cost", "high"),
+            "strength": cap.get("strength", "low"),
+            "advisory_only": cap.get("advisory_only", False),
+            "healthy": healthy,
+            "cost_rank": cost_order.get(cap.get("cost", "high"), 9),
+            "strength_rank": strength_order.get(cap.get("strength", "low"), 0)
+        })
+
+# Filter to healthy only
+healthy = [c for c in candidates if c["healthy"]]
+unhealthy = [c for c in candidates if not c["healthy"]]
+
+# Sort: cost ascending, strength descending
+healthy.sort(key=lambda c: (c["cost_rank"], -c["strength_rank"]))
+
+result = {
+    "operation": operation,
+    "selected": healthy[0]["id"] if healthy else None,
+    "candidates": [
+        {"id": c["id"], "cost": c["cost"], "strength": c["strength"],
+         "healthy": c["healthy"], "advisory_only": c["advisory_only"]}
+        for c in healthy
+    ],
+    "degraded": [
+        {"id": c["id"], "reason": "health check failed"}
+        for c in unhealthy
+    ] + disabled_skipped
+}
+
+print(json.dumps(result, indent=2))
+
+if not healthy:
+    print(f"\nWARN: no healthy capability for operation '{operation}'", file=sys.stderr)
+    sys.exit(2)
+PYSELECT
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+brain-capability -- Capability registry management
+
+Commands:
+  list                          Show all capabilities (with On column)
+  status [--id <id>]            Run health checks (disabled shown as OFF)
+  register <id> [opts]          Register a capability
+  remove <id>                   Remove a capability (destructive)
+  enable <id>                   Mark capability enabled
+  disable <id>                  Mark capability disabled (non-destructive skip)
+  discover                      Probe endpoints, auto-register
+  select --op <operation>       Select best capability for operation (skips disabled)
+
+Register options:
+  --type <type>                 local_llm|remote_agent|remote_api|deterministic
+  --provider <name>             Provider name
+  --endpoint <url>              How to reach it
+  --cost <level>                zero|low|medium|high
+  --strength <level>            low|medium|high
+  --operations <ops>            Comma-separated operations
+  --advisory-only               Mark as advisory (not authoritative)
+  --health-check <cmd>          Health check command
+  --model <name>                Model name (for LLMs)
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $CMD" >&2
+    echo "Run: brain-capability help" >&2
+    exit 1
+    ;;
+esac

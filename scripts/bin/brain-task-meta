@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# brain-task-meta — Read task fields from any lifecycle stage; canonical lookup for dispatch context_tier and metadata queries
+# Usage:
+#   brain-task-meta <TASK-ID>               Print all frontmatter as JSON
+#   brain-task-meta <TASK-ID> --field <f>   Print single field value
+#   brain-task-meta <TASK-ID> --status      Shorthand for --field status
+#   brain-task-meta <TASK-ID> --priority    Shorthand for --field priority
+#   brain-task-meta <TASK-ID> --node        Shorthand for --field node
+#   brain-task-meta <TASK-ID> --tier        Derive context_tier from priority
+#
+# Agent-agnostic: callable by Claude, Codex, Gemini seats via ~/bin symlink.
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+OPS="$BRAIN/brain/ops/tasks"
+
+TASK_ID=""
+FIELD=""
+DERIVE_TIER=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --field)     FIELD="$2"; shift 2 ;;
+    --status)    FIELD="status"; shift ;;
+    --priority)  FIELD="priority"; shift ;;
+    --node)      FIELD="node"; shift ;;
+    --tier)      DERIVE_TIER=true; shift ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: brain-task-meta <TASK-ID> [--field <field>]
+       brain-task-meta <TASK-ID> --tier
+
+Options:
+  --field <name>  Return only this frontmatter field's value
+  --status        Shorthand for --field status
+  --priority      Shorthand for --field priority
+  --node          Shorthand for --field node
+  --tier          Derive context_tier from priority (P1→full, P3/P4→minimal, else standard)
+
+Exit codes:
+  0  Found
+  1  Task not found or field missing
+
+Examples:
+  brain-task-meta TASK-2026-04-17-034 --priority
+  brain-task-meta TASK-2026-04-17-034 --tier
+  brain-task-meta TASK-2026-04-17-034 --field owner
+  brain-task-meta TASK-2026-04-17-034
+HELP
+      exit 0 ;;
+    -*)  echo "Unknown option: $1" >&2; exit 1 ;;
+    *)   TASK_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: TASK-ID required" >&2
+  exit 1
+fi
+
+# Locate task file across lifecycle directories
+TASK_FILE=""
+for dir in active queue completed must_execute; do
+  candidate="$OPS/$dir/${TASK_ID}.md"
+  if [[ -f "$candidate" ]]; then
+    TASK_FILE="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$TASK_FILE" ]]; then
+  echo "Error: task not found: $TASK_ID" >&2
+  exit 1
+fi
+
+if $DERIVE_TIER; then
+  priority=$(python3 -c "
+import re
+from pathlib import Path
+text = Path('$TASK_FILE').read_text()
+m = re.search(r'^priority:\s*[\"\']*([^\s\"\'\n]+)', text, re.MULTILINE)
+print((m.group(1) if m else '2').strip('\"').strip(\"'\"))
+" 2>/dev/null || echo "2")
+  case "$priority" in
+    1|P1) echo "full" ;;
+    3|4|P3|P4) echo "minimal" ;;
+    *) echo "standard" ;;
+  esac
+  exit 0
+fi
+
+python3 -c "
+import re, json, sys
+from pathlib import Path
+
+text = Path('$TASK_FILE').read_text()
+
+# Extract YAML frontmatter between --- delimiters
+if not text.startswith('---'):
+    print('{}')
+    sys.exit(0)
+
+end = text.find('\n---', 4)
+if end == -1:
+    print('{}')
+    sys.exit(0)
+
+fm_text = text[3:end]
+fm = {}
+for line in fm_text.splitlines():
+    m = re.match(r'^(\w+):\s*(.*)$', line.strip())
+    if m:
+        key, val = m.group(1), m.group(2).strip().strip('\"').strip(\"'\")
+        fm[key] = val
+
+field = '$FIELD'
+if field:
+    val = fm.get(field)
+    if val is None:
+        print(f'Error: field \"{field}\" not found in {\"$TASK_ID\"}', file=sys.stderr)
+        sys.exit(1)
+    print(val)
+else:
+    print(json.dumps(fm, indent=2, ensure_ascii=False))
+"

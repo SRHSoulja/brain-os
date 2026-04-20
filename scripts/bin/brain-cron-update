@@ -1,0 +1,202 @@
+#!/bin/bash
+# brain-cron-update — Safe cron updater for production
+# Usage:
+#   brain-cron-update add "0 4 * * * command here"     # add a Brain-managed entry
+#   brain-cron-update remove "pattern"                  # remove matching Brain-managed entry
+#   brain-cron-update replace "old line" "new line"     # replace any line in full crontab
+#   brain-cron-update list                              # list Brain-managed entries
+#   brain-cron-update show                              # show full crontab
+#   brain-cron-update --dry-run add|replace "..."       # preview changes
+#
+# Safe approach:
+#   1. Backup current crontab
+#   2. Parse managed block between markers
+#   3. Apply change to managed block only
+#   4. Merge: unmanaged lines + updated managed block
+#   5. Install via crontab <file> (not pipe)
+#
+# Managed block markers:
+#   # --- Brain-managed entries (do not edit manually) ---
+#   # --- End Brain-managed entries ---
+#
+# Unmanaged lines are NEVER modified by this tool.
+
+set -euo pipefail
+
+MARKER_START="# --- Brain-managed entries (do not edit manually) ---"
+MARKER_END="# --- End Brain-managed entries ---"
+
+DRY_RUN=false
+ACTION=""
+ENTRY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    add|remove|list|show) ACTION="$1"; shift; ENTRY="${1:-}"; [[ -n "${1:-}" ]] && shift ;;
+    replace) ACTION="$1"; shift; ENTRY="${1:-}"; shift; REPLACE_WITH="${1:-}"; [[ -n "${1:-}" ]] && shift ;;
+    *) echo "Unknown: $1"; exit 1 ;;
+  esac
+done
+
+if [[ -z "$ACTION" ]]; then
+  echo "Usage: brain-cron-update [--dry-run] add|remove|list|show [entry/pattern]"
+  exit 1
+fi
+
+# ── Read current crontab ──────────────────────────────────────────
+CURRENT=$(ssh -4 gmgn "crontab -l 2>/dev/null" || true)
+
+# ── Split into unmanaged + managed ────────────────────────────────
+UNMANAGED=""
+MANAGED=""
+IN_BLOCK=false
+
+while IFS= read -r line; do
+  if [[ "$line" == "$MARKER_START" ]]; then
+    IN_BLOCK=true
+    continue
+  elif [[ "$line" == "$MARKER_END" ]]; then
+    IN_BLOCK=false
+    continue
+  fi
+
+  if $IN_BLOCK; then
+    MANAGED="${MANAGED}${line}\n"
+  else
+    UNMANAGED="${UNMANAGED}${line}\n"
+  fi
+done <<< "$CURRENT"
+
+# Strip trailing newlines
+MANAGED=$(echo -e "$MANAGED" | sed '/^$/d')
+UNMANAGED=$(echo -e "$UNMANAGED" | sed '/^$/d')
+
+case "$ACTION" in
+  show)
+    echo "=== Full crontab ==="
+    echo "$CURRENT"
+    ;;
+
+  list)
+    echo "=== Brain-managed entries ==="
+    if [[ -n "$MANAGED" ]]; then
+      echo "$MANAGED"
+    else
+      echo "(none)"
+    fi
+    ;;
+
+  add)
+    if [[ -z "$ENTRY" ]]; then
+      echo "Usage: brain-cron-update add \"schedule command\""
+      exit 1
+    fi
+
+    # Check if already present
+    if echo "$MANAGED" | grep -qF "$ENTRY"; then
+      echo "Already present: $ENTRY"
+      exit 0
+    fi
+
+    NEW_MANAGED="$MANAGED"
+    [[ -n "$NEW_MANAGED" ]] && NEW_MANAGED="${NEW_MANAGED}\n${ENTRY}" || NEW_MANAGED="$ENTRY"
+
+    # Build new crontab
+    NEW_CRONTAB="${UNMANAGED}\n${MARKER_START}\n${NEW_MANAGED}\n${MARKER_END}"
+
+    if $DRY_RUN; then
+      echo "=== Would install ==="
+      echo -e "$NEW_CRONTAB"
+    else
+      # Backup first
+      ssh -4 gmgn "crontab -l > ~/backup/crontab-pre-update-$(date +%Y%m%d-%H%M%S).txt 2>/dev/null" || true
+
+      # Write to temp file and install
+      echo -e "$NEW_CRONTAB" | ssh -4 gmgn "cat > /tmp/brain-cron-update.txt && crontab /tmp/brain-cron-update.txt && rm /tmp/brain-cron-update.txt"
+      echo "Added: $ENTRY"
+
+      # Verify
+      VERIFY=$(ssh -4 gmgn "crontab -l 2>/dev/null" | grep -cF "$ENTRY" || echo 0)
+      if [[ "$VERIFY" -gt 0 ]]; then
+        echo "Verified: entry present in installed crontab"
+      else
+        echo "WARNING: entry not found after install — check manually"
+      fi
+    fi
+    ;;
+
+  remove)
+    if [[ -z "$ENTRY" ]]; then
+      echo "Usage: brain-cron-update remove \"pattern\""
+      exit 1
+    fi
+
+    NEW_MANAGED=$(echo "$MANAGED" | grep -vF "$ENTRY" || true)
+
+    NEW_CRONTAB="${UNMANAGED}\n${MARKER_START}\n${NEW_MANAGED}\n${MARKER_END}"
+
+    if $DRY_RUN; then
+      echo "=== Would install ==="
+      echo -e "$NEW_CRONTAB"
+    else
+      ssh -4 gmgn "crontab -l > ~/backup/crontab-pre-update-$(date +%Y%m%d-%H%M%S).txt 2>/dev/null" || true
+      echo -e "$NEW_CRONTAB" | ssh -4 gmgn "cat > /tmp/brain-cron-update.txt && crontab /tmp/brain-cron-update.txt && rm /tmp/brain-cron-update.txt"
+      echo "Removed entries matching: $ENTRY"
+    fi
+    ;;
+
+  replace)
+    if [[ -z "$ENTRY" || -z "${REPLACE_WITH:-}" ]]; then
+      echo "Usage: brain-cron-update replace \"old line\" \"new line\""
+      echo "Replaces any line in the full crontab (managed or unmanaged)."
+      exit 1
+    fi
+
+    # Verify the old line exists
+    MATCH_COUNT=$(echo "$CURRENT" | grep -cF "$ENTRY" || true)
+    MATCH_COUNT=$(echo "$MATCH_COUNT" | tr -d '[:space:]')
+    if [[ "$MATCH_COUNT" -eq 0 ]]; then
+      echo "Error: no line matching \"$ENTRY\" found in crontab"
+      exit 1
+    fi
+    if [[ "$MATCH_COUNT" -gt 1 ]]; then
+      echo "Error: $MATCH_COUNT lines match — be more specific"
+      exit 1
+    fi
+
+    # Build new crontab with the replacement
+    NEW_FULL=$(echo "$CURRENT" | while IFS= read -r line; do
+      if [[ "$line" == *"$ENTRY"* ]]; then
+        echo "$REPLACE_WITH"
+      else
+        echo "$line"
+      fi
+    done)
+
+    if $DRY_RUN; then
+      echo "=== Would replace ==="
+      echo "OLD: $(echo "$CURRENT" | grep -F "$ENTRY")"
+      echo "NEW: $REPLACE_WITH"
+      echo ""
+      echo "=== Full crontab after change ==="
+      echo "$NEW_FULL"
+    else
+      # Backup
+      ssh -4 gmgn "crontab -l > ~/backup/crontab-pre-update-$(date +%Y%m%d-%H%M%S).txt 2>/dev/null" || true
+
+      # Write to temp file and install
+      echo "$NEW_FULL" | ssh -4 gmgn "cat > /tmp/brain-cron-update.txt && crontab /tmp/brain-cron-update.txt && rm /tmp/brain-cron-update.txt"
+      echo "Replaced: $ENTRY"
+      echo "With:     $REPLACE_WITH"
+
+      # Verify
+      VERIFY=$(ssh -4 gmgn "crontab -l 2>/dev/null" | grep -cF "$REPLACE_WITH" || echo 0)
+      if [[ "$VERIFY" -gt 0 ]]; then
+        echo "Verified: new entry present in installed crontab"
+      else
+        echo "WARNING: new entry not found after install — check manually"
+      fi
+    fi
+    ;;
+esac

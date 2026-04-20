@@ -1,0 +1,1177 @@
+#!/bin/bash
+# brain-wiki — Knowledge wiki for the GM GN Repeat brain
+# A unified, searchable, cross-referenced knowledge base that consolidates
+# information from sessions, Discord, devlogs, memories, nodes, and decisions.
+#
+# Usage:
+#   brain-wiki search "query"              Search all wiki pages
+#   brain-wiki list                        List all wiki pages
+#   brain-wiki list --category tools       List pages in a category
+#   brain-wiki show <page>                 Show a wiki page
+#   brain-wiki create <page> --cat <cat>   Create a new wiki page
+#   brain-wiki edit <page>                 Open page for editing (prints path)
+#   brain-wiki link <page1> <page2>        Add cross-reference between pages
+#   brain-wiki rebuild-index               Rebuild the wiki search index
+#   brain-wiki import-memories             Import .claude memories into wiki
+#   brain-wiki import-sessions             Run brain-session-digest for all sessions
+#   brain-wiki import-devlogs              Link devlogs into wiki index
+#   brain-wiki compact [--dry-run] [--keep N] Roll old sessions into monthly summaries (default: keep 7 days)
+#   brain-wiki stats                       Wiki statistics
+#   brain-wiki graph                       Show page relationship graph
+#
+# Wiki Structure:
+#   brain/wiki/                    Root
+#   brain/wiki/index.json          Master search index
+#   brain/wiki/pages/              Topic pages (the core knowledge)
+#   brain/wiki/sessions/           Session digests (from brain-session-digest)
+#   brain/wiki/discord/            Discord message digests
+#   brain/wiki/decisions/          Decision records and ADRs
+#   brain/wiki/tools/              Tool documentation
+#   brain/wiki/people/             People and contacts
+#   brain/wiki/products/           Products and services
+#   brain/wiki/systems/            Systems and architecture
+#
+# Categories: tools, systems, products, people, decisions, sessions, discord, pages
+
+set -euo pipefail
+
+# Resolve real script dir (handles symlink invocation from ~/bin/)
+_WIKI_SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+BRAIN_DIR="$HOME/gmgn-brain"
+WIKI_DIR="$BRAIN_DIR/brain/wiki"
+INDEX_FILE="$WIKI_DIR/index.json"
+LOG_FILE="$BRAIN_DIR/work/logs/brain-wiki.log"
+
+# All wiki subdirs
+CATEGORIES=(pages sessions discord decisions tools people products systems research aspirations patterns ideas)
+
+# Ensure structure exists (skip mkdir for read-only operations)
+_WIKI_READONLY=false
+case "${1:-}" in
+  search|list|show|stats|graph) _WIKI_READONLY=true ;;
+esac
+
+if ! $_WIKI_READONLY; then
+  for cat in "${CATEGORIES[@]}"; do
+    mkdir -p "$WIKI_DIR/$cat"
+  done
+  mkdir -p "$(dirname "$LOG_FILE")"
+fi
+
+log() {
+  # Skip logging when log file isn't writable (analyst/read-only mode)
+  [[ -w "$(dirname "$LOG_FILE")" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ── Search ─────────────────────────────────────────────────────────
+wiki_search() {
+  local query="$1"
+  log "Search: $query"
+
+  echo "=== Wiki Search: \"$query\" ==="
+  echo ""
+
+  # Search index first (fast)
+  if [[ -f "$INDEX_FILE" ]]; then
+    local idx_results=$(python3 -c "
+import json, sys, re
+q = sys.argv[1].lower()
+terms = q.split()
+with open(sys.argv[2]) as f:
+    idx = json.load(f)
+hits = []
+for entry in idx.get('pages', []):
+    score = 0
+    text = (entry.get('title','') + ' ' + entry.get('summary','') + ' ' + ' '.join(entry.get('tags',[]))).lower()
+    for t in terms:
+        if t in text:
+            score += 1
+        if t in entry.get('title','').lower():
+            score += 2
+    if score > 0:
+        hits.append((score, entry))
+hits.sort(key=lambda x: -x[0])
+for score, h in hits[:15]:
+    cat = h.get('category', 'pages')
+    print(f\"  [{cat}] {h['title']} -- {h.get('path', '')}\")
+    if h.get('summary'):
+        print(f\"         {h['summary'][:120]}\")
+" "$query" "$INDEX_FILE" 2>/dev/null)
+
+    if [[ -n "$idx_results" ]]; then
+      echo "Index matches:"
+      echo "$idx_results"
+      echo ""
+    fi
+  fi
+
+  # Grep fallback across all wiki files
+  echo "Content matches:"
+  grep -rli "$query" "$WIKI_DIR" --include="*.md" 2>/dev/null | head -15 | while read -r f; do
+    local rel="${f#$WIKI_DIR/}"
+    local title=$(head -10 "$f" | grep -oP 'title:\s*"?\K[^"]+' || basename "$f" .md)
+    echo "  $rel -- $title"
+  done
+  echo ""
+}
+
+# ── List ───────────────────────────────────────────────────────────
+wiki_list() {
+  local filter_cat="${1:-}"
+
+  if [[ -n "$filter_cat" ]]; then
+    echo "=== Wiki: $filter_cat ==="
+    ls -1 "$WIKI_DIR/$filter_cat/"*.md 2>/dev/null | while read -r f; do
+      local title=$(head -10 "$f" | grep -oP 'title:\s*"?\K[^"]+' 2>/dev/null || basename "$f" .md)
+      local date=$(head -10 "$f" | grep -oP 'date:\s*"?\K[^"]+' 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null | xargs -I{} date -d @{} '+%Y-%m-%d' 2>/dev/null || echo "")
+      echo "  $(basename "$f" .md) -- $title ($date)"
+    done
+  else
+    echo "=== Wiki Pages ==="
+    for cat in "${CATEGORIES[@]}"; do
+      local count=$(ls "$WIKI_DIR/$cat/"*.md 2>/dev/null | wc -l)
+      if [[ "$count" -gt 0 ]]; then
+        echo ""
+        echo "[$cat] ($count pages)"
+        ls -1t "$WIKI_DIR/$cat/"*.md 2>/dev/null | head -5 | while read -r f; do
+          local title=$(head -10 "$f" | grep -oP 'title:\s*"?\K[^"]+' 2>/dev/null || basename "$f" .md)
+          echo "  - $(basename "$f" .md): $title"
+        done
+        [[ "$count" -gt 5 ]] && echo "  ... and $((count - 5)) more"
+      fi
+    done
+  fi
+  echo ""
+}
+
+# ── Show ───────────────────────────────────────────────────────────
+wiki_show() {
+  local page="$1"
+
+  # Resolve W-NNNN stable ID via index
+  if [[ "$page" =~ ^W-[0-9]+$ ]] && [[ -f "$INDEX_FILE" ]]; then
+    local found_path
+    found_path=$(python3 -c "
+import json, sys
+with open('$INDEX_FILE') as f:
+    idx = json.load(f)
+pid = sys.argv[1]
+for p in idx.get('pages', []):
+    if p.get('page_id') == pid:
+        print(p['path'])
+        break
+" "$page" 2>/dev/null)
+    if [[ -n "$found_path" ]]; then
+      cat "$WIKI_DIR/$found_path"
+      return 0
+    fi
+    echo "Page ID not found: $page"
+    return 1
+  fi
+
+  # Exact slug match across categories
+  local found=""
+  for cat in "${CATEGORIES[@]}"; do
+    if [[ -f "$WIKI_DIR/$cat/$page.md" ]]; then
+      found="$WIKI_DIR/$cat/$page.md"
+      break
+    fi
+  done
+
+  # Partial match
+  if [[ -z "$found" ]]; then
+    found=$(find "$WIKI_DIR" -name "*${page}*.md" -type f 2>/dev/null | head -1)
+  fi
+
+  if [[ -z "$found" ]]; then
+    echo "Page not found: $page"
+    echo "Try: brain-wiki search \"$page\""
+    return 1
+  fi
+
+  cat "$found"
+}
+
+wiki_backlinks() {
+  local page="$1"
+  local depth="${2:-1}"
+
+  if [[ ! -f "$INDEX_FILE" ]]; then
+    echo "Index not built. Run: brain-wiki rebuild-index"
+    return 1
+  fi
+
+  python3 - "$INDEX_FILE" "$WIKI_DIR" "$page" "$depth" << 'BKEOF'
+import json, sys, re
+from collections import deque
+
+index_file, wiki_dir, query, depth_str = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+depth = int(depth_str)
+
+with open(index_file) as f:
+    idx = json.load(f)
+
+# Resolve query to page_id (accepts W-NNNN, slug, or path)
+target_id = None
+pages_by_id = {}
+pages_by_slug = {}
+for p in idx.get('pages', []):
+    pid = p.get('page_id', '')
+    if pid:
+        pages_by_id[pid] = p
+    slug = p['path'].split('/')[-1].replace('.md', '')
+    pages_by_slug[slug] = p
+
+if re.match(r'^W-\d+$', query):
+    target_id = query
+elif query in pages_by_id:
+    target_id = query
+elif query in pages_by_slug:
+    target_id = pages_by_slug[query].get('page_id', '')
+
+if not target_id:
+    print(f"Page not found: {query}", file=sys.stderr)
+    sys.exit(2)
+
+links_to = idx.get('links_to', {})
+
+# BFS
+visited = set()
+queue = deque([(target_id, 0)])
+results = []
+
+while queue:
+    node, d = queue.popleft()
+    if node in visited or d > depth: continue
+    visited.add(node)
+    referrers = links_to.get(node, [])
+    for ref_id in referrers:
+        if ref_id not in visited:
+            p = pages_by_id.get(ref_id, {})
+            results.append({
+                'page_id': ref_id,
+                'title': p.get('title', ref_id),
+                'path': p.get('path', ''),
+                'depth': d + 1,
+            })
+            if d + 1 < depth:
+                queue.append((ref_id, d + 1))
+
+target_page = pages_by_id.get(target_id, {})
+print(f"Backlinks for {target_id} ({target_page.get('title', target_id)}):")
+print(f"  {len(results)} page(s) reference this")
+print()
+for r in sorted(results, key=lambda x: (x['depth'], x['title'])):
+    indent = '  ' * r['depth']
+    print(f"{indent}{r['page_id']}  {r['title']}")
+    print(f"{indent}  {r['path']}")
+BKEOF
+}
+
+# ── Create ─────────────────────────────────────────────────────────
+wiki_create() {
+  local page="$1"
+  local category="${2:-pages}"
+  local title="${3:-$page}"
+  local body="${4:-}"
+  local slug=$(echo "$page" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+  local output="$WIKI_DIR/$category/$slug.md"
+
+  if [[ -f "$output" ]]; then
+    echo "Page already exists: $output"
+    return 1
+  fi
+
+  # ── Assign stable page_id ─────────────────────────────────────
+  local counter_file="$WIKI_DIR/.page-id-counter"
+  local next_id=1
+  if [[ -f "$counter_file" ]]; then
+    next_id=$(( $(cat "$counter_file" 2>/dev/null || echo 0) + 1 ))
+  fi
+  local page_id
+  page_id=$(printf "W-%04d" "$next_id")
+  echo "$next_id" > "$counter_file"
+
+  cat > "$output" << EOF
+---
+title: "$title"
+page_id: "$page_id"
+type: "wiki"
+category: "$category"
+created: "$(date -Iseconds)"
+updated: "$(date -Iseconds)"
+tags: []
+related: []
+---
+
+# $title
+
+> Created $(date +%Y-%m-%d)
+
+$body
+
+## Related
+
+<!-- Add [[page-name]] links to cross-reference -->
+EOF
+
+  echo "Created: $output (id: $page_id)"
+  log "Created wiki page: $category/$slug (id: $page_id)"
+}
+
+# ── Link ───────────────────────────────────────────────────────────
+# Resolution priority:
+#   1. Exact path match (systems/foo, pages/bar)
+#   2. Exact slug match in non-session categories
+#   3. Optional --cat filter
+#   4. Fuzzy wildcard fallback (with ambiguity warning if multiple matches)
+_resolve_page() {
+  local query="$1"
+  local cat_filter="${2:-}"
+
+  # 1. Exact path match: category/slug
+  if [[ "$query" == */* ]]; then
+    local exact="$WIKI_DIR/${query}.md"
+    [[ -f "$exact" ]] && echo "$exact" && return 0
+    exact="$WIKI_DIR/${query}"
+    [[ -f "$exact" ]] && echo "$exact" && return 0
+  fi
+
+  # 2. Exact slug match in non-session categories (or filtered category)
+  local search_cats=()
+  if [[ -n "$cat_filter" ]]; then
+    search_cats=("$cat_filter")
+  else
+    for c in "${CATEGORIES[@]}"; do
+      [[ "$c" != "sessions" ]] && search_cats+=("$c")
+    done
+  fi
+
+  local exact_matches=()
+  for c in "${search_cats[@]}"; do
+    local f="$WIKI_DIR/$c/${query}.md"
+    [[ -f "$f" ]] && exact_matches+=("$f")
+  done
+
+  if [[ ${#exact_matches[@]} -eq 1 ]]; then
+    echo "${exact_matches[0]}"
+    return 0
+  elif [[ ${#exact_matches[@]} -gt 1 ]]; then
+    echo "AMBIGUOUS: ${#exact_matches[@]} exact matches for '$query':" >&2
+    for m in "${exact_matches[@]}"; do echo "  $(echo "$m" | sed "s|$WIKI_DIR/||")" >&2; done
+    echo "${exact_matches[0]}"
+    return 0
+  fi
+
+  # 3. Fuzzy wildcard fallback (all non-session categories, or filtered)
+  local fuzzy_matches=()
+  for c in "${search_cats[@]}"; do
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && fuzzy_matches+=("$f")
+    done < <(find "$WIKI_DIR/$c" -maxdepth 1 -name "*${query}*.md" -type f 2>/dev/null)
+  done
+
+  # If no non-session matches, try sessions as last resort
+  if [[ ${#fuzzy_matches[@]} -eq 0 && -z "$cat_filter" ]]; then
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && fuzzy_matches+=("$f")
+    done < <(find "$WIKI_DIR/sessions" -maxdepth 1 -name "*${query}*.md" -type f 2>/dev/null)
+  fi
+
+  if [[ ${#fuzzy_matches[@]} -eq 0 ]]; then
+    return 1
+  elif [[ ${#fuzzy_matches[@]} -gt 1 ]]; then
+    echo "AMBIGUOUS: ${#fuzzy_matches[@]} fuzzy matches for '$query':" >&2
+    for m in "${fuzzy_matches[@]}"; do echo "  $(echo "$m" | sed "s|$WIKI_DIR/||")" >&2; done
+  fi
+  echo "${fuzzy_matches[0]}"
+  return 0
+}
+
+wiki_link() {
+  local page1="$1"
+  local page2="$2"
+  local cat_filter=""
+
+  # Parse optional --cat flag
+  if [[ "${3:-}" == "--cat" && -n "${4:-}" ]]; then
+    cat_filter="$4"
+  fi
+
+  # Guard command substitutions so set -e doesn't kill the script
+  local f1 f2
+  f1=$(_resolve_page "$page1" "$cat_filter" || true)
+  if [[ -z "$f1" ]]; then
+    echo "Page not found: $page1"
+    return 1
+  fi
+  f2=$(_resolve_page "$page2" "$cat_filter" || true)
+  if [[ -z "$f2" ]]; then
+    echo "Page not found: $page2"
+    return 1
+  fi
+
+  # Normalize targets to canonical relative paths (category/slug.md)
+  local slug1 slug2
+  slug1=$(echo "$f1" | sed "s|$WIKI_DIR/||")
+  slug2=$(echo "$f2" | sed "s|$WIKI_DIR/||")
+
+  # Add related link to both pages using canonical paths
+  for pair in "$f1:$slug2" "$f2:$slug1"; do
+    local file="${pair%%:*}"
+    local target="${pair##*:}"
+    if ! grep -q "related:.*$target" "$file" 2>/dev/null; then
+      sed -i "s/related: \[/related: [\"$target\", /" "$file" 2>/dev/null
+      echo "Linked: $(basename "$file" .md) <-> $target"
+    fi
+  done
+  log "Linked: $slug1 <-> $slug2"
+}
+
+# ── Rebuild Index ──────────────────────────────────────────────────
+wiki_rebuild_index() {
+  log "Rebuilding wiki index"
+
+  python3 - "$WIKI_DIR" "$INDEX_FILE" << 'PYEOF'
+import os, sys, json, re
+from datetime import datetime
+
+wiki_dir = sys.argv[1]
+index_file = sys.argv[2]
+
+pages = []
+categories = {}
+tags_global = {}
+links = []        # (source_page_id, target_page_id) — W-NNNN pairs only
+links_to = {}     # page_id -> [page_ids that reference it]
+
+FENCED_RE     = re.compile(r'```.*?```', re.DOTALL)
+INLINE_CODE_RE = re.compile(r'`[^`]+`')
+WIKI_LINK_RE   = re.compile(r'\[\[([a-zA-Z][a-zA-Z0-9_\-./]*)\]\]')
+
+# Build slug->page_id lookup from all pages first (two-pass)
+slug_to_id = {}
+path_to_id = {}
+all_files = []
+for root, dirs, files in os.walk(wiki_dir):
+    dirs[:] = sorted(d for d in dirs if d != 'sessions')
+    for fname in sorted(files):
+        if not fname.endswith('.md'): continue
+        fpath = os.path.join(root, fname)
+        rel_path = os.path.relpath(fpath, wiki_dir)
+        all_files.append((fpath, rel_path, fname))
+
+for fpath, rel_path, fname in all_files:
+    try:
+        with open(fpath, 'r', errors='replace') as f:
+            content = f.read()
+    except: continue
+    m = re.search(r'^page_id:\s*["\']?(W-\d+)["\']?', content, re.MULTILINE)
+    if m:
+        pid = m.group(1)
+        slug = fname.replace('.md', '')
+        slug_to_id[slug] = pid
+        path_to_id[rel_path] = pid
+
+for fpath, rel_path, fname in all_files:
+    category = rel_path.split('/')[0] if '/' in rel_path else 'root'
+    try:
+        with open(fpath, 'r', errors='replace') as f:
+            content = f.read()
+    except: continue
+
+    title = fname.replace('.md', '').replace('-', ' ').title()
+    summary = ''
+    tags = []
+    related = []
+    page_id = ''
+    created = ''
+    updated = ''
+
+    # Parse frontmatter — handle both clean (---\n) and broken (field---\n) closing
+    fm_text = ''
+    fm_match = re.match(r'^---\s*\n(.*?)\n---(?:\s|$)', content, re.DOTALL)
+    if fm_match:
+        fm_text = fm_match.group(1)
+    else:
+        # Broken close: field: value---
+        bm = re.match(r'^---\s*\n(.*?)---\s*\n', content, re.DOTALL)
+        if bm: fm_text = bm.group(1)
+
+    if fm_text:
+        t = re.search(r'title:\s*["\']?([^"\'\n]+)', fm_text)
+        if t: title = t.group(1).strip()
+        c = re.search(r'created:\s*["\']?([^"\'\n]+)', fm_text)
+        if c: created = c.group(1).strip()
+        u = re.search(r'updated:\s*["\']?([^"\'\n]+)', fm_text)
+        if u: updated = u.group(1).strip()
+        pid_m = re.search(r'page_id:\s*["\']?(W-\d+)["\']?', fm_text)
+        if pid_m: page_id = pid_m.group(1)
+
+        tag_match = re.search(r'tags:\s*\[([^\]]*)\]', fm_text)
+        if tag_match:
+            tags = [t.strip().strip('"').strip("'") for t in tag_match.group(1).split(',') if t.strip()]
+
+        rel_match = re.search(r'related:\s*\[([^\]]*)\]', fm_text)
+        if rel_match:
+            related = [r.strip().strip('"').strip("'") for r in rel_match.group(1).split(',') if r.strip()]
+
+    # Summary: first non-empty non-heading body line
+    body = re.sub(r'^---.*?---\s*\n?', '', content, count=1, flags=re.DOTALL)
+    for line in body.split('\n'):
+        line = line.strip()
+        if line and not line.startswith('#') and not line.startswith('>') and not line.startswith('---'):
+            summary = line[:200]
+            break
+
+    # Links: from related: (already W-NNNN) + [[wiki_link]] in body (skip code blocks)
+    if page_id:
+        # related: entries that are W-NNNN IDs
+        for r in related:
+            if re.match(r'^W-\d+$', r):
+                links.append((page_id, r))
+                links_to.setdefault(r, set()).add(page_id)
+
+        # [[wiki_link]] in body — strip fenced + inline code first
+        clean_body = FENCED_RE.sub('', body)
+        clean_body = INLINE_CODE_RE.sub('', clean_body)
+        for m in WIKI_LINK_RE.finditer(clean_body):
+            slug = m.group(1).split('/')[-1].replace('.md', '')
+            if slug in slug_to_id:
+                target_id = slug_to_id[slug]
+                if target_id != page_id:
+                    links.append((page_id, target_id))
+                    links_to.setdefault(target_id, set()).add(page_id)
+
+    page_entry = {
+        'title': title,
+        'path': rel_path,
+        'page_id': page_id,
+        'category': category,
+        'tags': tags,
+        'related': related,
+        'summary': summary,
+        'created': created,
+        'updated': updated,
+        'size': len(content),
+    }
+    pages.append(page_entry)
+    categories[category] = categories.get(category, 0) + 1
+    for tag in tags:
+        tags_global[tag] = tags_global.get(tag, 0) + 1
+
+# Deduplicate links
+links = list({(s, t) for s, t in links})
+links_to_serial = {k: sorted(v) for k, v in links_to.items()}
+
+index = {
+    'generated': datetime.now().isoformat(),
+    'total_pages': len(pages),
+    'categories': categories,
+    'tags': tags_global,
+    'links': [{'from': s, 'to': t} for s, t in sorted(links)],
+    'links_to': links_to_serial,
+    'pages': sorted(pages, key=lambda p: p.get('updated') or p.get('created') or '', reverse=True),
+}
+
+with open(index_file, 'w') as f:
+    json.dump(index, f, indent=2)
+
+real_links = len(links)
+print(f"Index rebuilt: {len(pages)} pages across {len(categories)} categories")
+print(f"Tags: {len(tags_global)} unique | Links: {real_links} (W-NNNN edges) | Backlink map: {len(links_to_serial)} nodes")
+for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
+    print(f"  [{cat}] {count} pages")
+PYEOF
+
+  log "Wiki index rebuilt"
+
+  # Regenerate machine-readable manifests for systems/ and pages/ (§9.12)
+  local manifest_lib="$_WIKI_SCRIPT_DIR/../lib/wiki-manifest.py"
+  if [[ -f "$manifest_lib" ]]; then
+    python3 "$manifest_lib" "$WIKI_DIR" 2>/dev/null && log "Manifests regenerated (systems/, pages/)" || log "WARN: manifest regeneration failed (non-fatal)"
+  fi
+}
+
+# ── Import Memories ────────────────────────────────────────────────
+wiki_import_memories() {
+  local memory_dir="$BRAIN/brain/memory"
+  local wiki_people="$WIKI_DIR/people"
+  local wiki_systems="$WIKI_DIR/systems"
+  local wiki_tools="$WIKI_DIR/tools"
+  local imported=0
+
+  log "Importing memories to wiki"
+
+  for mem_file in "$memory_dir"/*.md; do
+    [[ ! -f "$mem_file" ]] && continue
+    [[ "$(basename "$mem_file")" == "MEMORY.md" ]] && continue
+
+    local basename_f=$(basename "$mem_file" .md)
+    local mem_type=$(head -10 "$mem_file" | grep -oP 'type:\s*\K.*' | tr -d '"' || echo "unknown")
+    local mem_name=$(head -10 "$mem_file" | grep -oP 'name:\s*\K.*' | tr -d '"' || echo "$basename_f")
+
+    # Determine wiki category based on memory type
+    local wiki_cat="pages"
+    case "$mem_type" in
+      reference) wiki_cat="systems" ;;
+      project) wiki_cat="systems" ;;
+      feedback) wiki_cat="pages" ;;
+      user) wiki_cat="people" ;;
+    esac
+
+    local target="$WIKI_DIR/$wiki_cat/$basename_f.md"
+
+    # Skip if already exists
+    [[ -f "$target" ]] && continue
+
+    # Copy with wiki frontmatter added
+    python3 -c "
+import sys, re
+
+with open(sys.argv[1]) as f:
+    content = f.read()
+
+# Parse existing frontmatter
+fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', content, re.DOTALL)
+if fm_match:
+    fm_block = fm_match.group(1)
+    body = fm_match.group(2)
+else:
+    fm_block = ''
+    body = content
+
+# Extract fields
+name = ''
+desc = ''
+mem_type = ''
+for line in fm_block.split('\n'):
+    if line.startswith('name:'):
+        name = line.split(':', 1)[1].strip().strip('\"')
+    elif line.startswith('description:'):
+        desc = line.split(':', 1)[1].strip().strip('\"')
+    elif line.startswith('type:'):
+        mem_type = line.split(':', 1)[1].strip().strip('\"')
+
+if not name:
+    name = sys.argv[3]
+
+wiki_cat = sys.argv[4]
+
+# Write wiki page
+out = f'''---
+title: \"{name}\"
+type: \"wiki\"
+category: \"{wiki_cat}\"
+source: \"memory\"
+memory_type: \"{mem_type}\"
+created: \"$(date -Iseconds)\"
+updated: \"$(date -Iseconds)\"
+tags: [\"{mem_type}\", \"imported\"]
+related: []
+---
+
+# {name}
+
+> Imported from memory: {sys.argv[3]}
+
+{body.strip()}
+'''
+
+with open(sys.argv[2], 'w') as f:
+    f.write(out)
+" "$mem_file" "$target" "$basename_f" "$wiki_cat"
+
+    imported=$((imported + 1))
+  done
+
+  echo "Imported $imported memory files to wiki"
+  log "Imported $imported memories"
+}
+
+# ── Import Devlogs ────────────────────────────────────────────────
+wiki_import_devlogs() {
+  local devlog_dir="$BRAIN_DIR/work/logs/devlog"
+  local wiki_sessions="$WIKI_DIR/sessions"
+  local imported=0
+
+  log "Importing devlogs to wiki"
+
+  for devlog in "$devlog_dir"/*.md; do
+    [[ ! -f "$devlog" ]] && continue
+    local basename_f=$(basename "$devlog" .md)
+    local target="$wiki_sessions/devlog-$basename_f.md"
+
+    [[ -f "$target" ]] && continue
+
+    # Create a lightweight pointer with summary -- NOT a full copy
+    local title=$(head -10 "$devlog" | grep -oP 'title:\s*"?\K[^"]+' 2>/dev/null || echo "$basename_f")
+    local date=$(head -10 "$devlog" | grep -oP 'date:\s*"?\K[^"]+' 2>/dev/null || echo "")
+    local tags=$(head -10 "$devlog" | grep -oP 'tags:\s*\K.*' 2>/dev/null || echo "[]")
+    # Extract first non-frontmatter, non-heading paragraph as summary
+    local summary=$(sed -n '/^---$/,/^---$/d; /^#/d; /^>/d; /^$/d; p' "$devlog" 2>/dev/null | head -3 | tr '\n' ' ' | cut -c1-300)
+
+    cat > "$target" << EOF
+---
+title: "Devlog: $title"
+type: "wiki"
+category: "sessions"
+source: "devlog"
+source_path: "work/logs/devlog/$basename_f.md"
+date: "$date"
+created: "$(date -Iseconds)"
+tags: ["devlog", "session"]
+related: []
+---
+
+# Devlog: $title
+
+> **Source:** \`work/logs/devlog/$basename_f.md\` -- read the full devlog there.
+
+**Summary:** $summary
+EOF
+
+    imported=$((imported + 1))
+  done
+
+  echo "Imported $imported devlog(s) to wiki"
+  log "Imported $imported devlogs"
+}
+
+# ── Compact ────────────────────────────────────────────────────────
+wiki_compact() {
+  local dry_run="${1:-false}"
+  local keep_days="${2:-7}"
+  local archive_dir="$WIKI_DIR/sessions/archive"
+
+  mkdir -p "$archive_dir"
+
+  log "Compacting wiki (keep_days=$keep_days, dry_run=$dry_run)"
+
+  python3 - "$WIKI_DIR" "$archive_dir" "$keep_days" "$dry_run" << 'PYEOF'
+import os, sys, re, json
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+wiki_dir = sys.argv[1]
+archive_dir = sys.argv[2]
+keep_days = int(sys.argv[3])
+dry_run = sys.argv[4] == 'true'
+
+sessions_dir = os.path.join(wiki_dir, 'sessions')
+cutoff = datetime.now() - timedelta(days=keep_days)
+
+# Group old session files by month
+monthly = defaultdict(list)  # "2026-03" -> [files]
+keep = []
+archive_candidates = []
+
+for fname in sorted(os.listdir(sessions_dir)):
+    if not fname.endswith('.md'):
+        continue
+    fpath = os.path.join(sessions_dir, fname)
+    if os.path.isdir(fpath):
+        continue
+
+    # Extract date from filename (2026-03-14-1910-*.md or devlog-2026-03-14-*.md)
+    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', fname)
+    if not date_match:
+        keep.append(fname)
+        continue
+
+    file_date = datetime.strptime(date_match.group(1), '%Y-%m-%d')
+    month_key = file_date.strftime('%Y-%m')
+
+    if file_date >= cutoff:
+        keep.append(fname)
+    else:
+        monthly[month_key].append((fname, fpath, file_date))
+        archive_candidates.append(fname)
+
+print(f"Sessions: {len(keep)} recent (keep), {len(archive_candidates)} old (compact)")
+print(f"Months to compact: {sorted(monthly.keys())}")
+print()
+
+if not archive_candidates:
+    print("Nothing to compact. All sessions are within the keep window.")
+    sys.exit(0)
+
+if dry_run:
+    print("=== DRY RUN ===")
+    for month, files in sorted(monthly.items()):
+        print(f"\n[{month}] {len(files)} files -> monthly-summary-{month}.md")
+        for fname, _, fdate in files[:5]:
+            print(f"  - {fname}")
+        if len(files) > 5:
+            print(f"  ... and {len(files) - 5} more")
+    sys.exit(0)
+
+# Build monthly summaries
+total_archived = 0
+total_saved_bytes = 0
+
+for month, files in sorted(monthly.items()):
+    summary_path = os.path.join(sessions_dir, f"monthly-summary-{month}.md")
+
+    # Skip if already compacted
+    if os.path.exists(summary_path):
+        print(f"[{month}] Already compacted, skipping {len(files)} files")
+        # Still move originals to archive
+        for fname, fpath, _ in files:
+            dest = os.path.join(archive_dir, fname)
+            if not os.path.exists(dest) and os.path.exists(fpath):
+                os.rename(fpath, dest)
+                total_archived += 1
+        continue
+
+    # Extract key data from each file
+    entries = []
+    original_bytes = 0
+
+    for fname, fpath, fdate in files:
+        original_bytes += os.path.getsize(fpath)
+
+        with open(fpath, 'r', errors='replace') as f:
+            content = f.read()
+
+        # Parse title
+        title_match = re.search(r'title:\s*"?([^"\n]+)', content)
+        title = title_match.group(1).strip() if title_match else fname
+
+        # Extract key sections
+        session_id_match = re.search(r'session_id:\s*"?([^"\n]+)', content)
+        session_id = session_id_match.group(1).strip()[:12] if session_id_match else ''
+
+        # Get file counts
+        files_edited = len(re.findall(r'^- `[^`]+`', content, re.MULTILINE))
+
+        # Get conversation highlights (first 5 human messages)
+        human_msgs = re.findall(r'\*\*Human:\*\* (.+)', content)[:5]
+
+        # Get Discord messages
+        discord_msgs = re.findall(r'- \*\*(\w+)\*\* \([^)]+\): (.+)', content)[:3]
+
+        # Get tools used
+        tools_match = re.search(r'## Tools Used\s+\n(.+)', content)
+        tools = tools_match.group(1).strip() if tools_match else ''
+
+        # Get commits
+        commits = re.findall(r'```\s*\n(git commit.+?)\n```', content, re.DOTALL)
+
+        entry = {
+            'date': fdate.strftime('%Y-%m-%d'),
+            'title': title,
+            'session_id': session_id,
+            'files_edited': files_edited,
+            'human_msgs': human_msgs,
+            'discord_msgs': discord_msgs,
+            'tools': tools,
+            'commits': commits,
+            'source': fname,
+        }
+        entries.append(entry)
+
+    # Sort entries by date
+    entries.sort(key=lambda e: e['date'])
+
+    # Write monthly summary
+    month_name = datetime.strptime(month, '%Y-%m').strftime('%B %Y')
+
+    with open(summary_path, 'w') as out:
+        out.write(f'''---
+title: "Monthly Summary - {month_name}"
+type: "wiki"
+category: "sessions"
+month: "{month}"
+session_count: {len(entries)}
+created: "{datetime.now().isoformat()}"
+tags: ["monthly-summary", "compacted"]
+related: []
+---
+
+# {month_name} - Session Summary
+
+> {len(entries)} sessions compacted into this summary
+
+''')
+
+        for entry in entries:
+            out.write(f"## {entry['date']} - {entry['title']}\n\n")
+            if entry['session_id']:
+                out.write(f"Session: `{entry['session_id']}...`\n\n")
+
+            if entry['human_msgs']:
+                out.write("**Key exchanges:**\n")
+                for msg in entry['human_msgs']:
+                    # Truncate long messages
+                    clean = msg[:150] + ('...' if len(msg) > 150 else '')
+                    out.write(f"- {clean}\n")
+                out.write("\n")
+
+            if entry['discord_msgs']:
+                out.write("**Discord:**\n")
+                for user, msg in entry['discord_msgs']:
+                    out.write(f"- {user}: {msg[:120]}\n")
+                out.write("\n")
+
+            if entry['files_edited']:
+                out.write(f"Files edited: {entry['files_edited']}\n\n")
+
+            if entry['commits']:
+                out.write("**Commits:**\n")
+                for c in entry['commits'][:3]:
+                    out.write(f"- `{c[:100]}`\n")
+                out.write("\n")
+
+            out.write("---\n\n")
+
+    summary_bytes = os.path.getsize(summary_path)
+    ratio = original_bytes / summary_bytes if summary_bytes > 0 else 0
+
+    print(f"[{month}] {len(files)} files -> monthly-summary-{month}.md ({original_bytes // 1024}KB -> {summary_bytes // 1024}KB, {ratio:.1f}x compression)")
+    total_saved_bytes += (original_bytes - summary_bytes)
+
+    # Move originals to archive
+    for fname, fpath, _ in files:
+        dest = os.path.join(archive_dir, fname)
+        if os.path.exists(fpath):
+            os.rename(fpath, dest)
+            total_archived += 1
+
+print(f"\nCompacted: {total_archived} files archived, {total_saved_bytes // 1024}KB saved")
+print(f"Originals preserved in: {archive_dir}")
+PYEOF
+
+  log "Compact complete"
+}
+
+# ── Stats ──────────────────────────────────────────────────────────
+wiki_stats() {
+  echo "=== Wiki Statistics ==="
+  echo ""
+  local total=0
+  for cat in "${CATEGORIES[@]}"; do
+    local count=$(ls "$WIKI_DIR/$cat/"*.md 2>/dev/null | wc -l)
+    total=$((total + count))
+    echo "  [$cat] $count pages"
+  done
+  echo ""
+  echo "Total: $total pages"
+
+  if [[ -f "$INDEX_FILE" ]]; then
+    echo ""
+    echo "Index:"
+    python3 -c "
+import json
+with open('$INDEX_FILE') as f:
+    idx = json.load(f)
+print(f\"  Generated: {idx.get('generated', 'never')}\")
+print(f\"  Indexed: {idx.get('total_pages', 0)} pages\")
+print(f\"  Tags: {len(idx.get('tags', {}))} unique\")
+print(f\"  Links: {len(idx.get('links', []))} cross-references\")
+" 2>/dev/null || echo "  (index needs rebuild)"
+  fi
+
+  # Size
+  local wiki_size=$(du -sh "$WIKI_DIR" 2>/dev/null | cut -f1)
+  echo ""
+  echo "Disk: $wiki_size"
+}
+
+# ── Graph ──────────────────────────────────────────────────────────
+wiki_graph() {
+  if [[ ! -f "$INDEX_FILE" ]]; then
+    echo "Index not built. Run: brain-wiki rebuild-index"
+    return 1
+  fi
+
+  python3 -c "
+import json
+
+with open('$INDEX_FILE') as f:
+    idx = json.load(f)
+
+links = idx.get('links', [])
+related = {}
+
+# From explicit links
+for link in links:
+    s, t = link['from'], link['to']
+    related.setdefault(s, set()).add(t)
+
+# From related fields
+for page in idx.get('pages', []):
+    name = page['path'].split('/')[-1].replace('.md', '')
+    for r in page.get('related', []):
+        if r:
+            related.setdefault(name, set()).add(r)
+
+if not related:
+    print('No cross-references found yet.')
+    print('Add [[page-name]] links in wiki pages, or use: brain-wiki link page1 page2')
+else:
+    print('=== Wiki Graph ===')
+    print()
+    for node, targets in sorted(related.items()):
+        for t in sorted(targets):
+            print(f'  {node} --> {t}')
+" 2>/dev/null
+}
+
+# ── Main dispatch ──────────────────────────────────────────────────
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  search)
+    [[ -z "${1:-}" ]] && { echo "Usage: brain-wiki search \"query\""; exit 1; }
+    wiki_search "$*"
+    ;;
+  list)
+    CAT=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --category|--cat) CAT="$2"; shift 2 ;;
+        *) CAT="$1"; shift ;;
+      esac
+    done
+    wiki_list "$CAT"
+    ;;
+  show)
+    [[ -z "${1:-}" ]] && { echo "Usage: brain-wiki show <page|W-NNNN>"; exit 1; }
+    wiki_show "$1"
+    ;;
+  backlinks|bl)
+    [[ -z "${1:-}" ]] && { echo "Usage: brain-wiki backlinks <page|W-NNNN> [--depth N]"; exit 1; }
+    _BL_PAGE="$1"; shift
+    _BL_DEPTH=1
+    [[ "${1:-}" == "--depth" ]] && { _BL_DEPTH="$2"; shift 2; }
+    wiki_backlinks "$_BL_PAGE" "$_BL_DEPTH"
+    ;;
+  create)
+    PAGE="${1:-}"
+    [[ -z "$PAGE" ]] && { echo "Usage: brain-wiki create <slug> [--cat category] [--title \"...\"] [--body \"...\"]"; exit 1; }
+    shift
+    CAT="pages"
+    _TITLE=""
+    _BODY=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --cat|--category) CAT="$2"; shift 2 ;;
+        --title) _TITLE="$2"; shift 2 ;;
+        --body) _BODY="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    wiki_create "$PAGE" "$CAT" "${_TITLE:-$PAGE}" "$_BODY"
+    ;;
+  edit)
+    PAGE="${1:-}"
+    found=$(find "$WIKI_DIR" -name "*${PAGE}*.md" -type f 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then
+      echo "$found"
+    else
+      echo "Page not found: $PAGE"
+    fi
+    ;;
+  link)
+    [[ -z "${1:-}" || -z "${2:-}" ]] && { echo "Usage: brain-wiki link <page1> <page2>"; exit 1; }
+    wiki_link "$1" "$2"
+    ;;
+  rebuild-index|index)
+    wiki_rebuild_index
+    # Also regenerate hub link sections after index rebuild
+    python3 "$_WIKI_SCRIPT_DIR/../lib/wiki-hub-generate.py" "$WIKI_DIR" 2>/dev/null \
+      | grep -v '^$' | sed 's/^/  [hubs] /' || true
+    ;;
+
+  hub)
+    SUBCMD="${1:-generate}"; shift || true
+    case "$SUBCMD" in
+      generate)
+        DR_FLAG=""
+        [[ "${1:-}" == "--dry-run" ]] && DR_FLAG="--dry-run"
+        python3 "$_WIKI_SCRIPT_DIR/../lib/wiki-hub-generate.py" "$WIKI_DIR" $DR_FLAG
+        ;;
+      list)
+        echo "Hub pages:"
+        for f in "$WIKI_DIR/pages"/hub_*.md; do
+          [[ -f "$f" ]] || continue
+          title=$(grep '^title:' "$f" | head -1 | sed 's/title: *//;s/"//g')
+          count=$(grep -c '^\- \[\[' "$f" 2>/dev/null || echo 0)
+          printf "  %-40s  %s linked\n" "$(basename "$f")" "$count"
+        done
+        ;;
+      *)
+        echo "brain-wiki hub <generate|list> [--dry-run]"
+        ;;
+    esac
+    ;;
+  manifest)
+    # Generate machine-readable manifests for systems/ and pages/
+    MANIFEST_FOLDER="${1:-}"
+    TOOLS_LIB="$_WIKI_SCRIPT_DIR/../lib"
+    if [[ -n "$MANIFEST_FOLDER" ]]; then
+      python3 "$TOOLS_LIB/wiki-manifest.py" "$WIKI_DIR" "$MANIFEST_FOLDER"
+    else
+      python3 "$TOOLS_LIB/wiki-manifest.py" "$WIKI_DIR"
+    fi
+    ;;
+  import-memories)
+    wiki_import_memories
+    echo "Auto-rebuilding wiki index..."
+    wiki_rebuild_index
+    ;;
+  import-sessions)
+    echo "Running brain-session-digest --all..."
+    brain-session-digest --all
+    echo "Auto-rebuilding wiki index..."
+    wiki_rebuild_index
+    ;;
+  import-devlogs)
+    wiki_import_devlogs
+    echo "Auto-rebuilding wiki index..."
+    wiki_rebuild_index
+    ;;
+  compact)
+    DR=false
+    DAYS=7
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dry-run) DR=true; shift ;;
+        --keep) DAYS="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    wiki_compact "$DR" "$DAYS"
+    ;;
+  stats)
+    wiki_stats
+    ;;
+  graph)
+    wiki_graph
+    ;;
+  help|*)
+    echo "brain-wiki -- Knowledge wiki for the GM GN Repeat brain"
+    echo ""
+    echo "Commands:"
+    echo "  search \"query\"        Search all wiki pages"
+    echo "  list [--cat <cat>]    List pages (optionally by category)"
+    echo "  show <page>           Display a wiki page"
+    echo "  create <title> [--cat <cat>]  Create a new page"
+    echo "  edit <page>           Print page path for editing"
+    echo "  link <p1> <p2>        Cross-reference two pages"
+    echo "  rebuild-index         Rebuild search index (also regenerates hub links)"
+  echo "  hub generate          Regenerate ## Linked Pages in all hub_*.md pages"
+  echo "  hub list              List hub pages and linked-page counts"
+  echo "  manifest [folder]     Generate machine-readable manifest.json for systems/ and pages/"
+    echo "  import-memories       Import .claude memories into wiki"
+    echo "  import-sessions       Digest all sessions into wiki"
+    echo "  import-devlogs        Import devlogs into wiki"
+    echo "  stats                 Show wiki statistics"
+    echo "  graph                 Show cross-reference graph"
+    echo ""
+    echo "Categories: ${CATEGORIES[*]}"
+    ;;
+esac
