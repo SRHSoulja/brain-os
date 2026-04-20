@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# brain-bootstrap-new-user — Initialize a fresh brain install for a new operator
+#
+# Usage: brain-bootstrap-new-user [--brain-dir <path>] [--dry-run] [--quiet]
+#
+# What this does:
+#   1. Validates prerequisites (bash 4+, python3, git)
+#   2. Determines the brain root directory
+#   3. Creates ~/bin/ symlinks for all brain scripts
+#   4. Creates required ops directories if missing
+#   5. Copies settings templates to .claude/ .codex/ .gemini/ (if not already present)
+#   6. Prints a first-run checklist: what the user still needs to fill in
+#
+# What this does NOT do:
+#   - Write persona.md or goals.md for you (those require your input)
+#   - Set up any cloud services, APIs, or external dependencies
+#   - Require or configure codex-lab (that is optional — see brain/MANUAL.md §5)
+#
+set -euo pipefail
+
+BRAIN_DIR="${BRAIN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+DRY_RUN=false
+QUIET=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --brain-dir) BRAIN_DIR="$2"; shift 2 ;;
+    --dry-run)   DRY_RUN=true; shift ;;
+    --quiet)     QUIET=true; shift ;;
+    -h|--help)
+      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+_log() { $QUIET || echo "$@"; }
+_dry() { $DRY_RUN && echo "  [dry-run] $*" || eval "$@"; }
+
+_log ""
+_log "Brain bootstrap — new user setup"
+_log "Brain root: $BRAIN_DIR"
+_log ""
+
+# ── 1. Prerequisites ────────────────────────────────────────────
+_log "Checking prerequisites..."
+
+ERRORS=()
+
+bash_major="${BASH_VERSINFO[0]:-0}"
+if [[ "$bash_major" -lt 4 ]]; then
+  ERRORS+=("bash 4+ required (found: $BASH_VERSION)")
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  ERRORS+=("python3 not found — required by brain-resume and other scripts")
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  ERRORS+=("git not found — required for session commits and brain state")
+fi
+
+if [[ ${#ERRORS[@]} -gt 0 ]]; then
+  echo "Prerequisites failed:" >&2
+  for e in "${ERRORS[@]}"; do echo "  - $e" >&2; done
+  exit 1
+fi
+
+_log "  bash $BASH_VERSION ✓"
+_log "  python3 $(python3 --version 2>&1 | cut -d' ' -f2) ✓"
+_log "  git $(git --version | cut -d' ' -f3) ✓"
+_log ""
+
+# ── 2. Brain dir validation ─────────────────────────────────────
+if [[ ! -d "$BRAIN_DIR/scripts/bin" ]]; then
+  echo "Error: brain scripts not found at $BRAIN_DIR/scripts/bin" >&2
+  echo "Make sure BRAIN_DIR points to the root of this repo." >&2
+  exit 1
+fi
+
+# ── 3. ~/bin symlinks ───────────────────────────────────────────
+_log "Setting up ~/bin symlinks..."
+mkdir -p "$HOME/bin"
+
+linked=0
+skipped=0
+for script in "$BRAIN_DIR/scripts/bin/"*; do
+  name="$(basename "$script")"
+  target="$HOME/bin/$name"
+  if [[ -L "$target" && "$(readlink "$target")" == "$script" ]]; then
+    skipped=$((skipped + 1))
+  elif [[ -e "$target" ]]; then
+    _log "  SKIP (exists, not our symlink): $name"
+    skipped=$((skipped + 1))
+  else
+    _dry "ln -s \"$script\" \"$target\""
+    linked=$((linked + 1))
+  fi
+done
+
+_log "  Linked: $linked new, $skipped already present"
+_log ""
+
+# Make sure ~/bin is on PATH
+if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+  _log "  NOTE: ~/bin is not in your PATH. Add this to ~/.bashrc or ~/.zshrc:"
+  _log "    export PATH=\"\$HOME/bin:\$PATH\""
+  _log ""
+fi
+
+# ── 4. Required ops directories ─────────────────────────────────
+_log "Ensuring required directories..."
+
+dirs=(
+  "brain/ops/tasks/queue"
+  "brain/ops/tasks/active"
+  "brain/ops/tasks/completed"
+  "brain/ops/tasks/deferred"
+  "brain/ops/derived"
+  "work/logs"
+  "work/outputs"
+  "work/inbox/checkpoints"
+)
+
+for d in "${dirs[@]}"; do
+  if [[ ! -d "$BRAIN_DIR/$d" ]]; then
+    _dry "mkdir -p \"$BRAIN_DIR/$d\""
+    _log "  created: $d"
+  fi
+done
+
+_log "  Directories OK"
+_log ""
+
+# ── 5. Settings templates ───────────────────────────────────────
+_log "Checking seat settings..."
+
+SETTINGS_TEMPLATE="$BRAIN_DIR/.claude/settings.json"
+CODEX_TEMPLATE="$BRAIN_DIR/.codex/hooks.json"
+GEMINI_TEMPLATE="$BRAIN_DIR/.gemini/settings.json"
+
+if [[ -f "$SETTINGS_TEMPLATE" && ! -f "$HOME/.claude/projects/$(echo "$BRAIN_DIR" | tr '/' '-'|sed 's/^-//')/settings.json" ]]; then
+  _log "  NOTE: Copy .claude/settings.json to your Claude Code project settings when ready."
+  _log "        Template is at: $SETTINGS_TEMPLATE"
+fi
+
+if [[ -f "$CODEX_TEMPLATE" ]]; then
+  _log "  .codex/hooks.json template available at: $CODEX_TEMPLATE"
+fi
+if [[ -f "$GEMINI_TEMPLATE" ]]; then
+  _log "  .gemini/settings.json template available at: $GEMINI_TEMPLATE"
+fi
+_log ""
+
+# ── 6. First-run checklist ──────────────────────────────────────
+PERSONA_FILLED=false
+GOALS_FILLED=false
+[[ -f "$BRAIN_DIR/brain/persona/persona.md" ]] && \
+  ! grep -q "^> Fill this in" "$BRAIN_DIR/brain/persona/persona.md" 2>/dev/null && \
+  PERSONA_FILLED=true
+[[ -f "$BRAIN_DIR/brain/goals/goals.md" ]] && \
+  ! grep -q "^> Fill this in" "$BRAIN_DIR/brain/goals/goals.md" 2>/dev/null && \
+  GOALS_FILLED=true
+
+echo ""
+echo "════════════════════════════════════════"
+echo " Brain bootstrap complete"
+echo "════════════════════════════════════════"
+echo ""
+echo "First-run checklist:"
+echo ""
+$PERSONA_FILLED \
+  && echo "  [✓] brain/persona/persona.md — filled in" \
+  || echo "  [ ] brain/persona/persona.md — FILL THIS IN (who you are, tone, domain)"
+$GOALS_FILLED \
+  && echo "  [✓] brain/goals/goals.md — filled in" \
+  || echo "  [ ] brain/goals/goals.md — FILL THIS IN (current focus, active initiatives)"
+echo "  [ ] Review CLAUDE.md / AGENTS.md / GEMINI.md — adjust session-start rules if needed"
+echo "  [ ] Open a Claude Code session in $BRAIN_DIR — the brain is ready to run"
+echo ""
+echo "Optional:"
+echo "  [ ] Set CODEX_LAB_PATH if you use a Codex handoff directory (see brain/MANUAL.md §5)"
+echo "  [ ] Add more services to brain/services/brain-monitor/lib/config.js"
+echo "  [ ] Set up git identity: git -C $BRAIN_DIR config user.name / user.email"
+echo ""
+echo "Brain root: $BRAIN_DIR"
+echo "Scripts:    $HOME/bin/ (symlinked)"
+echo ""
