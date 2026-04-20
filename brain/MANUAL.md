@@ -140,7 +140,7 @@ task contract narrows the allowed surfaces.
 | `brain/core-knowledge/identity.md` | Identity definition. Modify only via `--identity` flag on promote. |
 | `brain/ops/core-memory/queue.jsonl` | Unresolved core-memory items. Hard-gates session close. |
 | `brain/ops/core-memory/resolved.jsonl` | Resolved core-memory items. |
-| `~/.claude/projects/-home-arson-gmgn-brain/memory/` | Claude Code auto-memory (seat-specific -- see §7.1). |
+| `~/.claude/projects/<your-brain-slug>/memory/` | Claude Code auto-memory (seat-specific -- see §7.1). |
 
 ### 1.5 Proof of execution
 
@@ -707,11 +707,11 @@ surfaces here, as a warning -- not a hard block.
 ### 6.6 VE activation: repo-owned service refresh (enforced)
 
 `brain-ve-activate` restarts all PM2 processes whose `pm_exec_path` starts
-with `~/gmgn-brain/brain/services/` immediately after `git pull`. This is
+with `~/brain/brain/services/` immediately after `git pull`. This is
 enforced in the script, not operator habit.
 
 **Why:** services under `brain/services/` (canonical repo ownership introduced
-in VE canonicalization Phase 1) run from the gmgn-brain working tree. A git
+in VE canonicalization Phase 1) run from the brain working tree. A git
 pull updates source on disk but PM2 keeps the old process. Without restart, VE
 silently serves stale code after laptop-side commits.
 
@@ -745,7 +745,7 @@ shared rules here.**
   repo commits / Clip deploy / VE yield, brain-memory-maintain, brain-
   next-focus). Inherits the core-memory gate via `brain-closeout-gate`.
 - **Project memory store.**
-  `~/.claude/projects/-home-arson-gmgn-brain/memory/`. Auto-loaded every
+  `~/.claude/projects/<your-brain-slug>/memory/`. Auto-loaded every
   conversation. Other seats do not use this store.
 - **Checkpointing.** Use `brain-checkpoint "reason"` explicitly across all
   seats. Do not rely on seat-specific compaction hooks.

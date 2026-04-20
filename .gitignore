@@ -1,0 +1,27 @@
+# Runtime state — never commit
+brain/ops/derived/
+brain/ops/events.log
+brain/ops/events.jsonl
+brain/ops/tasks/active/
+brain/ops/tasks/inbox/
+brain/index/
+brain/ops/.brain-active-seat.json
+brain/ops/.brain-heartbeat.json
+
+# Operator-specific content
+brain/memory/
+brain/persona/persona.md
+brain/goals/goals.md
+work/inbox/
+work/logs/
+work/outputs/
+work/exports/
+
+# Agent seat state
+.brain-active-seat.json
+.brain-heartbeat.json
+
+# OS / editor
+.DS_Store
+*.swp
+*.tmp
