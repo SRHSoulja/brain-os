@@ -109,6 +109,17 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
   _log ""
 fi
 
+# Export BRAIN_DIR so all brain-* commands resolve the correct repo root
+_SHELL_RC="$HOME/.bashrc"
+[[ -f "$HOME/.zshrc" ]] && _SHELL_RC="$HOME/.zshrc"
+_BRAIN_DIR_EXPORT="export BRAIN_DIR=\"$BRAIN_DIR\""
+if ! grep -qF "BRAIN_DIR=\"$BRAIN_DIR\"" "$_SHELL_RC" 2>/dev/null; then
+  _dry "echo '$_BRAIN_DIR_EXPORT' >> $_SHELL_RC"
+  _log "  Added to $_SHELL_RC: $_BRAIN_DIR_EXPORT"
+  _log "  Run: source $_SHELL_RC  (or open a new terminal)"
+  _log ""
+fi
+
 # ── 4. Required ops directories ─────────────────────────────────
 _log "Ensuring required directories..."
 
