@@ -1,0 +1,600 @@
+#!/bin/bash
+# brain-context — Query-aware context assembly for the GM GN Repeat brain
+# Usage:
+#   brain-context "query"                  Preview best context for a query
+#   brain-context --build-search-index     Build deployable search index for Clip
+#   brain-context --health                 Context health diagnostics
+#   brain-context --stats                  Tier breakdown and size stats
+#
+# brain-context is the SINGLE SOURCE of retrieval/scoring logic.
+# Clip consumes its output (search index), not a reimplementation.
+
+set -euo pipefail
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+INDEX_FILE="$BRAIN_DIR/.brain-index.json"
+EXPORT_DIR="$BRAIN_DIR/work/exports"
+SEARCH_INDEX_FILE="$EXPORT_DIR/brain-knowledge-search.json"
+QUERY_LOG="$BRAIN_DIR/work/logs/context-query.log"
+HEALTH_FILE="$BRAIN_DIR/work/logs/context-health.md"
+
+mkdir -p "$(dirname "$QUERY_LOG")" "$EXPORT_DIR"
+
+# ── Ensure index exists with content ──────────────────────────────
+ensure_index() {
+  if [[ ! -f "$INDEX_FILE" ]]; then
+    echo "[brain-context] Index missing — rebuilding with content..."
+    brain-search --rebuild --with-content
+  fi
+  # Check if index has content fields
+  local has_content
+  has_content=$(python3 -c "
+import json
+idx = json.load(open('$INDEX_FILE'))
+has = any('content' in s for e in idx['entries'] for s in e.get('sections',[]))
+print('1' if has else '0')
+" 2>/dev/null || echo "0")
+  if [[ "$has_content" == "0" ]]; then
+    echo "[brain-context] Index missing content fields — rebuilding..."
+    brain-search --rebuild --with-content
+  fi
+}
+
+# ── Query mode ────────────────────────────────────────────────────
+query_context() {
+  local query="$1"
+  ensure_index
+
+  python3 - "$INDEX_FILE" "$query" "$QUERY_LOG" << 'PYEOF'
+import sys, json, re, os, time
+
+index_file = sys.argv[1]
+query = sys.argv[2]
+query_log = sys.argv[3]
+
+with open(index_file) as f:
+    index = json.load(f)
+
+# ── Config ────────────────────────────────────────────────────
+TIER_CAPS = {'T1': 3072, 'T2': 4096, 'T3': 2048}
+TOTAL_CAP = 12288
+HISTORY_TERMS = {'devlog', 'devlogs', 'wishes', 'roadmap', 'history', 'build-session', 'founding', 'wish'}
+HISTORY_PENALTY = -5
+COOLDOWN_THRESHOLD = 5
+COOLDOWN_WINDOW = 20
+COOLDOWN_PENALTY = -3
+
+# ── Tokenize query ────────────────────────────────────────────
+query_lower = query.lower()
+tokens = [t for t in re.findall(r'[a-z0-9]+', query_lower) if len(t) > 1]
+if not tokens:
+    print("[brain-context] No search terms found.")
+    sys.exit(0)
+
+has_history_term = bool(set(tokens) & HISTORY_TERMS)
+
+# Resolve aliases
+aliases = index.get('entity_aliases', {})
+expanded = set(tokens)
+for t in tokens:
+    if t in aliases:
+        expanded.add(aliases[t])
+
+# ── Load cooldown history ─────────────────────────────────────
+cooldown_counts = {}
+if os.path.exists(query_log):
+    try:
+        with open(query_log) as f:
+            lines = f.readlines()
+        recent_files = []
+        for line in lines[-200:]:
+            if line.strip().startswith('T') and ':' in line and 'KB' in line:
+                # Parse "  T2: 1.4KB (coaching.md [matched: ...])"
+                m = re.findall(r'\(([^[]+?)(?:\s*\[|$)', line)
+                for match in m:
+                    for fname in match.split(','):
+                        fname = fname.strip()
+                        if fname:
+                            recent_files.append(fname)
+        # Count last COOLDOWN_WINDOW files
+        for fname in recent_files[-COOLDOWN_WINDOW:]:
+            cooldown_counts[fname] = cooldown_counts.get(fname, 0) + 1
+    except Exception:
+        pass
+
+# ── Score entries ─────────────────────────────────────────────
+results = []
+for entry in index['entries']:
+    score = 0
+    matched_sections = []
+    tier = entry.get('tier', 'T3')
+    tier_sub = entry.get('tier_sub', '')
+
+    title_lower = entry['title'].lower()
+    file_lower = entry['file'].lower()
+    fname = os.path.basename(entry['file'])
+
+    # Title matching (+10)
+    for t in expanded:
+        if t in title_lower:
+            score += 10
+        if t in file_lower:
+            score += 3
+
+    # Section matching (+5 header, +1 snippet/content)
+    for sec in entry.get('sections', []):
+        sec_lower = sec['name'].lower()
+        content_lower = sec.get('content', sec.get('snippet', '')).lower()
+        sec_score = 0
+        for t in expanded:
+            if t in sec_lower:
+                sec_score += 5
+            if t in content_lower:
+                sec_score += 1
+        if sec_score > 0:
+            score += sec_score
+            matched_sections.append(sec)
+
+    # Keyword matching (+3)
+    for t in expanded:
+        if t in entry.get('keywords', []):
+            score += 3
+
+    # Frontmatter matching (+2, +4 for tags)
+    for k, v in entry.get('frontmatter', {}).items():
+        v_lower = str(v).lower()
+        for t in expanded:
+            if t in v_lower:
+                score += 4 if k == 'tags' else 2
+
+    # Entity boost (+8)
+    file_entities = set(entry.get('entities', []))
+    for t in expanded:
+        if t in file_entities:
+            score += 8
+
+    # Node INDEX boost (+12)
+    if entry.get('is_node_index'):
+        for t in expanded:
+            if t in file_lower:
+                score += 12
+
+    # Active doc boost (+3)
+    if entry.get('is_active') and score > 0:
+        score += 3
+
+    # T3-history penalty
+    if tier_sub == 'history' and not has_history_term:
+        score += HISTORY_PENALTY
+
+    # Topical cooldown (T3/T3-history ONLY, T2 exempt)
+    if tier in ('T3',) and cooldown_counts.get(fname, 0) >= COOLDOWN_THRESHOLD:
+        score += COOLDOWN_PENALTY
+
+    if score > 0:
+        results.append({
+            'score': score,
+            'entry': entry,
+            'matched_sections': matched_sections,
+            'tier': tier,
+            'tier_sub': tier_sub,
+            'fname': fname,
+        })
+
+results.sort(key=lambda x: -x['score'])
+
+# ── Assemble context by tier with hard caps ───────────────────
+context_parts = {'T1': [], 'T2': [], 'T3': []}
+tier_bytes = {'T1': 0, 'T2': 0, 'T3': 0}
+dropped = []
+
+# T1: always included (all T1 entries, not just matched)
+for entry in index['entries']:
+    if entry.get('tier') == 'T1':
+        for sec in entry.get('sections', []):
+            text = sec.get('content', sec.get('snippet', ''))
+            if text and tier_bytes['T1'] + len(text) <= TIER_CAPS['T1']:
+                context_parts['T1'].append(f"[{entry['title']} > {sec['name']}] {text}")
+                tier_bytes['T1'] += len(text)
+
+# T2 and T3: from scored results
+for r in results:
+    tier = r['tier']
+    if tier == 'T1':
+        continue  # already loaded
+    target_tier = 'T3' if tier_sub == 'history' else tier
+    if target_tier not in ('T2', 'T3'):
+        target_tier = 'T3'
+
+    for sec in r['matched_sections']:
+        text = sec.get('content', sec.get('snippet', ''))
+        if not text:
+            continue
+        text_len = len(text)
+
+        if tier_bytes[target_tier] + text_len > TIER_CAPS[target_tier]:
+            dropped.append(f"{r['fname']} (over {target_tier} cap)")
+            continue
+        if tier_bytes['T1'] + tier_bytes['T2'] + tier_bytes['T3'] + text_len > TOTAL_CAP:
+            dropped.append(f"{r['fname']} (over total cap)")
+            continue
+
+        context_parts[target_tier].append(f"[{r['entry']['title']} > {sec['name']}] {text}")
+        tier_bytes[target_tier] += text_len
+
+# ── Output ────────────────────────────────────────────────────
+total = sum(tier_bytes.values())
+
+print(f"Query: \"{query}\"")
+print(f"History terms detected: {has_history_term}")
+print(f"─────────────────────────────")
+
+for tier_name in ('T1', 'T2', 'T3'):
+    kb = tier_bytes[tier_name] / 1024
+    cap_kb = TIER_CAPS[tier_name] / 1024
+    print(f"{tier_name}: {kb:.1f}KB / {cap_kb:.1f}KB")
+    for part in context_parts[tier_name]:
+        print(f"  {part[:120]}...")
+
+print(f"─────────────────────────────")
+print(f"Total: {total/1024:.1f}KB / {TOTAL_CAP/1024:.1f}KB")
+
+if dropped:
+    print(f"\nDropped ({len(dropped)}):")
+    for d in dropped[:10]:
+        print(f"  - {d}")
+
+# ── Log query ─────────────────────────────────────────────────
+ts = time.strftime('%Y-%m-%dT%H:%M:%S')
+log_lines = [f"[{ts}] query=\"{query}\""]
+for tier_name in ('T1', 'T2', 'T3'):
+    if context_parts[tier_name]:
+        fnames = set()
+        for part in context_parts[tier_name]:
+            m = re.match(r'\[([^>]+)', part)
+            if m:
+                fnames.add(m.group(1).strip())
+        kb = tier_bytes[tier_name] / 1024
+        log_lines.append(f"  {tier_name}: {kb:.1f}KB ({', '.join(sorted(fnames))})")
+log_lines.append(f"  total: {total/1024:.1f}KB")
+for d in dropped[:5]:
+    log_lines.append(f"  dropped: {d}")
+if cooldown_counts:
+    cd_active = [f for f, c in cooldown_counts.items() if c >= COOLDOWN_THRESHOLD]
+    if cd_active:
+        log_lines.append(f"  cooldown: {', '.join(cd_active)}")
+    else:
+        log_lines.append(f"  cooldown: none")
+else:
+    log_lines.append(f"  cooldown: none")
+
+# Rotate log: keep last 500 entries
+try:
+    existing = []
+    if os.path.exists(query_log):
+        with open(query_log) as f:
+            existing = f.read().split('\n[')
+        if len(existing) > 500:
+            existing = existing[-500:]
+            # Re-add the [ prefix that split removed
+            existing = ['[' + e if not e.startswith('[') else e for e in existing]
+    with open(query_log, 'w') as f:
+        if existing:
+            f.write('\n['.join(existing))
+            f.write('\n')
+        f.write('\n'.join(log_lines) + '\n')
+except Exception as e:
+    print(f"  (log write failed: {e})", file=sys.stderr)
+
+PYEOF
+}
+
+# ── Build search index for Clip ───────────────────────────────
+build_search_index() {
+  echo "[brain-context] Building search index for Clip deployment..."
+  ensure_index
+
+  python3 - "$INDEX_FILE" "$SEARCH_INDEX_FILE" << 'PYEOF'
+import json, sys, os
+
+index_file = sys.argv[1]
+output_file = sys.argv[2]
+
+with open(index_file) as f:
+    index = json.load(f)
+
+# Config metadata baked into index for Clip
+config = {
+    'tier_caps': {'T1': 3072, 'T2': 4096, 'T3': 2048},
+    'total_cap': 12288,
+    'history_terms': ['devlog', 'devlogs', 'wishes', 'roadmap', 'history', 'build-session', 'founding', 'wish'],
+    'history_penalty': -5,
+    'cooldown_threshold': 5,
+    'cooldown_window': 20,
+    'cooldown_penalty': -3,
+    'score_weights': {
+        'title': 10,
+        'file_path': 3,
+        'section_header': 5,
+        'section_content': 1,
+        'keyword': 3,
+        'frontmatter': 2,
+        'frontmatter_tags': 4,
+        'entity': 8,
+        'node_index': 12,
+        'active': 3,
+    }
+}
+
+# Filter and slim entries
+entries = []
+tiers = {'T1': 0, 'T2': 0, 'T3': 0, 'T3-history': 0}
+for e in index['entries']:
+    tier = e.get('tier', 'T3')
+    tier_sub = e.get('tier_sub', '')
+
+    # Skip T4
+    if tier == 'T4':
+        continue
+
+    # Exclude internal-only content (publishing-safety.md policy enforcement)
+    fp = e.get('file', '')
+    _skip = False
+    # Path-based exclusions
+    for excl in [
+        'work/logs/devlog/',          # internal operational history
+        'work/offers/',               # pricing, proposals, offers
+        'nodes/*/work/offers/',       # node-level offers (handled by fnmatch below)
+        'work/backlog/',              # internal backlog
+        'brain/governance/',          # agent governance, escalation, autonomy policies
+        'docs/governance/',           # project governance (credentials, access, compliance)
+        'brain/ops/tasks/',           # internal task queue
+        'brain/ops/impacts/',         # internal impact artifacts
+        'brain/ops/events.log',       # internal event log
+        'work/inbox/',                # unprocessed internal items
+        'work/session-handoffs/',     # session continuity (internal)
+        'brain/index/session-resume',    # operator briefing, not Clip knowledge
+        'work/exports/chatgpt-context/', # internal operator context exports
+        'work/logs/priority-queue',   # internal priority tracking
+        'work/open-questions',        # internal open questions
+    ]:
+        if excl in fp:
+            _skip = True
+            break
+    # Fnmatch for node-level patterns
+    if not _skip:
+        import fnmatch
+        for pat in ['nodes/*/work/offers/*', 'nodes/*/work/backlog/*']:
+            if fnmatch.fnmatch(fp, pat):
+                _skip = True
+                break
+    # Filename-based exclusions
+    if not _skip:
+        fn = os.path.basename(fp).lower()
+        for term in ['pricing', 'lead', 'reply-draft', 'negotiation', 'offer']:
+            if term in fn:
+                _skip = True
+                break
+    if _skip:
+        continue
+
+    # Slim down: keep what Clip needs for matching
+    slim = {
+        'file': e['file'],
+        'title': e['title'],
+        'tier': tier,
+        'keywords': e.get('keywords', []),
+        'entities': e.get('entities', []),
+        'is_node_index': e.get('is_node_index', False),
+        'is_active': e.get('is_active', False),
+        'sections': [],
+    }
+    if tier_sub:
+        slim['tier_sub'] = tier_sub
+
+    # Keep frontmatter tags/type/status only
+    fm = e.get('frontmatter', {})
+    slim_fm = {}
+    for k in ('tags', 'type', 'status'):
+        if k in fm:
+            slim_fm[k] = fm[k]
+    if slim_fm:
+        slim['frontmatter'] = slim_fm
+
+    # Sections with content
+    for sec in e.get('sections', []):
+        slim_sec = {
+            'name': sec['name'],
+            'content': sec.get('content', sec.get('snippet', ''))[:500],
+        }
+        slim['sections'].append(slim_sec)
+
+    entries.append(slim)
+    key = f'{tier}-{tier_sub}' if tier_sub else tier
+    tiers[key] = tiers.get(key, 0) + 1
+
+output = {
+    'generated': index.get('generated', ''),
+    'config': config,
+    'entity_aliases': index.get('entity_aliases', {}),
+    'entry_count': len(entries),
+    'entries': entries,
+}
+
+with open(output_file, 'w') as f:
+    json.dump(output, f, separators=(',', ':'))
+
+sz = os.path.getsize(output_file)
+print(f"[brain-context] Search index built: {len(entries)} entries, {sz//1024}KB")
+for t in sorted(tiers):
+    if tiers[t] > 0:
+        print(f"  {t}: {tiers[t]} files")
+
+PYEOF
+}
+
+# ── Health diagnostics ────────────────────────────────────────
+health_check() {
+  ensure_index
+
+  python3 - "$INDEX_FILE" "$EXPORT_DIR" "$HEALTH_FILE" "$BRAIN_DIR" << 'PYEOF'
+import json, sys, os, time
+from collections import Counter
+
+index_file = sys.argv[1]
+export_dir = sys.argv[2]
+health_file = sys.argv[3]
+brain_dir = sys.argv[4]
+
+with open(index_file) as f:
+    index = json.load(f)
+
+# Export file sizes
+files_info = []
+for name in ['brain-knowledge-core.json', 'brain-knowledge-live.json',
+             'brain_knowledge.json', 'brain-knowledge-search.json']:
+    path = os.path.join(export_dir, name)
+    if os.path.exists(path):
+        sz = os.path.getsize(path)
+        files_info.append(f"  {name}: {sz//1024}KB")
+    else:
+        files_info.append(f"  {name}: not found")
+
+# Tier breakdown
+tier_sizes = {}
+tier_counts = {}
+for e in index['entries']:
+    tier = e.get('tier', 'T3')
+    sub = e.get('tier_sub', '')
+    key = f'{tier}-{sub}' if sub else tier
+    tier_counts[key] = tier_counts.get(key, 0) + 1
+    content_size = sum(len(s.get('content', s.get('snippet', ''))) for s in e.get('sections', []))
+    tier_sizes[key] = tier_sizes.get(key, 0) + content_size
+
+# Duplicate detection
+snippets = Counter()
+snippet_sources = {}
+for e in index['entries']:
+    for s in e.get('sections', []):
+        snip = s.get('snippet', '')[:100]
+        if len(snip) > 50:
+            snippets[snip] += 1
+            if snip not in snippet_sources:
+                snippet_sources[snip] = []
+            snippet_sources[snip].append(f"{e['file']}:{s['name']}")
+dupes = [(snip, snippet_sources[snip]) for snip, count in snippets.items() if count > 1]
+
+# Stale detection (>30 days)
+now = time.time()
+stale_threshold = 30 * 86400
+stale = []
+for e in index['entries']:
+    fpath = os.path.join(brain_dir, e['file'])
+    if os.path.exists(fpath):
+        mtime = os.path.getmtime(fpath)
+        if now - mtime > stale_threshold:
+            days = int((now - mtime) / 86400)
+            stale.append(f"{e['file']} ({days}d old)")
+
+# Per-query estimates
+t1_size = tier_sizes.get('T1', 0)
+avg_match = 800  # typical 2 matched sections
+est_avg = t1_size + avg_match * 2
+est_max = t1_size + 2048 + 1024  # T1 + full T2 + full T3
+
+# Write report
+lines = [
+    "# Context Health Report",
+    f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    "",
+    "## Export Files",
+]
+lines.extend(files_info)
+lines.append("")
+lines.append("## Tier Breakdown")
+for t in sorted(tier_counts):
+    kb = tier_sizes.get(t, 0) / 1024
+    lines.append(f"  {t}: {tier_counts[t]} files, {kb:.1f}KB content")
+lines.append("")
+lines.append("## Duplicates")
+if dupes:
+    for snip, sources in dupes[:10]:
+        lines.append(f"  \"{snip[:60]}...\" appears in:")
+        for src in sources:
+            lines.append(f"    - {src}")
+else:
+    lines.append("  None detected")
+lines.append("")
+lines.append("## Stale Sections (>30 days)")
+if stale:
+    for s in stale[:20]:
+        lines.append(f"  - {s}")
+else:
+    lines.append("  None")
+lines.append("")
+lines.append("## Per-Query Estimates")
+lines.append(f"  Average: ~{est_avg/1024:.1f}KB (T1 {t1_size/1024:.1f}KB + ~2 matched sections)")
+lines.append(f"  Maximum: ~{est_max/1024:.1f}KB (T1 + full T2 + full T3)")
+lines.append(f"  Current static export: {sum(tier_sizes.values())/1024:.1f}KB total indexed content")
+
+report = '\n'.join(lines)
+with open(health_file, 'w') as f:
+    f.write(report + '\n')
+
+print(report)
+
+PYEOF
+}
+
+# ── Stats ─────────────────────────────────────────────────────
+show_stats() {
+  if [[ -f "$SEARCH_INDEX_FILE" ]]; then
+    python3 -c "
+import json, os
+si = json.load(open('$SEARCH_INDEX_FILE'))
+sz = os.path.getsize('$SEARCH_INDEX_FILE')
+print(f\"Search index: {si['entry_count']} entries, {sz//1024}KB\")
+print(f\"Generated: {si['generated']}\")
+tiers = {}
+for e in si['entries']:
+    t = e.get('tier', '?')
+    sub = e.get('tier_sub', '')
+    key = f'{t}-{sub}' if sub else t
+    tiers[key] = tiers.get(key, 0) + 1
+    sec_count = len(e.get('sections', []))
+content_total = sum(len(s.get('content','')) for e in si['entries'] for s in e.get('sections',[]))
+print(f'Content: {content_total//1024}KB across {sum(len(e[\"sections\"]) for e in si[\"entries\"])} sections')
+print('Tiers:')
+for t in sorted(tiers):
+    print(f'  {t}: {tiers[t]} files')
+caps = si.get('config', {}).get('tier_caps', {})
+print(f'Caps: T1={caps.get(\"T1\",0)//1024}KB T2={caps.get(\"T2\",0)//1024}KB T3={caps.get(\"T3\",0)//1024}KB total={si.get(\"config\",{}).get(\"total_cap\",0)//1024}KB')
+"
+  else
+    echo "[brain-context] No search index found. Run: brain-context --build-search-index"
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────────
+case "${1:-}" in
+  --build-search-index)
+    build_search_index
+    ;;
+  --health)
+    health_check
+    ;;
+  --stats)
+    show_stats
+    ;;
+  ""|--help|-h)
+    echo "Usage:"
+    echo "  brain-context \"query\"                  Preview best context for a query"
+    echo "  brain-context --build-search-index     Build deployable search index for Clip"
+    echo "  brain-context --health                 Context health diagnostics"
+    echo "  brain-context --stats                  Tier breakdown and size stats"
+    exit 0
+    ;;
+  *)
+    query_context "$1"
+    ;;
+esac

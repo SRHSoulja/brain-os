@@ -1,0 +1,185 @@
+#!/bin/bash
+# brain-memory-flush -- Extract decisions, patterns, and lessons from session digests
+# Writes to daily file + deterministic artifacts. Idempotent: duplicate runs add 0 bullets.
+#
+# Usage:
+#   brain-memory-flush                Run on today's digests
+#   brain-memory-flush --date YYYY-MM-DD   Run for specific date
+#   brain-memory-flush --dry-run      Show what would be extracted without writing
+
+set -euo pipefail
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+DAILY_DIR="$BRAIN_DIR/brain/ops/daily"
+SESSION_DIR="$BRAIN_DIR/brain/wiki/sessions"
+DEVLOG_DIR="$BRAIN_DIR/work/logs/devlog"
+LATEST_JSON="$BRAIN_DIR/work/logs/memory-flush-latest.json"
+HISTORY_JSONL="$BRAIN_DIR/work/logs/memory-flush-history.jsonl"
+
+mkdir -p "$DAILY_DIR" "$(dirname "$LATEST_JSON")"
+
+TARGET_DATE="$(date '+%Y-%m-%d')"
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --date) TARGET_DATE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+DAILY_FILE="$DAILY_DIR/${TARGET_DATE}.md"
+
+# Collect source files for this date
+SESSION_FILES=()
+while IFS= read -r f; do
+  SESSION_FILES+=("$f")
+done < <(find "$SESSION_DIR" -maxdepth 1 -name "${TARGET_DATE}*.md" -type f 2>/dev/null | sort)
+
+DEVLOG_FILES=()
+while IFS= read -r f; do
+  DEVLOG_FILES+=("$f")
+done < <(find "$DEVLOG_DIR" -maxdepth 1 -name "devlog-${TARGET_DATE}*.md" -type f 2>/dev/null | sort)
+
+TOTAL_SOURCES=$(( ${#SESSION_FILES[@]} + ${#DEVLOG_FILES[@]} ))
+
+if [[ $TOTAL_SOURCES -eq 0 ]]; then
+  echo "No sources for $TARGET_DATE"
+  # Still write artifact
+  NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  cat > "$LATEST_JSON" <<EOF
+{"date":"$TARGET_DATE","ts":"$NOW","sources":0,"extracted":0,"deduped":0,"status":"no_sources"}
+EOF
+  echo "{\"date\":\"$TARGET_DATE\",\"ts\":\"$NOW\",\"sources\":0,\"extracted\":0,\"deduped\":0,\"status\":\"no_sources\"}" >> "$HISTORY_JSONL"
+  exit 0
+fi
+
+# Extract bullets from source files
+# Pattern: look for decisions, lessons, patterns, corrections, rules
+extract_bullets() {
+  local file="$1"
+  local content
+  content="$(cat "$file")"
+
+  # Extract lines that look like decisions/patterns/lessons
+  local bullets=()
+
+  # Pattern 1: Lines starting with "- " after key headings
+  while IFS= read -r line; do
+    # Skip empty, headers, frontmatter
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^# ]] && continue
+    [[ "$line" =~ ^--- ]] && continue
+    [[ "$line" =~ ^\*\* ]] && continue
+
+    # Capture bullet points that contain decision/action language
+    if [[ "$line" =~ ^-\ .+ ]]; then
+      local text="${line#- }"
+      # Filter for substantive content (decisions, rules, lessons)
+      if echo "$text" | grep -qiE '(decided|learned|fixed|discovered|rule|never|always|must|should|avoid|pattern|correction|important|blocked|resolved|shipped|deployed|created|implemented|configured|verified)'; then
+        bullets+=("$text")
+      fi
+    fi
+  done <<< "$content"
+
+  printf '%s\n' "${bullets[@]}"
+}
+
+# Collect all new bullets
+ALL_BULLETS=()
+for f in "${SESSION_FILES[@]}"; do
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && ALL_BULLETS+=("$b")
+  done < <(extract_bullets "$f")
+done
+
+for f in "${DEVLOG_FILES[@]}"; do
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && ALL_BULLETS+=("$b")
+  done < <(extract_bullets "$f")
+done
+
+# Cap at 20 bullets per run
+if [[ ${#ALL_BULLETS[@]} -gt 20 ]]; then
+  ALL_BULLETS=("${ALL_BULLETS[@]:0:20}")
+fi
+
+# Dedup against existing daily file
+EXISTING_FINGERPRINTS=""
+if [[ -f "$DAILY_FILE" ]]; then
+  # Generate fingerprints from existing bullets (first 60 chars, lowercased, stripped)
+  EXISTING_FINGERPRINTS="$(grep '^- ' "$DAILY_FILE" 2>/dev/null | sed 's/^- //' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 ]//g' | cut -c1-60 || true)"
+fi
+
+fingerprint() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 ]//g' | cut -c1-60
+}
+
+NEW_BULLETS=()
+DEDUPED=0
+for b in "${ALL_BULLETS[@]}"; do
+  fp="$(fingerprint "$b")"
+  if echo "$EXISTING_FINGERPRINTS" | grep -qF "$fp" 2>/dev/null; then
+    DEDUPED=$((DEDUPED + 1))
+  else
+    NEW_BULLETS+=("$b")
+    EXISTING_FINGERPRINTS="${EXISTING_FINGERPRINTS}
+${fp}"
+  fi
+done
+
+if $DRY_RUN; then
+  echo "=== brain-memory-flush --dry-run ==="
+  echo "Date: $TARGET_DATE"
+  echo "Sources: $TOTAL_SOURCES (${#SESSION_FILES[@]} sessions, ${#DEVLOG_FILES[@]} devlogs)"
+  echo "Extracted: ${#ALL_BULLETS[@]}"
+  echo "Deduped: $DEDUPED"
+  echo "New bullets: ${#NEW_BULLETS[@]}"
+  echo ""
+  for b in "${NEW_BULLETS[@]}"; do
+    echo "  - $b"
+  done
+  exit 0
+fi
+
+# Write daily file
+if [[ ! -f "$DAILY_FILE" ]]; then
+  cat > "$DAILY_FILE" <<EOF
+---
+title: "Daily Memory - ${TARGET_DATE}"
+type: "daily-memory"
+date: "${TARGET_DATE}"
+---
+
+# Daily Memory - ${TARGET_DATE}
+
+## Decisions
+
+## Patterns
+
+## Lessons
+
+EOF
+fi
+
+# Append new bullets under Lessons heading (safest default section)
+if [[ ${#NEW_BULLETS[@]} -gt 0 ]]; then
+  {
+    echo ""
+    echo "## Extracted ($(date '+%H:%M'))"
+    echo ""
+    for b in "${NEW_BULLETS[@]}"; do
+      echo "- $b"
+    done
+  } >> "$DAILY_FILE"
+fi
+
+# Write artifacts
+NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+cat > "$LATEST_JSON" <<EOF
+{"date":"$TARGET_DATE","ts":"$NOW","sources":$TOTAL_SOURCES,"extracted":${#ALL_BULLETS[@]},"deduped":$DEDUPED,"new":${#NEW_BULLETS[@]},"status":"ok","daily_file":"$DAILY_FILE"}
+EOF
+echo "{\"date\":\"$TARGET_DATE\",\"ts\":\"$NOW\",\"sources\":$TOTAL_SOURCES,\"extracted\":${#ALL_BULLETS[@]},\"deduped\":$DEDUPED,\"new\":${#NEW_BULLETS[@]},\"status\":\"ok\"}" >> "$HISTORY_JSONL"
+
+echo "brain-memory-flush: $TARGET_DATE | sources=$TOTAL_SOURCES extracted=${#ALL_BULLETS[@]} deduped=$DEDUPED new=${#NEW_BULLETS[@]}"

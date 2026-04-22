@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# brain-task-create — redirect stub for discoverability
+# This command does not exist. The canonical is: brain-task "description" [flags]
+# See: brain-task --help
+echo "ERROR: 'brain-task-create' is not a command." >&2
+echo "       Use: brain-task \"Task title\" [--node <node>] [--p1|--p2|--p3|--p4] [--why \"reason\"]" >&2
+echo "       Or:  brain-task-quick \"Task title\" [--node <node>] [--p1|--p2|--p3|--p4] [--why \"reason\"]" >&2
+echo "" >&2
+echo "       Forwarding your arguments to brain-task now..." >&2
+exec brain-task "$@"

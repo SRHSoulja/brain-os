@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# brain-core-memory-resolve -- Mark a queued core memory as resolved after PoE-verified promotion
+# Usage: brain-core-memory-resolve --id <capture_id> --run-id <proof_run_id>
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+QUEUE_DIR="$BRAIN/brain/ops/core-memory"
+QUEUE_FILE="$QUEUE_DIR/queue.jsonl"
+RESOLVED_FILE="$QUEUE_DIR/resolved.jsonl"
+
+ID=""
+RUN_ID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --id) ID="$2"; shift 2 ;;
+    --run-id) RUN_ID="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$ID" || -z "$RUN_ID" ]]; then
+  echo "Usage: brain-core-memory-resolve --id <capture_id> --run-id <proof_run_id>" >&2
+  exit 1
+fi
+
+# Verify PoE run exists and passed
+if command -v brain-proof-verify >/dev/null 2>&1; then
+  _verdict=$(brain-proof-verify --run "$RUN_ID" 2>/dev/null) || true
+  if [[ "$_verdict" != *"PASS"* ]]; then
+    echo "PoE verdict not PASS for run $RUN_ID: $_verdict" >&2
+    echo "Cannot resolve without PASS verdict." >&2
+    exit 2
+  fi
+fi
+
+python3 - "$QUEUE_FILE" "$RESOLVED_FILE" "$ID" "$RUN_ID" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+
+queue_file, resolved_file, target_id, run_id = sys.argv[1:]
+
+# Read queue, find and remove target
+remaining = []
+resolved_entry = None
+try:
+    with open(queue_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("id") == target_id and entry.get("status") == "queued":
+                resolved_entry = entry
+            else:
+                remaining.append(line)
+except FileNotFoundError:
+    print(f"Queue file not found: {queue_file}", file=sys.stderr)
+    sys.exit(2)
+
+if not resolved_entry:
+    print(f"No queued item with id {target_id}", file=sys.stderr)
+    sys.exit(2)
+
+# Write remaining back to queue
+with open(queue_file, "w") as f:
+    for line in remaining:
+        f.write(line + "\n")
+
+# Append to resolved
+resolved_entry["status"] = "resolved"
+resolved_entry["resolved_at"] = datetime.now(timezone.utc).isoformat()
+resolved_entry["promotion_run_id"] = run_id
+with open(resolved_file, "a") as f:
+    f.write(json.dumps(resolved_entry) + "\n")
+
+print(f"resolved {target_id}")
+PY

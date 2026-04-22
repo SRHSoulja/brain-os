@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# brain-retrieve -- Deterministic, token-bounded knowledge retrieval
+# Usage: brain-retrieve --type <wiki|task|governance|tool|digest|state> --key <query> [--max-tokens 2000] [--category <bucket>] [--text]
+#
+# Layer 2 retrieval: explicit keys, source-typed queries, token-bounded results.
+# Same inputs = same outputs. No LLM in the retrieval path.
+#
+# See: brain/wiki/systems/context_retrieval_and_builder.md
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/bin"
+TYPE=""
+KEY=""
+MAX_TOKENS=2000
+TEXT_MODE=false
+CATEGORY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)       TYPE="$2"; shift 2 ;;
+    --key)        KEY="$2"; shift 2 ;;
+    --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+    --category)   CATEGORY="$2"; shift 2 ;;
+    --text)       TEXT_MODE=true; shift ;;
+    --json)       TEXT_MODE=false; shift ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: brain-retrieve --type <type> --key <query> [--max-tokens 2000] [--category <bucket>] [--text]
+
+Types:
+  wiki        Search brain/wiki/ via brain-wiki search, return best match content
+  task        Read task file by ID from queue/active/completed
+  governance  Grep brain/governance/ for policy name or section heading
+  tool        Read tool wiki page from brain/wiki/tools/
+  digest      Topic-match key against memory digests, return top match(es)
+  state       Return active-context.compact.md (always-fresh operational state)
+
+Options:
+  --max-tokens N       Token budget for returned content (default: 2000)
+  --category <bucket>  Scope wiki search to a manifest topic bucket (e.g. "Knowledge & Context")
+  --text               Human-readable output (default: JSON)
+  --json               JSON output (default)
+
+Output (JSON):
+  { "source", "key", "path", "content", "tokens", "truncated" }
+
+Empty result (no error) when key has no match.
+HELP
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$TYPE" ]]; then
+  echo "Error: --type required" >&2
+  exit 1
+fi
+# state type doesn't require a key
+if [[ -z "$KEY" && "$TYPE" != "state" ]]; then
+  echo "Error: --key required for type '$TYPE'" >&2
+  exit 1
+fi
+
+# ── Token counting: bytes / 4 approximation ─────────────────────────
+
+_count_tokens() {
+  # bytes / 4, matching token-budget-policy
+  local content="$1"
+  local bytes
+  bytes=$(printf '%s' "$content" | wc -c)
+  echo $(( bytes / 4 ))
+}
+
+_truncate_to_tokens() {
+  # Truncate content to approximately max_tokens (bytes / 4)
+  local content="$1"
+  local max="$2"
+  local max_bytes=$(( max * 4 ))
+  printf '%s' "$content" | head -c "$max_bytes"
+}
+
+# ── Output helpers ───────────────────────────────────────────────────
+
+_emit_result() {
+  local source="$1" key="$2" path="$3" content="$4"
+
+  local tokens
+  tokens=$(_count_tokens "$content")
+  local truncated=false
+
+  if [[ "$tokens" -gt "$MAX_TOKENS" ]]; then
+    content=$(_truncate_to_tokens "$content" "$MAX_TOKENS")
+    content="${content}
+
+[TRUNCATED -- full content at ${path}]"
+    tokens=$MAX_TOKENS
+    truncated=true
+  fi
+
+  if $TEXT_MODE; then
+    echo "=== brain-retrieve: $source/$key ==="
+    echo "Path: $path"
+    echo "Tokens: $tokens (truncated: $truncated)"
+    echo "---"
+    echo "$content"
+  else
+    local py_truncated="False"
+    $truncated && py_truncated="True"
+    python3 -c "
+import json, sys
+result = {
+    'source': sys.argv[1],
+    'key': sys.argv[2],
+    'path': sys.argv[3],
+    'tokens': int(sys.argv[4]),
+    'truncated': sys.argv[5] == 'True'
+}
+content = sys.stdin.read()
+result['content'] = content
+print(json.dumps(result, ensure_ascii=False))
+" "$source" "$key" "$path" "$tokens" "$py_truncated" <<< "$content"
+  fi
+}
+
+_emit_empty() {
+  local source="$1" key="$2"
+  if $TEXT_MODE; then
+    echo "=== brain-retrieve: $source/$key ==="
+    echo "No match found."
+  else
+    python3 -c "
+import json, sys
+result = {
+    'source': sys.argv[1],
+    'key': sys.argv[2],
+    'path': '',
+    'content': '',
+    'tokens': 0,
+    'truncated': False
+}
+print(json.dumps(result))
+" "$source" "$key"
+  fi
+}
+
+# ── Retrieval: wiki ──────────────────────────────────────────────────
+
+_retrieve_wiki() {
+  local key="$1"
+  local category="${CATEGORY:-}"
+
+  # Try direct page name match first (pages/ or systems/ or principles/)
+  local match=""
+  for dir in pages systems principles decisions research patterns ideas products people; do
+    local candidate="$BRAIN/brain/wiki/$dir/${key}.md"
+    if [[ -f "$candidate" ]]; then
+      match="$candidate"
+      break
+    fi
+  done
+
+  # If no direct match, use brain-wiki search and take first non-session result
+  if [[ -z "$match" ]]; then
+    local search_output
+    search_output=$("$TOOLS/brain-wiki" search "$key" 2>/dev/null || true)
+
+    # Parse search output: format is "  [cat] Title -- path/to/file.md"
+    # Extract path (last field after --), skip sessions
+    local candidates
+    candidates=$(echo "$search_output" | grep -E " -- [a-z].*\.md" | grep -v "sessions/" \
+      | sed 's/.* -- //' | sed 's/^[[:space:]]*//' || true)
+
+    if [[ -n "$category" && -n "$candidates" ]]; then
+      # Filter to paths whose manifest bucket or category matches
+      candidates=$(echo "$candidates" | python3 -c "
+import sys, json
+from pathlib import Path
+brain = '$BRAIN'
+category = '$category'.lower()
+manifest_paths = [
+    brain + '/brain/wiki/systems/manifest.json',
+    brain + '/brain/wiki/pages/manifest.json',
+]
+allowed = set()
+for mp in manifest_paths:
+    try:
+        d = json.loads(Path(mp).read_text())
+        for p in d.get('pages', []):
+            bucket = (p.get('topic_bucket') or '').lower()
+            cat = (p.get('category') or '').lower()
+            if category in bucket or category in cat:
+                allowed.add(Path(p.get('path','')).name)
+    except Exception:
+        pass
+for line in sys.stdin:
+    fname = Path(line.strip()).name
+    if not allowed or fname in allowed:
+        print(line, end='')
+" 2>/dev/null || echo "$candidates")
+    fi
+
+    match=$(echo "$candidates" | head -1 | tr -d '[:space:]' || true)
+    if [[ -n "$match" ]]; then
+      if [[ -f "$BRAIN/brain/wiki/$match" ]]; then
+        match="$BRAIN/brain/wiki/$match"
+      else
+        match=""
+      fi
+    fi
+  fi
+
+  if [[ -z "$match" || ! -f "$match" ]]; then
+    _emit_empty "wiki" "$key"
+    return
+  fi
+
+  local content
+  content=$(cat "$match")
+  local relpath="${match#$BRAIN/}"
+  _emit_result "wiki" "$key" "$relpath" "$content"
+}
+
+# ── Retrieval: digest ────────────────────────────────────────────────
+
+_retrieve_digest() {
+  local key="$1"
+  local digest_dir="$BRAIN/brain/wiki/pages"
+
+  # Score each digest by keyword overlap with the key
+  local best_file=""
+  local best_score=0
+
+  # Normalise key into tokens
+  local key_lower
+  key_lower=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ')
+
+  for f in "$digest_dir"/memory_digest_*.md; do
+    [[ -f "$f" ]] || continue
+    local name
+    name=$(basename "$f" .md | sed 's/memory_digest_//' | tr '_' ' ')
+    # Score: count key tokens found in digest name or first 500 chars of content
+    local preview
+    preview=$(head -c 500 "$f" | tr '[:upper:]' '[:lower:]')
+    local score=0
+    for token in $key_lower; do
+      [[ ${#token} -lt 3 ]] && continue
+      echo "$name $preview" | grep -qw "$token" 2>/dev/null && score=$((score + 1))
+    done
+    if [[ $score -gt $best_score ]]; then
+      best_score=$score
+      best_file="$f"
+    fi
+  done
+
+  # Fallback: if no keyword match, return tools_capabilities (broadest coverage)
+  if [[ -z "$best_file" ]]; then
+    best_file="$digest_dir/memory_digest_tools_capabilities.md"
+  fi
+
+  if [[ ! -f "$best_file" ]]; then
+    _emit_empty "digest" "$key"
+    return
+  fi
+
+  local content
+  content=$(cat "$best_file")
+  local relpath="${best_file#$BRAIN/}"
+  _emit_result "digest" "$key" "$relpath" "$content"
+}
+
+# ── Retrieval: state ─────────────────────────────────────────────────
+
+_retrieve_state() {
+  local state_file="$BRAIN/brain/index/active-context.compact.md"
+
+  if [[ ! -f "$state_file" ]]; then
+    _emit_empty "state" "active-context"
+    return
+  fi
+
+  local content
+  content=$(cat "$state_file")
+  local relpath="${state_file#$BRAIN/}"
+  # Use "active-context" as canonical key for state type
+  _emit_result "state" "active-context" "$relpath" "$content"
+}
+
+# ── Retrieval: task ──────────────────────────────────────────────────
+
+_retrieve_task() {
+  local key="$1"
+
+  # Normalize: accept bare ID or full filename
+  local task_id="$key"
+  [[ "$task_id" != *.md ]] && task_id="${task_id}.md"
+
+  # Search across queue, active, completed
+  local match=""
+  for dir in queue active completed; do
+    local candidate="$BRAIN/brain/ops/tasks/$dir/$task_id"
+    if [[ -f "$candidate" ]]; then
+      match="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$match" ]]; then
+    _emit_empty "task" "$key"
+    return
+  fi
+
+  local content
+  content=$(cat "$match")
+  local relpath="${match#$BRAIN/}"
+  _emit_result "task" "$key" "$relpath" "$content"
+}
+
+# ── Retrieval: governance ────────────────────────────────────────────
+
+_retrieve_governance() {
+  local key="$1"
+  local gov_dir="$BRAIN/brain/governance"
+
+  # Try direct file match first
+  local match=""
+  if [[ -f "$gov_dir/${key}.md" ]]; then
+    match="$gov_dir/${key}.md"
+  elif [[ -f "$gov_dir/${key}" ]]; then
+    match="$gov_dir/${key}"
+  fi
+
+  # If no direct match, grep for the key in governance files
+  if [[ -z "$match" ]]; then
+    match=$(grep -rl "$key" "$gov_dir"/*.md 2>/dev/null | head -1 || true)
+  fi
+
+  if [[ -z "$match" || ! -f "$match" ]]; then
+    _emit_empty "governance" "$key"
+    return
+  fi
+
+  local content
+  content=$(cat "$match")
+  local relpath="${match#$BRAIN/}"
+  _emit_result "governance" "$key" "$relpath" "$content"
+}
+
+# ── Retrieval: tool ──────────────────────────────────────────────────
+
+_retrieve_tool() {
+  local key="$1"
+  local tools_dir="$BRAIN/brain/wiki/tools"
+
+  # Try direct match
+  local match=""
+  if [[ -f "$tools_dir/${key}.md" ]]; then
+    match="$tools_dir/${key}.md"
+  fi
+
+  if [[ -z "$match" || ! -f "$match" ]]; then
+    _emit_empty "tool" "$key"
+    return
+  fi
+
+  local content
+  content=$(cat "$match")
+  local relpath="${match#$BRAIN/}"
+  _emit_result "tool" "$key" "$relpath" "$content"
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────
+
+case "$TYPE" in
+  wiki)       _retrieve_wiki "$KEY" ;;
+  task)       _retrieve_task "$KEY" ;;
+  governance) _retrieve_governance "$KEY" ;;
+  tool)       _retrieve_tool "$KEY" ;;
+  digest)     _retrieve_digest "$KEY" ;;
+  state)      _retrieve_state ;;
+  *)
+    echo "Error: unknown type '$TYPE'. Use wiki|task|governance|tool|digest|state." >&2
+    exit 1
+    ;;
+esac

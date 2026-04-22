@@ -1,0 +1,156 @@
+#!/bin/bash
+# brain-memory-compile -- Compile daily memory files into compiled-insights.md
+# Reads daily files, deduplicates against existing insights, appends new ones.
+# Idempotent: duplicate runs add 0 insights.
+#
+# Usage:
+#   brain-memory-compile              Compile all unprocessed daily files
+#   brain-memory-compile --date YYYY-MM-DD   Compile specific date only
+#   brain-memory-compile --dry-run    Show what would be compiled
+
+set -euo pipefail
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+DAILY_DIR="$BRAIN_DIR/brain/ops/daily"
+INSIGHTS_FILE="$BRAIN_DIR/brain/ops/compiled-insights.md"
+LATEST_JSON="$BRAIN_DIR/work/logs/memory-compiler-latest.json"
+HISTORY_JSONL="$BRAIN_DIR/work/logs/memory-compiler-history.jsonl"
+COMPILED_MARKER="$DAILY_DIR/.compiled-dates"
+
+mkdir -p "$DAILY_DIR" "$(dirname "$LATEST_JSON")"
+touch "$COMPILED_MARKER"
+
+TARGET_DATE=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --date) TARGET_DATE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Find daily files to compile
+DAILY_FILES=()
+if [[ -n "$TARGET_DATE" ]]; then
+  f="$DAILY_DIR/${TARGET_DATE}.md"
+  [[ -f "$f" ]] && DAILY_FILES+=("$f")
+else
+  # All daily files not yet compiled
+  while IFS= read -r f; do
+    basename_f="$(basename "$f" .md)"
+    if ! grep -qF "$basename_f" "$COMPILED_MARKER" 2>/dev/null; then
+      DAILY_FILES+=("$f")
+    fi
+  done < <(find "$DAILY_DIR" -maxdepth 1 -name "20*.md" -type f 2>/dev/null | sort)
+fi
+
+if [[ ${#DAILY_FILES[@]} -eq 0 ]]; then
+  echo "No uncompiled daily files"
+  NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  cat > "$LATEST_JSON" <<EOF
+{"ts":"$NOW","files":0,"extracted":0,"deduped":0,"new":0,"status":"no_files"}
+EOF
+  echo "{\"ts\":\"$NOW\",\"files\":0,\"extracted\":0,\"deduped\":0,\"new\":0,\"status\":\"no_files\"}" >> "$HISTORY_JSONL"
+  exit 0
+fi
+
+# Extract bullets from daily files
+ALL_BULLETS=()
+for f in "${DAILY_FILES[@]}"; do
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^-\ .+ ]]; then
+      text="${line#- }"
+      [[ -n "$text" ]] && ALL_BULLETS+=("$text")
+    fi
+  done < "$f"
+done
+
+# Fingerprint function for dedup
+fingerprint() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 ]//g' | cut -c1-60
+}
+
+# Load existing insight fingerprints
+EXISTING_FP=""
+if [[ -f "$INSIGHTS_FILE" ]]; then
+  EXISTING_FP="$(grep '^- ' "$INSIGHTS_FILE" 2>/dev/null | sed 's/^- //' | while IFS= read -r line; do fingerprint "$line"; done || true)"
+fi
+
+# Dedup
+NEW_BULLETS=()
+DEDUPED=0
+for b in "${ALL_BULLETS[@]}"; do
+  fp="$(fingerprint "$b")"
+  if [[ -n "$fp" ]] && echo "$EXISTING_FP" | grep -qF "$fp" 2>/dev/null; then
+    DEDUPED=$((DEDUPED + 1))
+  else
+    NEW_BULLETS+=("$b")
+    EXISTING_FP="${EXISTING_FP}
+${fp}"
+  fi
+done
+
+if $DRY_RUN; then
+  echo "=== brain-memory-compile --dry-run ==="
+  echo "Daily files: ${#DAILY_FILES[@]}"
+  echo "Extracted: ${#ALL_BULLETS[@]}"
+  echo "Deduped: $DEDUPED"
+  echo "New insights: ${#NEW_BULLETS[@]}"
+  echo ""
+  for b in "${NEW_BULLETS[@]}"; do
+    echo "  - $b"
+  done
+  exit 0
+fi
+
+# Ensure insights file exists
+if [[ ! -f "$INSIGHTS_FILE" ]]; then
+  cat > "$INSIGHTS_FILE" <<EOF
+---
+title: "Compiled Insights"
+type: "operational"
+status: "active"
+last_updated: "$(date '+%Y-%m-%d')"
+---
+
+# Compiled Insights
+
+Validated decisions, rules, and constraints extracted from session work. Maintained by the LLM during meditate. Each insight is a directive, not an observation. Remove entries that graduate to CLAUDE.md or governance docs.
+
+---
+
+EOF
+fi
+
+# Append new insights
+if [[ ${#NEW_BULLETS[@]} -gt 0 ]]; then
+  # Update last_updated in frontmatter
+  sed -i "s/^last_updated: .*/last_updated: \"$(date '+%Y-%m-%d')\"/" "$INSIGHTS_FILE"
+
+  {
+    echo ""
+    echo "## Auto-Compiled ($(date '+%Y-%m-%d %H:%M'))"
+    echo ""
+    for b in "${NEW_BULLETS[@]}"; do
+      echo "- $b [$(date '+%Y-%m-%d')]"
+    done
+  } >> "$INSIGHTS_FILE"
+fi
+
+# Mark daily files as compiled
+for f in "${DAILY_FILES[@]}"; do
+  basename_f="$(basename "$f" .md)"
+  echo "$basename_f" >> "$COMPILED_MARKER"
+done
+
+# Write artifacts
+NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+FILES_LIST="$(printf '%s,' "${DAILY_FILES[@]}" | sed 's/,$//')"
+cat > "$LATEST_JSON" <<EOF
+{"ts":"$NOW","files":${#DAILY_FILES[@]},"extracted":${#ALL_BULLETS[@]},"deduped":$DEDUPED,"new":${#NEW_BULLETS[@]},"status":"ok"}
+EOF
+echo "{\"ts\":\"$NOW\",\"files\":${#DAILY_FILES[@]},\"extracted\":${#ALL_BULLETS[@]},\"deduped\":$DEDUPED,\"new\":${#NEW_BULLETS[@]},\"status\":\"ok\"}" >> "$HISTORY_JSONL"
+
+echo "brain-memory-compile: files=${#DAILY_FILES[@]} extracted=${#ALL_BULLETS[@]} deduped=$DEDUPED new=${#NEW_BULLETS[@]}"

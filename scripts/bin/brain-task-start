@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# brain-task-start — Intuitive entry point for starting a task.
+# Wraps brain-task-execute; handles inbox tasks with a clear prompt.
+#
+# Usage:
+#   brain-task-start <TASK-ID> [--by <agent>] [--dry-run] [--force]
+#   brain-task-start --next [--by <agent>]
+#
+# If the task is in queue/: equivalent to brain-task-execute.
+# If the task is in inbox/: prints the required admit step and exits 1.
+# If --next: passes through to brain-task-execute --next.
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+OPS_DIR="$BRAIN/brain/ops/tasks"
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: brain-task-start <TASK-ID> [--by <agent>] [--dry-run] [--force]"
+  echo "       brain-task-start --next [--by <agent>]"
+  echo ""
+  echo "Canonical task start flow:"
+  echo "  1. brain-task-admit <path/to/task.md>   # inbox → queue (if not already admitted)"
+  echo "  2. brain-task-start <TASK-ID>            # queue → active + execution pack"
+  exit 1
+fi
+
+TASK_ID="${1:-}"
+
+# Pass-through for --next and flag-only invocations
+if [[ "$TASK_ID" == "--next" || "$TASK_ID" == --* ]]; then
+  exec brain-task-execute "$@"
+fi
+
+# Check if task is in inbox (not yet admitted)
+INBOX_FILE="$OPS_DIR/inbox/${TASK_ID}.md"
+if [[ -f "$INBOX_FILE" ]]; then
+  echo "ERROR: $TASK_ID is in inbox/ and has not been admitted to the queue yet." >&2
+  echo "" >&2
+  echo "Run this first:" >&2
+  echo "  brain-task-admit $INBOX_FILE" >&2
+  echo "" >&2
+  echo "Then:" >&2
+  echo "  brain-task-start $TASK_ID" >&2
+  exit 1
+fi
+
+# Task is in queue/ or active/ — delegate to brain-task-execute
+exec brain-task-execute "$@"

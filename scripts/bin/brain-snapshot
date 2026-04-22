@@ -1,0 +1,65 @@
+#!/bin/bash
+# brain-snapshot — Create versioned brain snapshot as a git tag
+# Usage:
+#   brain-snapshot            Create weekly snapshot tag
+#
+# Tags: brain-snapshot-YYYY-MM-DD
+# Cron: 0 2 * * 0 (Sundays at 2 AM)
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+LOCKFILE="/tmp/brain-snapshot.lock"
+LOG_FILE="$BRAIN/work/logs/brain-snapshot.log"
+TAG="brain-snapshot-$(date +%Y-%m-%d)"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# ── Flock ──────────────────────────────────────────────────────────
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  log "SKIP: Another brain-snapshot is running"
+  exit 1
+fi
+
+cd "$BRAIN"
+
+# ── Check if tag already exists ────────────────────────────────────
+if git tag -l "$TAG" | grep -q "$TAG"; then
+  log "SKIP: Tag $TAG already exists"
+  exit 0
+fi
+
+# ── Record working tree state in tag annotation ────────────────────
+DIRTY_STATE=""
+CHANGED_COUNT=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$CHANGED_COUNT" -gt 0 ]]; then
+  DIRTY_STATE="WARNING: Repo had $CHANGED_COUNT uncommitted change(s) at snapshot time.
+$(git status --short 2>/dev/null | head -20)"
+else
+  DIRTY_STATE="Repo was clean at snapshot time."
+fi
+
+COMMIT_HASH=$(git rev-parse --short HEAD)
+LAST_COMMIT=$(git log --oneline -1)
+
+TAG_MESSAGE="Weekly brain snapshot $(date +%Y-%m-%d)
+
+Commit: $LAST_COMMIT
+$DIRTY_STATE"
+
+# ── Create annotated tag ──────────────────────────────────────────
+git tag -a "$TAG" -m "$TAG_MESSAGE"
+
+log "Created tag: $TAG (commit $COMMIT_HASH, $CHANGED_COUNT uncommitted changes)"
+echo "[brain-snapshot] Tag created: $TAG"
+echo "  Commit: $LAST_COMMIT"
+if [[ "$CHANGED_COUNT" -gt 0 ]]; then
+  echo "  WARNING: $CHANGED_COUNT uncommitted change(s) at snapshot time"
+else
+  echo "  Repo was clean"
+fi

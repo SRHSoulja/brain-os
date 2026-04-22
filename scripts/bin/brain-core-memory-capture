@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# brain-core-memory-capture -- Queue a core memory for deterministic promotion
+# Usage: brain-core-memory-capture --statement "..." [--tags t1,t2] [--identity] [--source session|discord|manual]
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+QUEUE_DIR="$BRAIN/brain/ops/core-memory"
+QUEUE_FILE="$QUEUE_DIR/queue.jsonl"
+mkdir -p "$QUEUE_DIR"
+
+STATEMENT=""
+TAGS=""
+IDENTITY=false
+SOURCE="session"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --statement) STATEMENT="$2"; shift 2 ;;
+    --tags) TAGS="$2"; shift 2 ;;
+    --identity) IDENTITY=true; shift ;;
+    --source) SOURCE="$2"; shift 2 ;;
+    *) [[ -z "$STATEMENT" ]] && STATEMENT="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$STATEMENT" ]]; then
+  echo "Usage: brain-core-memory-capture --statement \"...\" [--tags t1,t2] [--identity] [--source session|discord|manual]" >&2
+  exit 1
+fi
+
+ID="cmem-$(date +%Y%m%d-%H%M%S)-$(head -c 4 /dev/urandom | xxd -p)"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+python3 - "$QUEUE_FILE" "$ID" "$TS" "$SOURCE" "$STATEMENT" "$TAGS" "$IDENTITY" <<'PY'
+import json, sys
+queue_file, id_, ts, source, statement, tags, identity = sys.argv[1:]
+entry = {
+    "id": id_,
+    "ts": ts,
+    "source": source,
+    "statement": statement,
+    "tags": [t.strip() for t in tags.split(",") if t.strip()] if tags else [],
+    "identity_relevant": identity == "true",
+    "status": "queued"
+}
+with open(queue_file, "a") as f:
+    f.write(json.dumps(entry) + "\n")
+print(id_)
+PY

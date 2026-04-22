@@ -1,0 +1,277 @@
+#!/bin/bash
+# brain-reflect — Daily reflection prompt generator
+# Usage:
+#   brain-reflect                     Generate today's reflection
+#   brain-reflect --date 2026-04-01   Generate for a specific date
+#   brain-reflect --quiet             Just output the file path, no stdout
+#
+# Reads recent brain activity (devlogs, wins, tasks, open questions)
+# and generates targeted reflection questions.
+# Output: work/logs/reflections/YYYY-MM-DD-reflect.md
+#
+# DETERMINISTIC — no LLM calls. Pure file reading and template generation.
+
+set -euo pipefail
+
+BRAIN_ROOT="${BRAIN_DIR:-$HOME/gmgn-brain}"
+DEVLOG_DIR="$BRAIN_ROOT/work/logs/devlog"
+WINS_LOG="$BRAIN_ROOT/work/logs/wins-log.md"
+TASK_QUEUE="$BRAIN_ROOT/brain/ops/tasks/queue"
+ACTIVE_CONTEXT="$BRAIN_ROOT/brain/index/active-context.md"
+OPEN_QUESTIONS="$BRAIN_ROOT/work/open-questions.md"
+REFLECTIONS_DIR="$BRAIN_ROOT/work/logs/reflections"
+
+# Defaults
+TARGET_DATE=$(date '+%Y-%m-%d')
+QUIET=false
+
+usage() {
+  echo "Usage:"
+  echo "  brain-reflect                     Generate today's reflection"
+  echo "  brain-reflect --date 2026-04-01   Generate for a specific date"
+  echo "  brain-reflect --quiet             Just output the file path"
+  exit 1
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --date)
+      TARGET_DATE="$2"
+      shift 2
+      ;;
+    --quiet)
+      QUIET=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      usage
+      ;;
+  esac
+done
+
+# Ensure output dir exists
+mkdir -p "$REFLECTIONS_DIR"
+
+OUTPUT_FILE="$REFLECTIONS_DIR/${TARGET_DATE}-reflect.md"
+GENERATED_AT=$(date -Iseconds)
+SOURCES=()
+
+log() {
+  if [[ "$QUIET" != true ]]; then
+    echo "$1"
+  fi
+}
+
+log "brain-reflect: generating reflection for $TARGET_DATE"
+
+# --- Step 1: Recent devlogs (last 3, sorted by date desc) ---
+DEVLOG_SECTION=""
+if [[ -d "$DEVLOG_DIR" ]]; then
+  DEVLOG_FILES=$(find "$DEVLOG_DIR" -name '*.md' ! -name 'README.md' -type f | sort -r | head -3)
+  if [[ -n "$DEVLOG_FILES" ]]; then
+    DEVLOG_SECTION=""
+    while IFS= read -r f; do
+      SOURCES+=("$f")
+      BASENAME=$(basename "$f" .md)
+      # Extract title from frontmatter or first heading
+      TITLE=$(grep -m1 '^title:' "$f" 2>/dev/null | sed 's/^title:\s*//;s/^"//;s/"$//' || true)
+      if [[ -z "$TITLE" ]]; then
+        TITLE=$(grep -m1 '^# ' "$f" 2>/dev/null | sed 's/^# //' || true)
+      fi
+      if [[ -z "$TITLE" ]]; then
+        TITLE="$BASENAME"
+      fi
+      # Extract date from filename (YYYY-MM-DD prefix)
+      FILE_DATE=$(echo "$BASENAME" | grep -oP '^\d{4}-\d{2}-\d{2}' || echo "unknown")
+      DEVLOG_SECTION="${DEVLOG_SECTION}- **${FILE_DATE}**: ${TITLE}
+"
+    done <<< "$DEVLOG_FILES"
+  fi
+fi
+
+if [[ -z "$DEVLOG_SECTION" ]]; then
+  DEVLOG_SECTION="(no recent devlogs found)
+"
+fi
+
+log "  - Read devlogs"
+
+# --- Step 2: Recent wins (last 10 entries from table, show 5 in output) ---
+WINS_SECTION=""
+if [[ -f "$WINS_LOG" ]]; then
+  SOURCES+=("$WINS_LOG")
+  # Extract table rows (lines starting with |, skip header and separator)
+  WINS_LINES=$(grep '^| ' "$WINS_LOG" | grep -v '^| Date' | grep -v '^|---' | tail -10)
+  if [[ -n "$WINS_LINES" ]]; then
+    # Take last 5 for display
+    DISPLAY_WINS=$(echo "$WINS_LINES" | tail -5)
+    WINS_SECTION=""
+    while IFS= read -r line; do
+      WIN_DATE=$(echo "$line" | awk -F'|' '{gsub(/^ +| +$/,"",$2); print $2}')
+      WIN_DESC=$(echo "$line" | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}')
+      WINS_SECTION="${WINS_SECTION}- **${WIN_DATE}**: ${WIN_DESC}
+"
+    done <<< "$DISPLAY_WINS"
+  fi
+fi
+
+if [[ -z "$WINS_SECTION" ]]; then
+  WINS_SECTION="(no recent wins found)
+"
+fi
+
+log "  - Read wins"
+
+# --- Step 3: Open tasks (titles from queue frontmatter) ---
+TASKS_SECTION=""
+if [[ -d "$TASK_QUEUE" ]]; then
+  TASK_FILES=$(find "$TASK_QUEUE" -name '*.md' -type f 2>/dev/null | sort)
+  if [[ -n "$TASK_FILES" ]]; then
+    while IFS= read -r f; do
+      SOURCES+=("$f")
+      TASK_TITLE=$(grep -m1 '^title:' "$f" 2>/dev/null | sed 's/^title:\s*//;s/^"//;s/"$//' || true)
+      TASK_ID=$(grep -m1 '^task_id:' "$f" 2>/dev/null | sed 's/^task_id:\s*//;s/^"//;s/"$//' || true)
+      if [[ -n "$TASK_TITLE" ]]; then
+        TASKS_SECTION="${TASKS_SECTION}- ${TASK_ID}: ${TASK_TITLE}
+"
+      fi
+    done <<< "$TASK_FILES"
+  fi
+fi
+
+if [[ -z "$TASKS_SECTION" ]]; then
+  TASKS_SECTION="(no queued tasks)
+"
+fi
+
+log "  - Read task queue"
+
+# --- Step 4: Current focus from active-context.md ---
+FOCUS_SECTION=""
+if [[ -f "$ACTIVE_CONTEXT" ]]; then
+  SOURCES+=("$ACTIVE_CONTEXT")
+  # Extract the Current Focus section (between ## Current Focus and next ##)
+  FOCUS_SECTION=$(awk '/^## Current Focus/,/^## [^C]/' "$ACTIVE_CONTEXT" | grep -v '^## ' | head -10 | sed '/^$/d')
+  if [[ -z "$FOCUS_SECTION" ]]; then
+    # Fallback: try any Focus heading
+    FOCUS_SECTION=$(awk '/^## .*[Ff]ocus/,/^## /' "$ACTIVE_CONTEXT" | grep -v '^## ' | head -10 | sed '/^$/d')
+  fi
+fi
+
+if [[ -z "$FOCUS_SECTION" ]]; then
+  FOCUS_SECTION="(no current focus section found)"
+fi
+
+log "  - Read active context"
+
+# --- Step 5: Open questions ---
+QUESTIONS_SECTION=""
+if [[ -f "$OPEN_QUESTIONS" ]]; then
+  SOURCES+=("$OPEN_QUESTIONS")
+  # Grab question lines (lines starting with - or *)
+  QUESTIONS_SECTION=$(grep -E '^\s*[-*] ' "$OPEN_QUESTIONS" | head -10 || true)
+fi
+
+if [[ -z "$QUESTIONS_SECTION" ]]; then
+  QUESTIONS_SECTION="(no open questions found)"
+fi
+
+log "  - Read open questions"
+
+# --- Step 5b: Recent healing events ---
+HEALING_LOG="$BRAIN_ROOT/work/logs/healing-events.log"
+HEALING_SECTION=""
+if [[ -f "$HEALING_LOG" ]]; then
+  SOURCES+=("$HEALING_LOG")
+  HEALING_SECTION=$(tail -3 "$HEALING_LOG" 2>/dev/null || true)
+fi
+
+if [[ -z "$HEALING_SECTION" ]]; then
+  HEALING_SECTION="(no recent healing events)"
+fi
+
+log "  - Read healing events"
+
+# --- Build sources list for frontmatter ---
+SOURCES_YAML="["
+for i in "${!SOURCES[@]}"; do
+  # Make paths relative to BRAIN_ROOT for readability
+  REL_PATH="${SOURCES[$i]#$BRAIN_ROOT/}"
+  if [[ $i -gt 0 ]]; then
+    SOURCES_YAML="${SOURCES_YAML}, "
+  fi
+  SOURCES_YAML="${SOURCES_YAML}\"${REL_PATH}\""
+done
+SOURCES_YAML="${SOURCES_YAML}]"
+
+# --- Step 6: Write the reflection file ---
+cat > "$OUTPUT_FILE" << REFLECT_EOF
+---
+type: reflection
+date: ${TARGET_DATE}
+generated: ${GENERATED_AT}
+sources: ${SOURCES_YAML}
+---
+
+# Reflection: ${TARGET_DATE}
+
+## What the Brain Knows
+
+### Recent Work
+${DEVLOG_SECTION}
+### Recent Wins
+${WINS_SECTION}
+### Open Tasks
+${TASKS_SECTION}
+### Current Focus
+${FOCUS_SECTION}
+
+### Open Questions
+${QUESTIONS_SECTION}
+
+### System Health (recent)
+${HEALING_SECTION}
+
+## Reflect (bullet points only, <60 seconds)
+
+### What mattered
+-
+-
+
+### What changed
+-
+-
+
+### What should happen next
+-
+-
+$(if [[ "$HEALING_SECTION" != "(no recent healing events)" ]]; then echo "
+### Did any system issues affect this session?
+-
+### Should any system issues be addressed before pursuing new work?
+-"; fi)
+
+---
+*Generated by brain-reflect. Fill in bullets above. This carries forward.*
+REFLECT_EOF
+
+if [[ "$QUIET" == true ]]; then
+  echo "$OUTPUT_FILE"
+else
+  echo ""
+  echo "========================================="
+  echo " REFLECTION GENERATED"
+  echo "========================================="
+  echo ""
+  echo "  File:    $OUTPUT_FILE"
+  echo "  Date:    $TARGET_DATE"
+  echo "  Sources: ${#SOURCES[@]} files read"
+  echo ""
+  echo "  Next: Open the file, read the prompts, write your answers."
+  echo ""
+fi

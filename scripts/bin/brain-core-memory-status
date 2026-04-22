@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# brain-core-memory-status -- Show unresolved core memory queue items
+# Usage: brain-core-memory-status [--count-only] [--json]
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+QUEUE_FILE="$BRAIN/brain/ops/core-memory/queue.jsonl"
+COUNT_ONLY=false
+JSON_OUT=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --count-only) COUNT_ONLY=true ;;
+    --json) JSON_OUT=true ;;
+  esac
+done
+
+if [[ ! -f "$QUEUE_FILE" ]]; then
+  $COUNT_ONLY && echo "0" && exit 0
+  $JSON_OUT && echo '{"unresolved":0,"items":[]}' && exit 0
+  echo "No core-memory queue file. Queue is empty."
+  exit 0
+fi
+
+python3 - "$QUEUE_FILE" "$COUNT_ONLY" "$JSON_OUT" <<'PY'
+import json, sys
+
+queue_file, count_only, json_out = sys.argv[1], sys.argv[2] == "true", sys.argv[3] == "true"
+items = []
+try:
+    with open(queue_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("status") == "queued":
+                items.append(entry)
+except FileNotFoundError:
+    pass
+
+if count_only:
+    print(len(items))
+elif json_out:
+    print(json.dumps({"unresolved": len(items), "items": items}))
+else:
+    if not items:
+        print("Core-memory queue: 0 unresolved")
+    else:
+        print(f"Core-memory queue: {len(items)} unresolved")
+        for item in items:
+            stmt = item.get("statement", "")[:70]
+            print(f"  - [{item['id']}] {stmt}")
+            print(f"    Resolve: brain-memory-promote-core \"{item.get('statement','')}\" --tag {','.join(item.get('tags',['core']))}")
+            print(f"             brain-core-memory-resolve --id {item['id']} --run-id <proof_run_id>")
+PY

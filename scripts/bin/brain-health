@@ -1,0 +1,91 @@
+#!/bin/bash
+# brain-health — Aggregated runtime health snapshot (read-only)
+# Usage: brain-health
+#
+# Reports verdict, task counts, export status, webhook health, and lock state.
+# Never mutates state.
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+TOOLS="$HOME/gmgn-brain/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+OPS_DIR="$_OPS_TASKS_DIR"
+VERDICT_JSON="$_VERDICT_JSON"
+VERDICT_READER="$_VERDICT_READER"
+EXPORT_LOG="$BRAIN/work/logs/brain-export.log"
+POST_COMMIT_LOG="$BRAIN/work/logs/post-commit.log"
+
+echo "## Brain Health"
+echo ""
+
+# ── Verdict ───────────────────────────────────────────────────────
+if [[ -f "$VERDICT_JSON" ]]; then
+  _vr=$(python3 "$VERDICT_READER" "$VERDICT_JSON" 2>/dev/null) || _vr=""
+  if [[ -n "$_vr" ]]; then
+    IFS=$'\t' read -r v_status v_summary v_issues v_ts v_q v_a v_c <<< "$_vr"
+    echo "Verdict: $v_status"
+    [[ "$v_status" != "OK" ]] && echo "  $v_issues issue(s): $v_summary"
+    verdict_age=$(( $(date +%s) - $(stat -c %Y "$VERDICT_JSON") ))
+    echo "  Last check: $(( verdict_age / 60 ))m ago"
+  else
+    echo "Verdict: UNKNOWN (reader failed)"
+  fi
+else
+  echo "Verdict: MISSING (no state-verdict.json)"
+fi
+
+# ── Tasks ─────────────────────────────────────────────────────────
+q=0; a=0; c=0
+for f in "$OPS_DIR"/queue/TASK-*.md; do [[ -f "$f" ]] && q=$((q+1)); done
+for f in "$OPS_DIR"/active/TASK-*.md; do [[ -f "$f" ]] && a=$((a+1)); done
+for f in "$OPS_DIR"/completed/TASK-*.md; do [[ -f "$f" ]] && c=$((c+1)); done
+echo "Queue: $q  Active: $a  Completed: $c"
+
+echo ""
+echo "## Exports"
+echo ""
+
+# ── Export log ────────────────────────────────────────────────────
+if [[ -f "$EXPORT_LOG" ]]; then
+  last_start=$(grep '^\[START\]' "$EXPORT_LOG" | tail -1 | awk '{print $2}' || echo "")
+  last_end=$(grep '^\[END\]' "$EXPORT_LOG" | tail -1 | awk '{print $2}' || echo "")
+  last_write=$(grep '^\[WRITE\]' "$EXPORT_LOG" | tail -1 | sed 's/\[WRITE\] [^ ]* //' || echo "")
+  last_deploy=$(grep '^\[DEPLOY\]' "$EXPORT_LOG" | tail -1 | sed 's/\[DEPLOY\] [^ ]* //' || echo "")
+
+  [[ -n "$last_end" ]] && echo "Last export: $last_end" || echo "Last export: never"
+  [[ -n "$last_write" ]] && echo "  Files: $last_write"
+  [[ -n "$last_deploy" ]] && echo "Last deploy: $last_deploy" || echo "Last deploy: none recorded"
+else
+  echo "Last export: no log"
+fi
+
+echo ""
+echo "## Webhook (decommissioned)"
+echo ""
+echo "Status: decommissioned (replaced by brain-export --deploy CLI)"
+echo "See: operator-notes.jsonl, 2026-04-09"
+
+echo ""
+echo "## Locks"
+echo ""
+
+# ── Active locks ──────────────────────────────────────────────────
+lock_count=0
+LOCK_BASE="$BRAIN/brain/ops/tasks/.locks"
+if [[ -d "$LOCK_BASE" ]]; then
+  for ld in "$LOCK_BASE"/*.lock; do
+    [[ -d "$ld" ]] || continue
+    lock_count=$((lock_count + 1))
+    meta="$ld/meta.json"
+    if [[ -f "$meta" ]]; then
+      info=$(python3 -c "
+import json
+d = json.load(open('$meta'))
+print(f\"  {d.get('task_id','?')}: {d.get('operation','?')} by {d.get('agent','?')} (pid={d.get('pid','?')})\")
+" 2>/dev/null || echo "  $(basename "$ld"): unreadable metadata")
+      echo "$info"
+    fi
+  done
+fi
+echo "Active locks: $lock_count"
