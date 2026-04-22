@@ -41,7 +41,7 @@ if ! $API_RUNNING; then
 fi
 
 # ── Promptbox queue depth ─────────────────────────────────────────
-BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 QUEUE_DIR="$BRAIN/brain/ops/promptbox/terminal"
 QUEUE_COUNT=0
 if [[ -d "$QUEUE_DIR" ]]; then

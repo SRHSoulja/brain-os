@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-BRAIN_ROOT="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN_ROOT="${BRAIN_DIR:-$HOME/brain}"
 DEVLOG_DIR="$BRAIN_ROOT/work/logs/devlog"
 WINS_LOG="$BRAIN_ROOT/work/logs/wins-log.md"
 TASK_QUEUE="$BRAIN_ROOT/brain/ops/tasks/queue"

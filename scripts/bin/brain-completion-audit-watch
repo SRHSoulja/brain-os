@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 COMPLETED_DIR="$BRAIN/brain/ops/tasks/completed"
 AUDIT_LOG="$BRAIN/work/logs/post-task-audit.log"
 AUDIT_SCRIPT="$BRAIN/scripts/lib/post-task-audit.py"

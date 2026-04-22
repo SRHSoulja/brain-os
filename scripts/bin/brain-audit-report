@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # brain-audit-report — Aggregates global forensic audit data.
 
-BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 RESULTS="$BRAIN/brain/ops/analytics/audit_progress.json"
 REPORT="$BRAIN/brain/ops/analytics/audit_summary_report.md"
 

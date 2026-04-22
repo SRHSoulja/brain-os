@@ -3,7 +3,7 @@
 # Usage: brain-core-memory-capture --statement "..." [--tags t1,t2] [--identity] [--source session|discord|manual]
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 QUEUE_DIR="$BRAIN/brain/ops/core-memory"
 QUEUE_FILE="$QUEUE_DIR/queue.jsonl"
 mkdir -p "$QUEUE_DIR"

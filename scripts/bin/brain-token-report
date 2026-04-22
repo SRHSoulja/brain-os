@@ -4,12 +4,12 @@
 # Usage:
 #   brain-token-report                — report for current/latest session
 #   brain-token-report <session-id>   — report for specific session
-#   brain-token-report --all          — summary across all gmgn-brain sessions
+#   brain-token-report --all          — summary across all brain sessions
 #   brain-token-report --json         — machine-readable output
 
 set -uo pipefail
 
-PROJECT_DIR="$HOME/.claude/projects/-home-arson-gmgn-brain"
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$HOME/.claude/projects/$(basename ${BRAIN_DIR:-$HOME/brain})}"
 JSON=false
 ALL=false
 SESSION_ID=""
@@ -142,7 +142,7 @@ else:
 
     # Read authoritative usage snapshot if available
     snapshot = None
-    snap_path = os.path.expanduser("~/gmgn-brain/work/logs/usage-snapshot.json")
+    snap_path = os.path.expanduser("${BRAIN_DIR:-$HOME/brain}/work/logs/usage-snapshot.json")
     try:
         with open(snap_path) as f:
             snapshot = json.load(f)

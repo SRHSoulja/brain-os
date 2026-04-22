@@ -18,7 +18,7 @@ done
 _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
 . "$_SELF_DIR/../lib/brain-paths.sh"
 _require_local
-TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+TOOLS="${_TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 . "$_SELF_DIR/../lib/frontmatter.sh"
 
 BRAIN="$_BRAIN"

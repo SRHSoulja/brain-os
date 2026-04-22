@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 QUIET=false
 [[ "${1:-}" == "--quiet" ]] && QUIET=true
 

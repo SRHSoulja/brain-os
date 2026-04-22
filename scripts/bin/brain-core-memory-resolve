@@ -3,7 +3,7 @@
 # Usage: brain-core-memory-resolve --id <capture_id> --run-id <proof_run_id>
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 QUEUE_DIR="$BRAIN/brain/ops/core-memory"
 QUEUE_FILE="$QUEUE_DIR/queue.jsonl"
 RESOLVED_FILE="$QUEUE_DIR/resolved.jsonl"

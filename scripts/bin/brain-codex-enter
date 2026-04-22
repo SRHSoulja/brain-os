@@ -27,7 +27,7 @@ done
   "$TOOLS/brain-seat-claim" --seat laptop --assistant codex --mode "$MODE"
   "$TOOLS/brain-heartbeat" >/dev/null 2>&1 || true
 }
-"$TOOLS/brain-codex-usage-snapshot" --cwd-prefix "$HOME/gmgn-brain" --quiet >/dev/null 2>&1 || true
+"$TOOLS/brain-codex-usage-snapshot" --cwd-prefix "${BRAIN_DIR:-$HOME/brain}" --quiet >/dev/null 2>&1 || true
 "$TOOLS/brain-codex-progress-checkpoint" --stage enter --reason "codex-enter mode=$MODE" --quiet >/dev/null 2>&1 || true
 
 # Command-map health preflight (advisory for now; entry should still succeed).

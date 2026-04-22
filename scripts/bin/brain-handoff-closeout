@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # brain-handoff-closeout — canonical wrapper for handoff_closeout.sh
-HDIR="${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/handoff-system"
+HDIR="${BRAIN_DIR:-$HOME/brain}/scripts/lib/handoff-system"
 if [[ "handoff_closeout.sh" == *.py ]]; then
   exec python3 "$HDIR/handoff_closeout.sh" "$@"
 else

@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 OPS_DIR="$BRAIN/brain/ops/tasks"
 . "$TOOLS/lib/frontmatter.sh"
 

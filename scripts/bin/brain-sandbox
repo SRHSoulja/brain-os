@@ -15,7 +15,7 @@ set -euo pipefail
 
 TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIB_DIR="$TOOLS_DIR/lib"
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 MASTER_LOG="$BRAIN/work/logs/sandbox-log.md"
 RUN_LOG="/tmp/brain-sandbox-run.log"
 NOW_DISPLAY=$(date '+%Y-%m-%d %I:%M %p %Z')

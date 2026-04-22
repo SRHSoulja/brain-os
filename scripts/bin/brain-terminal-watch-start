@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 PROMPTBOX="$BRAIN/brain/ops/promptbox/terminal"
 PID_FILE="/tmp/brain-terminal-watcher.pid"
 LOG_FILE="/tmp/brain-terminal-events.log"

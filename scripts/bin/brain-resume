@@ -3,7 +3,7 @@
 # Usage: brain-resume [--new-session] [--quiet] [--ve-sync] [--close-refresh]
 #
 # Reads brain state and writes brain/index/session-resume.md
-# Run before starting a Claude Code session in ~/gmgn-brain
+# Run before starting a Claude Code session in ~/brain (or $BRAIN_DIR)
 #
 # --new-session  Reset the session timer. Use only for true session starts
 #                (SessionStart hook). Mid-session callers (brain-task-complete,
@@ -29,7 +29,7 @@ for arg in "$@"; do
   esac
 done
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 # Resolve through symlinks so ~/bin wrappers can source libs reliably.
 _SELF_SOURCE="${BASH_SOURCE[0]}"
 while [[ -h "$_SELF_SOURCE" ]]; do
@@ -39,7 +39,7 @@ while [[ -h "$_SELF_SOURCE" ]]; do
 done
 _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
 . "$_SELF_DIR/../lib/brain-paths.sh"
-TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+TOOLS="${_TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 . "$_SELF_DIR/../lib/frontmatter.sh"
 RESUME="$_SESSION_RESUME"
 NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)

@@ -2,7 +2,7 @@
 # brain-task-quick — Fast task creation from minimal input
 # Usage:
 #   brain-task-quick "Deploy the new blog post" --node content-and-docs
-#   brain-task-quick "Fix Clip factual responses" --node clip-the-intern --p2
+#   brain-task-quick "Fix login bug" --node my-app --p2
 #   brain-task-quick "Audit cron schedule" --node automation-builds --steps "1. Check crontab;2. List schedule;3. Compare against expected"
 #   brain-task-quick "Title" --why "reason" --owner human --steps "1. Do X;2. Do Y"
 #
@@ -37,8 +37,8 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 
 # Self-dispatch: route through brain-dispatch if not already dispatched.
 # brain-dispatch sets BRAIN_DISPATCH_ACTIVE=1 before calling this tool.
@@ -123,7 +123,7 @@ if [[ -z "$TITLE" ]]; then
   echo "" >&2
   echo "Examples:" >&2
   echo "  brain-task-quick \"Deploy the new blog post\" --node content-and-docs" >&2
-  echo "  brain-task-quick \"Fix Clip factual responses\" --node clip-the-intern --p2" >&2
+  echo "  brain-task-quick \"Fix login bug\" --node my-app --p2" >&2
   echo "  brain-task-quick \"Audit cron schedule\" --steps \"SSH to production;List crontab;Compare expected\"" >&2
   echo "  brain-task-quick \"Review draft\" --owner human --why \"Needs human judgment\"" >&2
   exit 1
@@ -154,33 +154,20 @@ if [[ -z "$NODE" ]]; then
   NODE=$(python3 -c "
 import os, sys
 title = sys.argv[1].lower()
-nodes_dir = os.path.join(os.environ['HOME'], 'gmgn-brain', 'nodes')
+nodes_dir = os.path.join(os.environ.get('BRAIN_DIR', os.path.join(os.environ['HOME'], 'brain')), 'nodes')
 best = ''
 best_score = 0
-for d in os.listdir(nodes_dir):
-    full = os.path.join(nodes_dir, d)
-    if not os.path.isdir(full) or d.startswith('_') or d.startswith('example'):
-        continue
-    # Check if node name (with hyphens as spaces) appears in title
-    readable = d.replace('-', ' ')
-    # Also check common aliases
-    aliases = {
-        'clip-the-intern': ['clip', 'clip factual', 'discord bot'],
-        'gmgnrepeat-website': ['website', 'blog', 'deploy page', 'landing page'],
-        'content-and-docs': ['blog post', 'content', 'article', 'writing'],
-        'devops-tools': ['tool', 'brain-', 'cli', 'script'],
-        'coaching': ['guide', 'coaching', 'course', 'gumroad'],
-        'strikes': ['strikes', 'crypto', 'trading'],
-        'cliptv': ['cliptv', 'clips', 'streamer'],
-        'interactive-streams': ['stream', 'overlay', 'obs'],
-        'automation-builds': ['cron', 'automation', 'xbot', 'scheduled'],
-        'the-lab': ['lab', 'client', 'custom build'],
-    }
-    candidates = [readable] + aliases.get(d, [])
-    for alias in candidates:
-        if alias in title and len(alias) > best_score:
-            best = d
-            best_score = len(alias)
+if os.path.isdir(nodes_dir):
+    for d in os.listdir(nodes_dir):
+        full = os.path.join(nodes_dir, d)
+        if not os.path.isdir(full) or d.startswith('_') or d.startswith('example'):
+            continue
+        readable = d.replace('-', ' ')
+        candidates = [readable]
+        for alias in candidates:
+            if alias in title and len(alias) > best_score:
+                best = d
+                best_score = len(alias)
 print(best)
 " "$TITLE" 2>/dev/null || echo "")
 fi
@@ -211,15 +198,11 @@ fi
 
 # ── Default write surfaces ───────────────────────────────────────
 if [[ -z "$SURFACES" ]]; then
-  case "$NODE" in
-    gmgnrepeat-website) SURFACES="gmgnrepeat-website, work/drafts" ;;
-    clip-the-intern)    SURFACES="clip-the-intern/" ;;
-    content-and-docs)   SURFACES="work/drafts, gmgnrepeat-website" ;;
-    devops-tools)       SURFACES="tools/" ;;
-    strikes)            SURFACES="strikes/" ;;
-    cliptv)             SURFACES="cliptv/" ;;
-    *)                  SURFACES="work/" ;;
-  esac
+  if [[ -n "$NODE" ]]; then
+    SURFACES="nodes/${NODE}/"
+  else
+    SURFACES="work/"
+  fi
 fi
 
 # ── Creator model attribution (agent-agnostic) ───────────────────

@@ -9,7 +9,7 @@
 #   General:   checkpoint, receipt_note, task_note
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
 PROOF_DIR="$BRAIN/brain/ops/proof-execution"
 KEYGEN_TOOL="$HOME/bin/brain-proof-keygen"

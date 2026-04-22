@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 CHECKPOINT_DIR="$BRAIN/work/inbox/checkpoints"
 TIMESTAMP=$(date +%Y-%m-%d-%H%M%S)
 DISPLAY_TIME=$(date '+%Y-%m-%d %I:%M %p %Z')
@@ -187,15 +187,20 @@ if [[ -f "$PQUEUE" ]]; then
 fi
 
 # ── Repo states ─────────────────────────────────────────────────────
+# Checks brain repo only. Add instance-specific repos to BRAIN_EXTRA_REPOS
+# in brain/config/repos.conf: BRAIN_EXTRA_REPOS=("$HOME/myrepo|label" ...)
 REPO_STATES=""
 for repo_entry in \
-  "$HOME/gmgn-brain|gmgn-brain" \
-  "$HOME/gmgn-brain/scripts|tools" \
-  "$HOME/2026Projects/clip-the-intern|clip-the-intern" \
-  "$HOME/2026Projects/xbot|xbot" \
-  "$HOME/2026Projects/strikes|strikes" \
-  "$HOME/2026Projects/arcbot|arcbot" \
+  "${BRAIN_DIR:-$HOME/brain}|brain" \
+  "${BRAIN_DIR:-$HOME/brain}/scripts|scripts" \
 ; do
+  rpath="${repo_entry%%|*}"
+  rname="${repo_entry##*|}"
+  REPO_STATES+="$(repo_status "$rpath" "$rname")
+"
+done
+for repo_entry in "${BRAIN_EXTRA_REPOS[@]:-}"; do
+  [[ -z "$repo_entry" ]] && continue
   rpath="${repo_entry%%|*}"
   rname="${repo_entry##*|}"
   REPO_STATES+="$(repo_status "$rpath" "$rname")

@@ -5,7 +5,7 @@
 # Use this when running inside a 'brain-session' wrapper to 
 # automate the restart after state is sealed.
 
-BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
 TOOLS_BIN="$HOME/bin"
 
 echo "=== Meditation Ritual (Automated) ==="

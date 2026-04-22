@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # brain-handoff-run-all — canonical wrapper for handoff_run_all.sh
-HDIR="${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/handoff-system"
+HDIR="${BRAIN_DIR:-$HOME/brain}/scripts/lib/handoff-system"
 if [[ "handoff_run_all.sh" == *.py ]]; then
   exec python3 "$HDIR/handoff_run_all.sh" "$@"
 else

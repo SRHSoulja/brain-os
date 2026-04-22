@@ -7,7 +7,7 @@
 # Any agent can call this. Does NOT run brain-meditate (that's Claude-specific).
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 EVENTS_LOG="$BRAIN/brain/ops/events.log"
 EVENTS_JSONL="$BRAIN/brain/ops/events.jsonl"
 SESSION_FILE="$BRAIN/brain/ops/.active-session.json"

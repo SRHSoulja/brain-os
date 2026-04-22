@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gemini wrapper: in gmgn-brain, launch with bypass mode + gemini seat claim
+# gemini wrapper: launch with bypass mode + gemini seat claim
 set -euo pipefail
 
 # Resolve the real gemini binary dynamically via PATH.

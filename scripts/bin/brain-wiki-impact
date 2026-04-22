@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 WIKI="$BRAIN/brain/wiki"
 STALE_DAYS=30
 QUIET=false

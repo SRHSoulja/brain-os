@@ -8,10 +8,10 @@
 
 set -uo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_SELF_DIR/../lib/brain-paths.sh"
-TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+TOOLS="${_TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 _require_local
 COMPLETED="$_OPS_TASKS_DIR/completed"
 MANIFEST="$COMPLETED/.task-checksums"

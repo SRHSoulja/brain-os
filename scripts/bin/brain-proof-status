@@ -3,7 +3,7 @@
 # Usage: brain-proof-status [--limit N]
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
 INDEX_DIR="$BRAIN/brain/ops/proof-execution/index"
 LIMIT=10

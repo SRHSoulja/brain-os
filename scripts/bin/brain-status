@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 
 # ── Snapshot ─────────────────────────────────────────────────────
 SNAPSHOT=$(cd "$BRAIN" && git tag -l 'brain-snapshot-*' --sort=-creatordate 2>/dev/null | head -1)

@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 TERMINAL_DIR="$BRAIN/brain/ops/promptbox/terminal"
 ARCHIVE_BASE="$BRAIN/brain/ops/promptbox/archive"
 ARCHIVE_AGE_HOURS="${ARCHIVE_AGE_HOURS:-1}"

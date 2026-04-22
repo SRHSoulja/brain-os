@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # brain-audit-pipeline — Full-coverage forensic audit.
 
-BRAIN="${GMGN_BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 COMPLETED_DIR="$BRAIN/brain/ops/tasks/completed"
 PROGRESS_FILE="$BRAIN/brain/ops/analytics/audit_progress.md"
 LIST_FILE="$BRAIN/brain/ops/analytics/task_list.csv"

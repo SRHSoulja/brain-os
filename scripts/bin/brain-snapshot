@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 LOCKFILE="/tmp/brain-snapshot.lock"
 LOG_FILE="$BRAIN/work/logs/brain-snapshot.log"
 TAG="brain-snapshot-$(date +%Y-%m-%d)"

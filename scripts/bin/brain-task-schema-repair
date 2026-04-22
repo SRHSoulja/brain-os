@@ -190,7 +190,7 @@ def main():
     if args:
         ops_dir = args[0]
     else:
-        brain = os.environ.get('BRAIN', os.path.expanduser('~/gmgn-brain'))
+        brain = os.environ.get('BRAIN', os.path.expanduser(os.environ.get('BRAIN_DIR', '~/brain')))
         ops_dir = os.path.join(brain, 'brain', 'ops', 'tasks')
 
     completed_dir = os.path.join(ops_dir, 'completed')

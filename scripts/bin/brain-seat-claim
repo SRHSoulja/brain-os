@@ -3,7 +3,7 @@
 # Usage: brain-seat-claim --seat laptop|ve --assistant claude|codex --mode interactive|bridge|standby
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 SEAT_FILE="$BRAIN/brain/ops/.brain-active-seat.json"
 
 SEAT=""

@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 . "$TOOLS/lib/brain-paths.sh"
 OPS_DIR="$_OPS_TASKS_DIR"
 VERDICT_JSON="$_VERDICT_JSON"

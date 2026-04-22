@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN:-$HOME/gmgn-brain}"
-TOOLS="${TOOLS:-$HOME/gmgn-brain/scripts}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 
 # Self-dispatch: route through brain-dispatch if not already dispatched.
 # brain-dispatch sets BRAIN_DISPATCH_ACTIVE=1 before calling this tool.
@@ -777,8 +777,10 @@ model_confidence = 'low'
 
 if runtime_resolved == 'claude-code':
     # Read most-recent JSONL in ~/.claude/projects/<brain-slug>/
-    slug = '-home-arson-gmgn-brain'
-    projects_dir = os.path.join(home, '.claude', 'projects', slug)
+    brain_dir = os.environ.get('BRAIN_DIR', os.path.join(home, 'brain'))
+    brain_name = os.path.basename(brain_dir.rstrip('/'))
+    slug = '-' + os.path.abspath(brain_dir).replace('/', '-').lstrip('-')
+    projects_dir = os.environ.get('CLAUDE_PROJECT_DIR', os.path.join(home, '.claude', 'projects', slug))
     jsonl_files = sorted(glob.glob(os.path.join(projects_dir, '*.jsonl')), key=os.path.getmtime, reverse=True)
     found = False
     for jf in jsonl_files[:3]:
@@ -860,7 +862,7 @@ fi
 # If the completed task touched handoff-control surfaces, rebuild the
 # codex-lab handoff artifacts before continuation. Lane-mapped tasks
 # still autosync below; this catches non-lane or cross-cutting changes.
-HANDOFF_REFRESH_CLASSIFIER="$HOME/gmgn-brain/scripts/lib/handoff-system/handoff_refresh_classifier.py"
+HANDOFF_REFRESH_CLASSIFIER="${BRAIN_DIR:-$HOME/brain}/scripts/lib/handoff-system/handoff_refresh_classifier.py"
 _HANDOFF_REFRESH_REQUIRED="no"
 _HANDOFF_REFRESH_REASONS=""
 _HANDOFF_LANE_ID=$(fm_get "$COMPLETED_TARGET" "handoff_lane_id" 2>/dev/null || echo "")
@@ -1267,7 +1269,7 @@ if [[ -f "$COMPLETION_JSON" ]]; then
 fi
 
 # Auto-sync handoff lane if task has handoff_lane_id
-AUTOSYNC="$HOME/gmgn-brain/scripts/lib/handoff-system/handoff_task_lane_autosync.sh"
+AUTOSYNC="${BRAIN_DIR:-$HOME/brain}/scripts/lib/handoff-system/handoff_task_lane_autosync.sh"
 _AUTOSYNC_TARGET="$OPS_DIR/completed/${TASK_ID}.md"
 if [[ -f "$AUTOSYNC" ]] && grep -q 'handoff_lane_id:' "$_AUTOSYNC_TARGET" 2>/dev/null; then
   echo ""

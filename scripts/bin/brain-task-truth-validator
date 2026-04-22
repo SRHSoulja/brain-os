@@ -14,7 +14,7 @@ import os
 import re
 import sys
 
-BRAIN_DIR = os.environ.get("BRAIN_DIR", os.path.expanduser("~/gmgn-brain"))
+BRAIN_DIR = os.environ.get("BRAIN_DIR", os.path.expanduser(os.environ.get("BRAIN_DIR", "~/brain")))
 EVENTS_LOG = os.path.join(BRAIN_DIR, "brain/ops/events.jsonl")
 COMPLETED_DIR = os.path.join(BRAIN_DIR, "brain/ops/tasks/completed")
 TASK_ID_PATTERN = re.compile(r'^TASK-\d{4}-\d{2}-\d{2}-\d{3}(-A|-B)?$')

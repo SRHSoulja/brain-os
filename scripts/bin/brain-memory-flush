@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
 DAILY_DIR="$BRAIN_DIR/brain/ops/daily"
 SESSION_DIR="$BRAIN_DIR/brain/wiki/sessions"
 DEVLOG_DIR="$BRAIN_DIR/work/logs/devlog"

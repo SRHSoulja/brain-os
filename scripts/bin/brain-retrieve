@@ -8,7 +8,7 @@
 # See: brain/wiki/systems/context_retrieval_and_builder.md
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 TOOLS="$HOME/bin"
 TYPE=""
 KEY=""

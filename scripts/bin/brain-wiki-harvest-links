@@ -7,7 +7,7 @@
 import os, sys, re, json
 from pathlib import Path
 
-BRAIN = Path(os.environ.get("BRAIN_DIR", Path.home() / "gmgn-brain"))
+BRAIN = Path(os.environ.get("BRAIN_DIR", Path(os.environ.get("BRAIN_DIR", str(Path.home() / "brain")))))
 WIKI  = BRAIN / "brain/wiki"
 SCOPED_DIRS = ["tools", "pages", "systems"]
 

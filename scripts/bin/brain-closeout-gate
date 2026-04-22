@@ -3,8 +3,8 @@
 # Usage: brain-closeout-gate [--json]
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
-TOOLS_HOME="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS_HOME="${BRAIN_DIR:-$HOME/brain}/scripts"
 TOOLS_REPO="$TOOLS_HOME"
 
 JSON=false

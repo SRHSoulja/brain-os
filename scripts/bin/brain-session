@@ -5,7 +5,7 @@
 # Launches the specified AI agent. When a session ends (exit or meditate),
 # automatically relaunches with a fresh session. Ctrl+C twice to fully stop.
 
-BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
 AGENT="claude"
 
 while [[ $# -gt 0 ]]; do

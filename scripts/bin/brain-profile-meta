@@ -9,7 +9,7 @@
 # Agent-agnostic: callable by Claude, Codex, Gemini seats via ~/bin symlink.
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 PROFILES="$BRAIN/brain/ops/execution-profiles.json"
 
 PROFILE_ID=""

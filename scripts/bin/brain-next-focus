@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 # Resolve through symlinks so ~/bin wrappers can source libs reliably.
 _SELF_SOURCE="${BASH_SOURCE[0]}"
 while [[ -h "$_SELF_SOURCE" ]]; do
@@ -19,7 +19,7 @@ while [[ -h "$_SELF_SOURCE" ]]; do
 done
 _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
 . "$_SELF_DIR/../lib/brain-paths.sh"
-TOOLS="${_TOOLS:-$HOME/gmgn-brain/scripts}"
+TOOLS="${_TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 JSON_OUTPUT=false
 PERSIST=false
 for arg in "$@"; do
@@ -534,11 +534,10 @@ def verify_readiness(task_id):
                     missing_paths.append(p)
             else:
                 # Bare relative path — try multiple bases in priority order:
-                #   1. ~/gmgn-brain   (brain-repo-local: brain/, work/)
-                #   2. ~/2026Projects (tools namespace: tools/bin/)
-                #   3. ~/             (home-level: codex-lab/, 2026Projects/ itself)
+                #   1. brain dir  (brain-repo-local: brain/, work/)
+                #   2. home dir   (home-level paths)
                 # Pass if ANY base yields an existing parent directory.
-                bases = [brain, os.path.join(home, '2026Projects'), home]
+                bases = [brain, home]
                 found = any(
                     os.path.exists(os.path.dirname(os.path.join(b, p).rstrip('/')) or b)
                     for b in bases

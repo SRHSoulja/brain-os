@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 TOOLS="$BRAIN/scripts"
 . "$TOOLS/lib/brain-paths.sh"
 _require_local

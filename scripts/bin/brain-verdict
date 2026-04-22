@@ -6,8 +6,8 @@
 # If the verdict file doesn't exist or is stale (>1h), runs brain-state-check first.
 # Uses tools/lib/verdict-reader.py for normalized, validated parsing.
 
-BRAIN="$HOME/gmgn-brain"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 . "$TOOLS/lib/brain-paths.sh"
 VERDICT_JSON="$_VERDICT_JSON"
 VERDICT_READER="$_VERDICT_READER"

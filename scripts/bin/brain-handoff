@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-BRAIN_DIR="$HOME/gmgn-brain"
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
 OUTPUT_DIR="$BRAIN_DIR/work/session-handoffs"
 LOCK_FILE="/tmp/brain-handoff.lock"
 NOW=$(date +%Y-%m-%d-%H%M)

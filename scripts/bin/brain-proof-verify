@@ -3,7 +3,7 @@
 # Usage: brain-proof-verify --run RUN_ID [--allowed-surfaces "path1,path2"]
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 RUNS_DIR="$BRAIN/brain/ops/proof-execution/runs"
 INDEX_DIR="$BRAIN/brain/ops/proof-execution/index"
 PROOF_DIR="$BRAIN/brain/ops/proof-execution"

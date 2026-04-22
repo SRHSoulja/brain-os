@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 CODEX_LAB="$HOME/codex-lab"
 HANDOFF_CLI="$CODEX_LAB/tools/codex-claude-handoff"
 VERDICT_DIR="$BRAIN/brain/ops/codex-verdicts"

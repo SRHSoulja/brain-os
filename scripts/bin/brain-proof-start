@@ -3,8 +3,8 @@
 # Usage: brain-proof-start --task TASK-ID --executor <agent-id> [--signer-id <signer-id>]
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 . "$TOOLS/lib/brain-paths.sh"
 PROOF_DIR="$BRAIN/brain/ops/proof-execution"
 RUNS_DIR="$PROOF_DIR/runs"

@@ -3,7 +3,7 @@
 # Usage: brain-core-memory-status [--count-only] [--json]
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 QUEUE_FILE="$BRAIN/brain/ops/core-memory/queue.jsonl"
 COUNT_ONLY=false
 JSON_OUT=false

@@ -24,7 +24,7 @@
 # See: brain/wiki/systems/capability_layer_and_execution_routing.md
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 REGISTRY="$BRAIN/brain/ops/capability-registry.json"
 HEALTH_CACHE="/tmp/brain-capability-health.json"
 HEALTH_TTL=300  # 5 minutes

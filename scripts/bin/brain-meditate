@@ -42,7 +42,7 @@
 
 set -uo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 TOOLS="$HOME/bin"
 POST_SEAL="$BRAIN/scripts/hooks/post-seal"
 
@@ -362,7 +362,7 @@ if [[ -x "$TOOLS/brain-session-digest" ]]; then
         fi
         ;;
       gemini|gemini-cli)
-        # Glob across all Gemini project dirs (gmgn-brain, gemini-lab, etc.)
+        # Glob across all Gemini project dirs (brain, gemini-lab, etc.)
         _LATEST_SESSION=$(ls -t "$HOME"/.gemini/tmp/*/chats/session-*.json 2>/dev/null | head -1 || true)
         if [[ -n "$_LATEST_SESSION" ]]; then
           "$TOOLS/brain-session-digest" --gemini-session "$_LATEST_SESSION" >/dev/null 2>&1 || digest_rc=$?
@@ -444,7 +444,7 @@ else
           finish 4
         fi
         if git push >/dev/null 2>&1; then
-          record_stage "push" "PASS" "gmgn-brain pushed"
+          record_stage "push" "PASS" "brain pushed"
         else
           record_stage "push" "WARN" "push failed (likely auth/network)"
         fi

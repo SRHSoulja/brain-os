@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # brain-handoff-build — canonical wrapper for build_next_handoff.py
-HDIR="${BRAIN_DIR:-$HOME/gmgn-brain}/scripts/lib/handoff-system"
+HDIR="${BRAIN_DIR:-$HOME/brain}/scripts/lib/handoff-system"
 if [[ "build_next_handoff.py" == *.py ]]; then
   exec python3 "$HDIR/build_next_handoff.py" "$@"
 else

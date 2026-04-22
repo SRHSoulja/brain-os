@@ -5,7 +5,7 @@
 #   brain-proof-keygen --agent-id custom.agent@ve --json
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 PROOF_DIR="$BRAIN/brain/ops/proof-execution"
 AGENT_ID=""
 JSON=false

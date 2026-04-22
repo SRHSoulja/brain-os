@@ -11,7 +11,7 @@ if [[ "${1:-}" == "--deep" ]]; then
   DEEP=true
 fi
 
-BRAIN="$HOME/gmgn-brain"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 OPS="$BRAIN/brain/ops/tasks"
 
 echo "=== Codex Bootstrap ==="

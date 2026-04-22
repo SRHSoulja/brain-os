@@ -19,7 +19,7 @@ done
 _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
 TOOLS="$_SELF_DIR"
 TOOLS_LIB="$_SELF_DIR/../lib"
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 AGENT=""
 MODE="interactive"
 SEAT="laptop"

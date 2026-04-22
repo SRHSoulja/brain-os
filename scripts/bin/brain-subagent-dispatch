@@ -11,7 +11,7 @@
 # Supported targets: claude-code, codex, gemini
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 TOOLS="$HOME/bin"
 TARGET=""
 PROFILE=""

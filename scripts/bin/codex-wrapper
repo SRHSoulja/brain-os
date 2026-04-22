@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# codex wrapper: in gmgn-brain, launch with bypass mode + codex seat claim
+# codex wrapper: launch with bypass mode + codex seat claim
 set -euo pipefail
 
 # WSLg clipboard workaround (see memory: reference_wslg_x11_clipboard_broken.md)

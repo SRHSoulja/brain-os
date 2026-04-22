@@ -6,11 +6,11 @@
 #   brain-task complete "name"
 #   brain-task list [--all]
 #
-# Tasks stored as: ~/gmgn-brain/work/tasks/task-name.md
+# Tasks stored as: ~/brain/work/tasks/task-name.md
 
 set -euo pipefail
 
-BRAIN_DIR="$HOME/gmgn-brain"
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
 TASK_DIR="$BRAIN_DIR/work/tasks"
 NOW=$(date '+%Y-%m-%d %H:%M')
 TODAY=$(date +%Y-%m-%d)

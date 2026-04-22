@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
 OPS_DIR="$BRAIN/brain/ops/tasks"
 
 if [[ $# -eq 0 ]]; then

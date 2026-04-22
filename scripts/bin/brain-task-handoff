@@ -21,8 +21,8 @@
 
 set -euo pipefail
 
-BRAIN="$HOME/gmgn-brain"
-TOOLS="$HOME/gmgn-brain/scripts"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 CODEX_LAB="${CODEX_LAB_DIR:-$HOME/codex-lab}"
 HANDOFF_CLI="$HOME/bin/codex-claude-handoff"
 
