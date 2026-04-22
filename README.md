@@ -21,7 +21,7 @@ A bootstrappable multi-agent operating system for Claude Code, Codex, and Gemini
 ### Install
 
 ```bash
-git clone <this-repo> ~/brain
+git clone https://github.com/SRHSoulja/brain-os ~/brain
 cd ~/brain
 bash scripts/bin/brain-bootstrap-new-user
 ```
