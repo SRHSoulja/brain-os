@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# brain-dispatch -- Central Brain enforcement layer
+# Usage:
+#   brain-dispatch <tool> [args...]          # Full dispatch (write path)
+#   brain-dispatch --lifecycle <event> [args...]  # Light dispatch (event only)
+#   brain-dispatch --classify <tool>         # Show routing class
+#
+# Two-tier dispatcher:
+#   Heavy (full pre/post pipeline): all state mutations
+#   Light (event emission only): lifecycle transitions
+#
+# Routing via approval-class.sh:
+#   readonly_low_risk      -> passthrough (no dispatcher overhead)
+#   state_write_controlled -> full pre/post pipeline
+#   exec_or_external       -> pre/post + human approval gate
+#   control_plane_critical -> pre/post + hard human gate
+#
+# Rules:
+#   1. Dispatcher is mandatory for all state mutations
+#   2. Approval-class determines routing
+#   3. Reads are passthrough unless explicitly elevated
+#   4. All lifecycle transitions emit events, even if they bypass full dispatcher
+#
+# See: brain/governance/execution-routing-policy.md
+#      brain/governance/agent-lifecycle-policy.md
+set -euo pipefail
+
+# Resolve through symlinks so ~/bin wrappers can source libs reliably.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+. "$_SELF_DIR/../lib/brain-paths.sh"
+ensure_runtime_surfaces
+TOOLS="${_TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+AGENT="${BRAIN_AGENT:-}"
+if [[ -z "$AGENT" ]]; then
+  _SEAT_FILE="$BRAIN/brain/ops/.brain-active-seat.json"
+  if [[ -f "$_SEAT_FILE" ]]; then
+    AGENT=$(python3 -c "import json; print(json.load(open('$_SEAT_FILE')).get('assistant','unknown'))" 2>/dev/null || echo "unknown")
+  else
+    AGENT="unknown"
+  fi
+fi
+
+# ── Resolve running model (once per invocation; cached for stage logs) ─
+# Agent-agnostic probe. Never fails — returns "unresolved" if no probe hit.
+if [[ -x "$BRAIN/scripts/bin/brain-agent-model-probe" ]]; then
+  MODEL=$("$BRAIN/scripts/bin/brain-agent-model-probe" --field model 2>/dev/null || echo "unresolved")
+else
+  MODEL="unresolved"
+fi
+
+. "$_SELF_DIR/../lib/approval-class.sh"
+
+# ── Explicit write boundary ──────────────────────────────────────
+# These action categories REQUIRE full dispatcher routing.
+# Not implied by approval-class -- stated explicitly.
+# task creation, task mutation, file writes, state changes, external execution
+DISPATCH_REQUIRED_PATTERNS=(
+  "brain-task-admit"
+  "brain-task-claim"
+  "brain-task-execute"
+  "brain-task-complete"
+  "brain-task-release"
+  "brain-task-quick"
+  "brain-checkpoint"
+  "brain-memory-promote-core"
+  "brain-core-memory-capture"
+  "brain-core-memory-resolve"
+  "brain-proof-start"
+  "brain-proof-log"
+  "brain-proof-verify"
+  "brain-seat-claim"
+  "brain-heartbeat"
+  "brain-meditate"
+  "brain-cron-update"
+  "brain-sync"
+  "brain-push"
+  "brain-export"
+  "brain-ve-activate"
+  "brain-ve-deactivate"
+  "brain-blog-deploy"
+  "brain-discord-bridge-reply"
+  "brain-discord-bridge-done"
+  "brain-content-brief"
+  "safe-rm"
+)
+
+# ── Args ─────────────────────────────────────────────────────────
+LIFECYCLE=false
+CLASSIFY=false
+TOOL=""
+TOOL_ARGS=()
+
+case "${1:-}" in
+  --lifecycle)
+    LIFECYCLE=true
+    shift
+    TOOL="${1:-}"
+    shift || true
+    TOOL_ARGS=("$@")
+    ;;
+  --classify)
+    CLASSIFY=true
+    TOOL="${2:-}"
+    ;;
+  --help|-h)
+    echo "Usage:"
+    echo "  brain-dispatch <tool> [args...]              # Full dispatch"
+    echo "  brain-dispatch --lifecycle <event> [args...]  # Light dispatch (event only)"
+    echo "  brain-dispatch --classify <tool>              # Show routing class"
+    exit 0
+    ;;
+  *)
+    TOOL="${1:-}"
+    shift || true
+    TOOL_ARGS=("$@")
+    ;;
+esac
+
+if [[ -z "$TOOL" ]]; then
+  echo "Error: no tool or event specified" >&2
+  exit 1
+fi
+
+TOOL_BASE=$(basename "$TOOL")
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# ── Execution ID + state tracking ────────────────────────────────
+# Deterministic: hash(tool + args + context_key). No time bucket.
+# context_key = task ID > session ID > agent. Prevents cross-context dedupe collisions.
+# Tracks execution state: started | success | failure
+_ARGS_STR=$(printf '%s ' "${TOOL_ARGS[@]}" 2>/dev/null || echo "")
+if [[ -n "${BRAIN_TASK_ID:-}" ]]; then
+  _CONTEXT_KEY="$BRAIN_TASK_ID"
+else
+  _SESSION_FILE="$BRAIN/brain/ops/.active-session.json"
+  _SID=$(python3 -c "import json; print(json.load(open('$_SESSION_FILE')).get('session_id',''))" 2>/dev/null || echo "")
+  _CONTEXT_KEY="${_SID:-$AGENT}"
+fi
+EXEC_ID=$(echo "${TOOL_BASE}|${_ARGS_STR}|${_CONTEXT_KEY}" | md5sum | cut -c1-12)
+_EXEC_STATE="$BRAIN/brain/ops/.dispatch-state.jsonl"
+
+_exec_state_check() {
+  # Returns: "none", "started", "success", "failure"
+  [[ ! -f "$_EXEC_STATE" ]] && echo "none" && return
+  # Find latest entry for this exec_id
+  local last
+  last=$(grep "\"id\":\"${EXEC_ID}\"" "$_EXEC_STATE" 2>/dev/null | tail -1)
+  if [[ -z "$last" ]]; then
+    echo "none"
+  else
+    echo "$last" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('status','none'))" 2>/dev/null || echo "none"
+  fi
+}
+
+_exec_state_write() {
+  local status="$1"
+  echo "{\"id\":\"${EXEC_ID}\",\"tool\":\"${TOOL_BASE}\",\"status\":\"${status}\",\"ts\":\"${TS}\",\"agent\":\"${AGENT}\"}" >> "$_EXEC_STATE"
+  # Keep last 200 entries
+  if [[ -f "$_EXEC_STATE" ]] && [[ $(wc -l < "$_EXEC_STATE") -gt 200 ]]; then
+    tail -200 "$_EXEC_STATE" > "${_EXEC_STATE}.tmp" && mv "${_EXEC_STATE}.tmp" "$_EXEC_STATE"
+  fi
+}
+
+# ── Classify ─────────────────────────────────────────────────────
+if $CLASSIFY; then
+  approval_class_resolve "$TOOL_BASE"
+  _is_dispatch_required=false
+  for _dr in "${DISPATCH_REQUIRED_PATTERNS[@]}"; do
+    [[ "$TOOL_BASE" == "$_dr" ]] && _is_dispatch_required=true && break
+  done
+  echo "tool: $TOOL_BASE"
+  echo "class: $APPROVAL_CLASS"
+  echo "dispatch_required: $_is_dispatch_required"
+  exit 0
+fi
+
+# ── Light dispatch (lifecycle events) ────────────────────────────
+if $LIFECYCLE; then
+  # Emit event, no pre/post enforcement
+  echo "$TS LIFECYCLE $TOOL agent=$AGENT model=$MODEL $(printf '%s ' "${TOOL_ARGS[@]}")" >> "$BRAIN/brain/ops/events.log"
+  python3 -c "
+import json, sys
+from datetime import datetime
+entry = {
+    'ts': '$TS',
+    'type': 'LIFECYCLE',
+    'event': '$TOOL',
+    'agent': '$AGENT',
+    'model': '$MODEL',
+    'args': sys.argv[1:]
+}
+with open('$BRAIN/brain/ops/events.jsonl', 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+" "${TOOL_ARGS[@]}" 2>/dev/null || true
+  echo "[dispatch] lifecycle: $TOOL ($AGENT)"
+  exit 0
+fi
+
+# ── Full dispatch (write path) ───────────────────────────────────
+approval_class_resolve "$TOOL_BASE"
+
+# Find the actual tool binary
+TOOL_PATH=""
+if [[ -x "$TOOLS/bin/$TOOL_BASE" ]]; then
+  TOOL_PATH="$TOOLS/bin/$TOOL_BASE"
+elif command -v "$TOOL_BASE" >/dev/null 2>&1; then
+  TOOL_PATH=$(command -v "$TOOL_BASE")
+else
+  echo "[dispatch] ERROR: tool not found: $TOOL_BASE" >&2
+  exit 1
+fi
+
+# ── PRE-ACTION ───────────────────────────────────────────────────
+_PRE_FAIL=""
+
+# 1. Verdict gate (skip for readonly)
+if [[ "$APPROVAL_CLASS" != "readonly_low_risk" ]]; then
+  VERDICT_FILE="$BRAIN/brain/ops/derived/state-verdict.json"
+  if [[ -f "$VERDICT_FILE" ]]; then
+    VERDICT=$(python3 -c "import json; print(json.load(open('$VERDICT_FILE')).get('status','unknown'))" 2>/dev/null || echo "unknown")
+    case "$VERDICT" in
+      OK|STALE) ;; # proceed (STALE = warn but allow)
+      DRIFT|CONFLICT)
+        _PRE_FAIL="VERDICT_BLOCK: state is $VERDICT. Run brain-state-check."
+        ;;
+    esac
+    [[ "$VERDICT" == "STALE" ]] && echo "[dispatch] WARN: state verdict is STALE"
+  fi
+fi
+
+# 2. BRAIN_TASK_ID enforcement for write-class tools
+# Writes must have task context to prevent cross-task dedupe collisions.
+# Known seated agents (AGENT != unknown) use session-scoped context key — no collision risk.
+# Only warn when agent is truly unresolved, since attribution and dedup are then ambiguous.
+if [[ "$APPROVAL_CLASS" != "readonly_low_risk" && -z "${BRAIN_TASK_ID:-}" && "$AGENT" == "unknown" ]]; then
+  echo "[dispatch] WARN: no BRAIN_TASK_ID and agent unresolved for write-class tool $TOOL_BASE ($APPROVAL_CLASS)"
+  echo "[dispatch] Context key is session-scoped but attribution is missing — set BRAIN_AGENT or run brain-agent-bootstrap"
+fi
+
+# 3. Capability selection verification
+# Classifies task_type from tool name, validates the executing agent/capability
+# is qualified for this task_type per capability_layer_and_execution_routing.md §2.
+# This is verification only -- it does not change selection behavior.
+_TASK_TYPE="execution"  # default
+_CAPABILITY_TIER="remote_agent"  # default: assume seated agent
+_SELECTION_VIOLATIONS=""
+
+# Classify task_type from tool name patterns
+case "$TOOL_BASE" in
+  brain-retrieve|brain-wiki|brain-search|brain-context)
+    _TASK_TYPE="retrieval" ;;
+  brain-assess|brain-signal-admit|brain-spotcheck|brain-clip-drift)
+    _TASK_TYPE="classification" ;;
+  brain-session-digest|brain-memory-compile|brain-content-brief)
+    _TASK_TYPE="summarization" ;;
+  brain-memory-flush|brain-extract|brain-ingest-*)
+    _TASK_TYPE="preprocessing" ;;
+  brain-discord-bridge-*|mcp__discord*|mcp__plugin_discord*)
+    _TASK_TYPE="discord" ;;
+  brain-task-admit|brain-task-quick)
+    _TASK_TYPE="task_generation" ;;
+  brain-next-focus|brain-handoff)
+    _TASK_TYPE="planning" ;;
+  *)
+    _TASK_TYPE="execution" ;;
+esac
+
+# Derive execution role from task_type (§2b of capability_layer_and_execution_routing.md)
+# Roles are classification only -- they do not change capability filtering.
+case "$_TASK_TYPE" in
+  architecture|planning|task_generation) _EXEC_ROLE="architect" ;;
+  execution)                            _EXEC_ROLE="worker" ;;
+  retrieval)                            _EXEC_ROLE="auditor" ;;
+  classification|summarization|preprocessing) _EXEC_ROLE="processor" ;;
+  *)                                    _EXEC_ROLE="worker" ;;
+esac
+
+# Determine capability tier of the executing agent.
+# Reads brain/config/agents.md if present; falls back to hardcoded mapping.
+_AGENT_TYPE="cli"
+_AGENT_GUARD_ENV=""
+# Local bound config takes precedence over product scaffolding
+_AGENTS_CFG="$BRAIN/brain/config/agents.md"
+[[ -f "$BRAIN/brain/config/local/agents.md" ]] && _AGENTS_CFG="$BRAIN/brain/config/local/agents.md"
+
+if [[ -f "$_AGENTS_CFG" ]]; then
+  _BINDING=$(python3 - "$AGENT" "$_AGENTS_CFG" <<'PYEOF' 2>/dev/null
+import re, sys
+agent_id, cfg = sys.argv[1], sys.argv[2]
+with open(cfg) as f:
+    txt = f.read()
+m = re.search(r'  - id: ' + re.escape(agent_id) + r'\n((?:    [^\n]+\n)*)', txt)
+if not m:
+    raise SystemExit(1)
+blk = m.group(0)
+def g(k, d=''):
+    x = re.search(r'    ' + k + r': *(.+)', blk)
+    return x.group(1).strip() if x else d
+print('_CFG_AVAILABLE=' + g('available', 'true'))
+print('_CFG_TYPE='      + g('type',      'cli'))
+print('_CFG_AUTHORITY=' + g('authority', 'operator'))
+print('_CFG_GUARD='     + g('guard_env', ''))
+PYEOF
+  )
+  if [[ -n "$_BINDING" ]]; then
+    _CFG_AVAILABLE=$(echo "$_BINDING" | grep '^_CFG_AVAILABLE=' | cut -d= -f2)
+    _AGENT_TYPE=$(    echo "$_BINDING" | grep '^_CFG_TYPE='      | cut -d= -f2)
+    _CFG_AUTHORITY=$( echo "$_BINDING" | grep '^_CFG_AUTHORITY=' | cut -d= -f2)
+    _AGENT_GUARD_ENV=$(echo "$_BINDING" | grep '^_CFG_GUARD='    | cut -d= -f2)
+    # Availability check
+    [[ "${_CFG_AVAILABLE:-true}" == "false" ]] && \
+      echo "[dispatch] WARN: agent '$AGENT' is marked unavailable in brain/config/agents.md" >&2
+    # Re-entry check: wrapper agents only
+    if [[ "$_AGENT_TYPE" == "wrapper" && -n "$_AGENT_GUARD_ENV" ]]; then
+      [[ -n "${!_AGENT_GUARD_ENV:-}" ]] && \
+        echo "[dispatch] WARN: re-entry detected — $AGENT is a wrapper and $_AGENT_GUARD_ENV is already set" >&2
+    fi
+    # Map authority → capability tier
+    case "${_CFG_AUTHORITY:-operator}" in
+      sovereign|operator) _CAPABILITY_TIER="remote_strong" ;;
+      advisory)           _CAPABILITY_TIER="remote_agent"  ;;
+      local)              _CAPABILITY_TIER="local_llm"     ;;
+      *)                  _CAPABILITY_TIER="remote_agent"  ;;
+    esac
+  else
+    # Agent not in config — legacy fallback (no warning to avoid noise)
+    case "$AGENT" in
+      claude-code|codex|gemini) _CAPABILITY_TIER="remote_strong" ;;
+      ollama*)                  _CAPABILITY_TIER="local_llm"     ;;
+      *)                        _CAPABILITY_TIER="remote_agent"  ;;
+    esac
+  fi
+else
+  # No config file — original behavior preserved
+  case "$AGENT" in
+    claude-code|codex|gemini) _CAPABILITY_TIER="remote_strong" ;;
+    ollama*)                  _CAPABILITY_TIER="local_llm"     ;;
+    *)                        _CAPABILITY_TIER="remote_agent"  ;;
+  esac
+fi
+
+# Validate: task_type allows this capability tier
+case "$_TASK_TYPE" in
+  retrieval)
+    # Only deterministic allowed; any agent executing retrieval tools is fine
+    # (the tools themselves are deterministic; the agent is just invoking them)
+    ;;
+  classification|preprocessing)
+    # deterministic, local_llm OK; remote_strong is wasteful but not a violation
+    if [[ "$_CAPABILITY_TIER" == "remote_strong" ]]; then
+      echo "[dispatch] OPTIMIZATION: $TOOL_BASE (task_type=$_TASK_TYPE) using remote_strong; local_llm would suffice"
+    fi
+    ;;
+  summarization)
+    # all tiers allowed
+    ;;
+  planning|architecture|task_generation)
+    # remote_strong only
+    if [[ "$_CAPABILITY_TIER" == "local_llm" ]]; then
+      _SELECTION_VIOLATIONS="VIOLATION: $TOOL_BASE (task_type=$_TASK_TYPE) requires remote_strong but capability=$_CAPABILITY_TIER"
+      echo "[dispatch] $_SELECTION_VIOLATIONS" >&2
+    fi
+    ;;
+  execution)
+    # deterministic or remote_agent; local_llm cannot mutate state
+    if [[ "$_CAPABILITY_TIER" == "local_llm" ]]; then
+      _SELECTION_VIOLATIONS="VIOLATION: $TOOL_BASE (task_type=$_TASK_TYPE) cannot use local_llm (advisory-only)"
+      echo "[dispatch] $_SELECTION_VIOLATIONS" >&2
+    fi
+    ;;
+esac
+
+# 4. Discord routing: redirect non-Claude agents to bridge
+# Claude Code has native Discord (plugin + admin MCP). All others use bridge queue.
+if [[ "$_TASK_TYPE" == "discord" && "$AGENT" != "claude-code" ]]; then
+  echo "[dispatch] Discord routing: $AGENT lacks native Discord access."
+  echo "[dispatch] Redirecting to bridge: brain-discord-bridge-enqueue"
+  # Convert the Discord action to a bridge enqueue
+  _BRIDGE_CMD="$TOOL_BASE ${TOOL_ARGS[*]:-}"
+  _bridge_bin="$_SELF_DIR/brain-discord-bridge-enqueue"
+  [[ ! -x "$_bridge_bin" ]] && _bridge_bin="$(command -v brain-discord-bridge-enqueue 2>/dev/null || true)"
+  [[ -x "${_bridge_bin:-}" ]] && "$_bridge_bin" --command "$_BRIDGE_CMD" --user "$AGENT" --source "dispatch-redirect" 2>&1
+  echo "$TS DISPATCH_DISCORD_BRIDGE tool=$TOOL_BASE agent=$AGENT bridge=enqueued" >> "$BRAIN/brain/ops/events.log"
+  echo "[dispatch] Queued for next Claude Code session to deliver."
+  exit 0
+fi
+
+# 5. Log pre-action event (with capability verification + role)
+echo "$TS DISPATCH_PRE $TOOL_BASE class=$APPROVAL_CLASS agent=$AGENT task=${BRAIN_TASK_ID:-none} task_type=$_TASK_TYPE role=$_EXEC_ROLE capability=$_CAPABILITY_TIER" >> "$BRAIN/brain/ops/events.log"
+
+# 3. Block on pre-action failure
+if [[ -n "$_PRE_FAIL" ]]; then
+  echo "[dispatch] BLOCKED: $_PRE_FAIL" >&2
+  echo "$TS DISPATCH_BLOCKED $TOOL_BASE reason=$_PRE_FAIL agent=$AGENT" >> "$BRAIN/brain/ops/events.log"
+  exit 1
+fi
+
+# ── EXECUTION STATE CHECK ────────────────────────────────────────
+_PRIOR_STATE=$(_exec_state_check)
+case "$_PRIOR_STATE" in
+  success)
+    echo "[dispatch] DEDUPE: $TOOL_BASE already succeeded (id=$EXEC_ID). Skipping."
+    echo "$TS DISPATCH_DEDUPE $TOOL_BASE exec_id=$EXEC_ID agent=$AGENT" >> "$BRAIN/brain/ops/events.log"
+    exit 0
+    ;;
+  started)
+    echo "[dispatch] WARN: $TOOL_BASE was started but never resolved (id=$EXEC_ID). Possible crash recovery."
+    echo "[dispatch] Allowing re-execution."
+    ;;
+  failure)
+    echo "[dispatch] Prior execution failed (id=$EXEC_ID). Allowing retry."
+    ;;
+esac
+
+# ── EXECUTE ──────────────────────────────────────────────────────
+_exec_state_write "started"
+echo "[dispatch] $TOOL_BASE ($APPROVAL_CLASS) -> executing [id=$EXEC_ID]"
+
+# Capture exit code without triggering set -e
+# BRAIN_DISPATCH_ACTIVE=1 prevents self-dispatch re-entry in wired tools.
+set +e
+BRAIN_DISPATCH_ACTIVE=1 "$TOOL_PATH" "${TOOL_ARGS[@]}"
+_EXIT_CODE=$?
+set -e
+
+# Record final state (always runs -- set +e above protects this)
+if [[ $_EXIT_CODE -eq 0 ]]; then
+  _exec_state_write "success"
+else
+  _exec_state_write "failure"
+fi
+
+# ── POST-ACTION ──────────────────────────────────────────────────
+# Log completion
+echo "$TS DISPATCH_POST $TOOL_BASE exit=$_EXIT_CODE agent=$AGENT" >> "$BRAIN/brain/ops/events.log"
+
+# Post-action: event logging to jsonl (includes capability verification)
+python3 -c "
+import json
+entry = {
+    'ts': '$TS',
+    'type': 'DISPATCH',
+    'tool': '$TOOL_BASE',
+    'class': '$APPROVAL_CLASS',
+    'agent': '$AGENT',
+    'model': '$MODEL',
+    'exit_code': $_EXIT_CODE,
+    'task_type': '$_TASK_TYPE',
+    'exec_role': '$_EXEC_ROLE',
+    'capability_tier': '$_CAPABILITY_TIER',
+    'violation': '$_SELECTION_VIOLATIONS' if '$_SELECTION_VIOLATIONS' else None
+}
+# Strip None values
+entry = {k: v for k, v in entry.items() if v is not None}
+with open('$BRAIN/brain/ops/events.jsonl', 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+" 2>/dev/null || true
+
+exit $_EXIT_CODE
