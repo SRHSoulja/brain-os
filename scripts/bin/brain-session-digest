@@ -1,0 +1,826 @@
+#!/bin/bash
+# brain-session-digest — Export session conversations to searchable markdown
+# Multi-agent aware: detects source agent from seat state and supports
+# Claude JSONL, Codex run logs, and Gemini session JSON.
+#
+# Usage:
+#   brain-session-digest                   Digest the current/latest session
+#   brain-session-digest --all             Digest all unprocessed sessions
+#   brain-session-digest --id UUID         Digest a specific session
+#   brain-session-digest --recent N        Digest last N sessions
+#   brain-session-digest --agent <name>    Force agent type (claude-code|codex|gemini)
+#   brain-session-digest --codex-rollout F  Digest a native Codex rollout-*.jsonl (canonical)
+#   brain-session-digest --codex-run ID    Digest a legacy sidecar-lane Codex run (deprecated)
+#   brain-session-digest --gemini-session F Digest a specific Gemini session JSON file
+#   brain-session-digest --dry-run         Show what would be processed
+#
+# Output: brain/wiki/sessions/YYYY-MM-DD-HHMM-digest.md
+
+set -euo pipefail
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
+export BRAIN_DIR
+# Claude Code derives the project key by replacing '/' with '-' in the
+# absolute BRAIN_DIR path (leading '/' becomes leading '-').
+SESSION_DIR="$HOME/.claude/projects/$(echo "$BRAIN_DIR" | tr '/' '-')"
+# Legacy Codex sidecar runs (deprecated; native rollouts are preferred).
+CODEX_RUNS_DIR="${CODEX_RUNS_DIR:-$HOME/.codex/runs}"
+# Gemini sessions live under ~/.gemini/tmp/<project>/chats/session-*.jsonl.
+# Callers pass an explicit file via --gemini-session.
+WIKI_DIR="$BRAIN_DIR/brain/wiki/sessions"
+PROCESSED_FILE="$WIKI_DIR/.processed-sessions"
+SEAT_FILE="$BRAIN_DIR/brain/ops/.brain-active-seat.json"
+LOG_FILE="$BRAIN_DIR/work/logs/brain-session-digest.log"
+
+mkdir -p "$WIKI_DIR" "$(dirname "$LOG_FILE")"
+touch "$PROCESSED_FILE"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+MODE="latest"
+TARGET_ID=""
+RECENT_N=1
+DRY_RUN=false
+FORCE_AGENT=""
+CODEX_RUN=""
+CODEX_ROLLOUT=""
+GEMINI_SESSION=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all) MODE="all"; shift ;;
+    --id) MODE="id"; TARGET_ID="$2"; shift 2 ;;
+    --recent) MODE="recent"; RECENT_N="$2"; shift 2 ;;
+    --agent) FORCE_AGENT="$2"; shift 2 ;;
+    --codex-run) MODE="codex-run"; CODEX_RUN="$2"; shift 2 ;;        # legacy sidecar format
+    --codex-rollout) MODE="codex-rollout"; CODEX_ROLLOUT="$2"; shift 2 ;;  # native rollout-*.jsonl
+    --gemini-session) MODE="gemini-session"; GEMINI_SESSION="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Detect source agent from seat state or force flag
+detect_agent() {
+  if [[ -n "$FORCE_AGENT" ]]; then
+    echo "$FORCE_AGENT"
+    return
+  fi
+  if [[ -f "$SEAT_FILE" ]]; then
+    local agent
+    agent=$(python3 -c "import json; print(json.load(open('$SEAT_FILE')).get('assistant','unknown'))" 2>/dev/null)
+    if [[ -n "$agent" && "$agent" != "unknown" ]]; then
+      echo "$agent"
+      return
+    fi
+  fi
+  echo "claude-code"  # default fallback
+}
+
+# Get session files to process (Claude mode)
+get_sessions() {
+  local all_sessions
+  all_sessions=$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null || true)
+  [[ -z "$all_sessions" ]] && return
+
+  case "$MODE" in
+    latest)
+      echo "$all_sessions" | head -1
+      ;;
+    all)
+      echo "$all_sessions" | while read -r f; do
+        local base=$(basename "$f" .jsonl)
+        grep -qF "$base" "$PROCESSED_FILE" || echo "$f"
+      done
+      ;;
+    id)
+      echo "$SESSION_DIR/${TARGET_ID}.jsonl"
+      ;;
+    recent)
+      echo "$all_sessions" | head -"$RECENT_N"
+      ;;
+  esac
+}
+
+digest_session() {
+  local jsonl_file="$1"
+  local session_id=$(basename "$jsonl_file" .jsonl)
+  local mod_date=$(date -r "$jsonl_file" '+%Y-%m-%d' 2>/dev/null || stat -c '%Y' "$jsonl_file" | xargs -I{} date -d @{} '+%Y-%m-%d')
+  local mod_time=$(date -r "$jsonl_file" '+%H%M' 2>/dev/null || echo "0000")
+  local output_file="$WIKI_DIR/${mod_date}-${mod_time}-${session_id:0:8}.md"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local size=$(du -h "$jsonl_file" | cut -f1)
+    local lines=$(wc -l < "$jsonl_file")
+    echo "Would digest: $session_id ($size, $lines lines) -> $(basename "$output_file")"
+    return
+  fi
+
+  log "Digesting session $session_id"
+
+  local source_agent
+  source_agent=$(detect_agent)
+
+  # Extract using Python for robust JSON parsing
+  python3 - "$jsonl_file" "$output_file" "$session_id" "$mod_date" "$source_agent" << 'PYEOF'
+import json, os, sys, re
+from datetime import datetime
+
+jsonl_file = sys.argv[1]
+output_file = sys.argv[2]
+session_id = sys.argv[3]
+mod_date = sys.argv[4]
+source_agent = sys.argv[5]
+
+messages = []
+tools_used = set()
+files_edited = set()
+files_read = set()
+commits = []
+discord_msgs = []
+decisions = []
+errors = []
+
+with open(jsonl_file, 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg_type = entry.get('type', '')
+
+        # User messages
+        if msg_type == 'user':
+            msg = entry.get('message', {})
+            content = msg.get('content', '')
+            if isinstance(content, str) and content.strip():
+                # Check for Discord messages
+                if '<channel source="plugin:discord:discord"' in content:
+                    discord_msgs.append(content)
+                else:
+                    # Truncate very long messages
+                    preview = content[:500] + ('...' if len(content) > 500 else '')
+                    messages.append(('user', preview))
+
+        # Assistant messages
+        elif msg_type == 'assistant':
+            msg = entry.get('message', {})
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get('type') == 'text':
+                            text = block.get('text', '')
+                            if text.strip():
+                                preview = text[:500] + ('...' if len(text) > 500 else '')
+                                messages.append(('assistant', preview))
+                        elif block.get('type') == 'tool_use':
+                            tool = block.get('name', 'unknown')
+                            tools_used.add(tool)
+                            inp = block.get('input', {})
+                            # Track file operations
+                            if tool in ('Read', 'read'):
+                                fp = inp.get('file_path', '')
+                                if fp:
+                                    files_read.add(fp)
+                            elif tool in ('Edit', 'Write', 'edit', 'write'):
+                                fp = inp.get('file_path', '')
+                                if fp:
+                                    files_edited.add(fp)
+                            elif tool == 'Bash':
+                                cmd = inp.get('command', '')
+                                if cmd.startswith('git commit'):
+                                    commits.append(cmd[:200])
+            elif isinstance(content, str) and content.strip():
+                preview = content[:500] + ('...' if len(content) > 500 else '')
+                messages.append(('assistant', preview))
+
+        # Tool results with errors
+        elif msg_type == 'tool_result':
+            content = entry.get('content', '')
+            if isinstance(content, str) and ('error' in content.lower() or 'Error' in content):
+                errors.append(content[:300])
+
+# Build the digest
+out = []
+out.append('---')
+out.append(f'title: "Session Digest - {mod_date}"')
+out.append(f'type: "session-digest"')
+out.append(f'source_agent: "{source_agent}"')
+out.append(f'session_id: "{session_id}"')
+out.append(f'date: "{mod_date}"')
+out.append(f'tools_used: {len(tools_used)}')
+out.append(f'files_edited: {len(files_edited)}')
+out.append(f'messages: {len(messages)}')
+out.append('---')
+out.append('')
+out.append(f'# Session Digest - {mod_date}')
+out.append('')
+out.append(f'**Agent:** {source_agent}')
+out.append(f'**Session:** `{session_id[:12]}...`')
+out.append(f'**Date:** {mod_date}')
+out.append(f'**Messages:** {len(messages)} exchanges')
+out.append(f'**Tools:** {len(tools_used)} unique tools used')
+out.append('')
+
+# Conversation flow - key exchanges
+out.append('## Conversation Flow')
+out.append('')
+for role, content in messages:
+    # Clean up system reminders and noise
+    if '<system-reminder>' in content:
+        continue
+    prefix = '**Human:**' if role == 'user' else '**Assistant:**'
+    # Further clean the content
+    clean = re.sub(r'<[^>]+>', '', content).strip()
+    if clean and len(clean) > 10:
+        out.append(f'{prefix} {clean}')
+        out.append('')
+
+# Discord messages
+if discord_msgs:
+    out.append('## Discord Messages (Received)')
+    out.append('')
+    for dm in discord_msgs:
+        # Extract user and content
+        user_match = re.search(r'user="([^"]+)"', dm)
+        ts_match = re.search(r'ts="([^"]+)"', dm)
+        content_match = re.search(r'>(.*?)</channel>', dm, re.DOTALL)
+        user = user_match.group(1) if user_match else 'unknown'
+        ts = ts_match.group(1) if ts_match else ''
+        content = content_match.group(1).strip() if content_match else dm
+        out.append(f'- **{user}** ({ts}): {content}')
+    out.append('')
+
+# Files touched
+if files_edited:
+    out.append('## Files Modified')
+    out.append('')
+    for f in sorted(files_edited):
+        # Make paths relative to brain
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    out.append('')
+
+if files_read:
+    out.append('## Files Read')
+    out.append('')
+    for f in sorted(list(files_read)[:30]):  # Cap at 30
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    if len(files_read) > 30:
+        out.append(f'- ... and {len(files_read) - 30} more')
+    out.append('')
+
+# Tools
+if tools_used:
+    out.append('## Tools Used')
+    out.append('')
+    out.append(', '.join(sorted(tools_used)))
+    out.append('')
+
+# Commits
+if commits:
+    out.append('## Git Commits')
+    out.append('')
+    for c in commits:
+        out.append(f'```\n{c}\n```')
+    out.append('')
+
+# Errors
+if errors:
+    out.append('## Errors Encountered')
+    out.append('')
+    for e in errors[:10]:
+        out.append(f'- {e[:200]}')
+    out.append('')
+
+with open(output_file, 'w') as f:
+    f.write('\n'.join(out))
+
+print(f"Digest: {len(messages)} messages, {len(tools_used)} tools, {len(files_edited)} edits -> {output_file}")
+PYEOF
+
+  # Mark as processed
+  echo "$session_id" >> "$PROCESSED_FILE"
+  log "Digested -> $output_file"
+}
+
+# ── Codex run digest ─────────────────────────────────────────────────
+
+digest_codex_run() {
+  local run_dir="$1"
+  local run_id=$(basename "$run_dir")
+  local stderr_log="$run_dir/stderr.log"
+  local stdout_log="$run_dir/stdout.log"
+
+  if [[ ! -f "$stderr_log" ]]; then
+    log "SKIP codex run $run_id: no stderr.log"
+    return
+  fi
+
+  local mod_date=$(date -r "$stderr_log" '+%Y-%m-%d' 2>/dev/null || stat -c '%Y' "$stderr_log" | xargs -I{} date -d @{} '+%Y-%m-%d')
+  local mod_time=$(date -r "$stderr_log" '+%H%M' 2>/dev/null || echo "0000")
+  local output_file="$WIKI_DIR/${mod_date}-${mod_time}-${run_id}.md"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local size=$(du -h "$stderr_log" | cut -f1)
+    echo "Would digest codex run: $run_id ($size) -> $(basename "$output_file")"
+    return
+  fi
+
+  log "Digesting codex run $run_id"
+
+  python3 - "$stderr_log" "$stdout_log" "$output_file" "$run_id" "$mod_date" << 'CODEX_PYEOF'
+import os, sys, re
+
+stderr_file = sys.argv[1]
+stdout_file = sys.argv[2]
+output_file = sys.argv[3]
+run_id = sys.argv[4]
+mod_date = sys.argv[5]
+
+stderr_text = open(stderr_file, 'r', errors='replace').read()
+try:
+    stdout_text = open(stdout_file, 'r', errors='replace').read()
+except FileNotFoundError:
+    stdout_text = ""
+
+# Parse model/sandbox from header
+model = "unknown"
+m = re.search(r'model:\s*(\S+)', stderr_text[:500])
+if m:
+    model = m.group(1)
+
+# Count exec blocks (tool calls)
+exec_count = len(re.findall(r'^exec$', stderr_text, re.MULTILINE))
+
+# Extract files read/written from exec commands
+files_read = set()
+files_written = set()
+for m in re.finditer(r'exec\n/bin/bash -lc "(.*?)"', stderr_text):
+    cmd = m.group(1)
+    if 'cat ' in cmd or 'head ' in cmd or 'sed -n' in cmd:
+        paths = re.findall(r'(/home/\S+\.(?:md|json|py|sh|txt))', cmd)
+        files_read.update(paths)
+    if '>' in cmd or 'tee ' in cmd or 'write' in cmd.lower():
+        paths = re.findall(r'(/home/\S+\.(?:md|json|py|sh|txt))', cmd)
+        files_written.update(paths)
+
+# Extract codex reasoning/messages
+codex_messages = []
+for m in re.finditer(r'^codex\n(.*?)(?=\n(?:user|exec|codex)\n|\Z)', stderr_text, re.DOTALL):
+    text = m.group(1).strip()
+    if text and len(text) > 10:
+        codex_messages.append(text[:500])
+
+user_messages = []
+for m in re.finditer(r'^user\n(.*?)(?=\n(?:user|exec|codex)\n|\Z)', stderr_text, re.DOTALL):
+    text = m.group(1).strip()
+    if text and len(text) > 10:
+        user_messages.append(text[:500])
+
+out = []
+out.append('---')
+out.append(f'title: "Session Digest - {mod_date} ({run_id})"')
+out.append('type: "session-digest"')
+out.append('source_agent: "codex"')
+out.append(f'session_id: "{run_id}"')
+out.append(f'date: "{mod_date}"')
+out.append(f'model: "{model}"')
+out.append(f'tools_used: {exec_count}')
+out.append(f'files_edited: {len(files_written)}')
+out.append(f'messages: {len(codex_messages) + len(user_messages)}')
+out.append('---')
+out.append('')
+out.append(f'# Session Digest - {mod_date} ({run_id})')
+out.append('')
+out.append(f'**Agent:** codex')
+out.append(f'**Run:** `{run_id}`')
+out.append(f'**Date:** {mod_date}')
+out.append(f'**Model:** {model}')
+out.append(f'**Exec calls:** {exec_count}')
+out.append('')
+
+if stdout_text.strip():
+    out.append('## Summary (stdout)')
+    out.append('')
+    out.append(stdout_text.strip()[:1000])
+    out.append('')
+
+out.append('## Conversation Flow')
+out.append('')
+for msg in user_messages[:20]:
+    out.append(f'**User:** {msg}')
+    out.append('')
+for msg in codex_messages[:20]:
+    out.append(f'**Codex:** {msg}')
+    out.append('')
+
+if files_written:
+    out.append('## Files Modified')
+    out.append('')
+    for f in sorted(files_written):
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    out.append('')
+
+if files_read:
+    out.append('## Files Read')
+    out.append('')
+    for f in sorted(list(files_read)[:30]):
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    out.append('')
+
+with open(output_file, 'w') as f:
+    f.write('\n'.join(out))
+
+print(f"Codex digest: {run_id}, {exec_count} execs, {len(files_written)} writes -> {output_file}")
+CODEX_PYEOF
+
+  echo "$run_id" >> "$PROCESSED_FILE"
+  log "Digested codex run -> $output_file"
+}
+
+# ── Codex native rollout digest (rollout-*.jsonl) ────────────────────
+# Canonical native Codex CLI session format. Replaces the deprecated
+# deprecated ~/.codex/runs/CODEX-* sidecar format.
+digest_codex_rollout() {
+  local rollout_file="$1"
+  [[ ! -f "$rollout_file" ]] && { log "rollout not found: $rollout_file"; return 1; }
+
+  local basename_f
+  basename_f=$(basename "$rollout_file" .jsonl)
+  local mod_date
+  mod_date=$(date -r "$rollout_file" '+%Y-%m-%d' 2>/dev/null || echo "unknown")
+  local mod_time
+  mod_time=$(date -r "$rollout_file" '+%H%M' 2>/dev/null || echo "0000")
+  # Trim rollout-YYYY-MM-DDTHH-MM-SS- prefix to leave the session UUID
+  local session_slug
+  session_slug=$(echo "$basename_f" | sed -E 's/^rollout-[0-9T-]+//' | cut -c1-20)
+  local output_file="$WIKI_DIR/${mod_date}-${mod_time}-codex-${session_slug}.md"
+
+  if grep -qF "rollout:$basename_f" "$PROCESSED_FILE" 2>/dev/null; then
+    log "Already processed: rollout:$basename_f"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local size
+    size=$(du -h "$rollout_file" | cut -f1)
+    echo "Would digest codex rollout: $basename_f ($size) -> $(basename "$output_file")"
+    return
+  fi
+
+  log "Digesting codex rollout $basename_f"
+
+  python3 - "$rollout_file" "$output_file" "$mod_date" <<'ROLLOUT_PYEOF'
+import json, sys, re
+rollout_path, output_file, mod_date = sys.argv[1], sys.argv[2], sys.argv[3]
+
+session_id = ""
+model = "unknown"
+cwd = ""
+cli_version = ""
+user_msgs, assistant_msgs = [], []
+tool_calls = 0
+files_written, files_read = set(), set()
+
+def _extract_texts(content):
+    if not isinstance(content, list):
+        return []
+    out = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        t = c.get("text") or c.get("output_text") or c.get("input_text")
+        if t:
+            out.append(t)
+    return out
+
+def _scan_paths(cmd_or_args):
+    """Pull file paths out of a command string or arguments blob (best-effort)."""
+    if not cmd_or_args:
+        return set()
+    paths = set()
+    for m in re.finditer(r'(?<![\w/.])(?:/[A-Za-z0-9._-]+){2,}|\b[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+\.(?:md|py|sh|json|jsonl|yaml|yml|toml|js|ts|tsx|html|css|txt)\b', str(cmd_or_args)):
+        paths.add(m.group(0))
+    return paths
+
+with open(rollout_path) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        mtype = msg.get("type")
+        payload = msg.get("payload", {}) or {}
+        if mtype == "session_meta":
+            session_id = payload.get("id", "")
+            model = payload.get("model") or model
+            cwd = payload.get("cwd", "")
+            cli_version = payload.get("cli_version", "")
+        elif mtype == "turn_context":
+            m = payload.get("model")
+            if m and model in ("unknown", ""):
+                model = m
+        elif mtype == "response_item":
+            ptype = payload.get("type")
+            if ptype == "message":
+                role = payload.get("role")
+                texts = _extract_texts(payload.get("content"))
+                blob = "\n".join(texts).strip()
+                if not blob:
+                    continue
+                if role == "user":
+                    user_msgs.append(blob)
+                elif role == "assistant":
+                    assistant_msgs.append(blob)
+            elif ptype in ("function_call", "custom_tool_call"):
+                tool_calls += 1
+                args = payload.get("arguments", "") or ""
+                try:
+                    pa = json.loads(args)
+                    for v in pa.values() if isinstance(pa, dict) else []:
+                        for p in _scan_paths(v):
+                            # crude: writes often contain "Write" or "Edit" in tool name
+                            name = payload.get("name", "")
+                            if re.search(r'write|edit|create|apply', name, re.I):
+                                files_written.add(p)
+                            else:
+                                files_read.add(p)
+                except Exception:
+                    for p in _scan_paths(args):
+                        files_read.add(p)
+
+# Trim noise from user_msgs: drop giant developer-instruction / AGENTS.md pastes that appear at session start
+user_msgs = [u for u in user_msgs if not (len(u) > 1500 and ("AGENTS.md instructions" in u or "<permissions instructions>" in u))]
+
+# Frontmatter + body
+out = []
+out.append("---")
+out.append(f'title: "Session Digest - {mod_date} (codex-rollout)"')
+out.append('type: "session-digest"')
+out.append('category: "sessions"')
+out.append('source_agent: "codex"')
+out.append(f'session_id: "{session_id}"')
+out.append(f'model: "{model}"')
+out.append(f'cwd: "{cwd}"')
+out.append(f'cli_version: "{cli_version}"')
+out.append(f'mod_date: "{mod_date}"')
+out.append(f'tool_calls: {tool_calls}')
+out.append(f'files_written: {len(files_written)}')
+out.append(f'files_read: {len(files_read)}')
+out.append(f'messages: {len(user_msgs) + len(assistant_msgs)}')
+out.append("---")
+out.append("")
+out.append(f"# Session Digest - {mod_date} (codex)")
+out.append("")
+out.append(f"**Agent:** codex")
+out.append(f"**Session:** `{session_id}`")
+out.append(f"**Model:** {model}")
+out.append(f"**Tool calls:** {tool_calls}")
+out.append("")
+
+out.append("## Conversation Flow")
+out.append("")
+# Interleave: show user prompts first, then assistant summaries; cap to readable amounts
+for u in user_msgs[:15]:
+    snippet = u.strip().split("\n")[0][:400]
+    out.append(f"**User:** {snippet}")
+    out.append("")
+for a in assistant_msgs[:15]:
+    snippet = a.strip()[:400]
+    out.append(f"**Codex:** {snippet}")
+    out.append("")
+
+if files_written:
+    out.append("## Files Written")
+    out.append("")
+    for f in sorted(files_written)[:30]:
+        out.append(f"- `{f}`")
+    out.append("")
+
+if files_read:
+    out.append("## Files Read")
+    out.append("")
+    for f in sorted(files_read)[:30]:
+        out.append(f"- `{f}`")
+    out.append("")
+
+with open(output_file, "w") as fh:
+    fh.write("\n".join(out))
+
+print(f"Codex rollout digest: session={session_id[:12]}, tools={tool_calls}, writes={len(files_written)} -> {output_file}")
+ROLLOUT_PYEOF
+
+  echo "rollout:$basename_f" >> "$PROCESSED_FILE"
+  log "Digested codex rollout -> $output_file"
+}
+
+# ── Gemini session digest ────────────────────────────────────────────
+
+digest_gemini_session() {
+  local json_file="$1"
+  local basename_f=$(basename "$json_file" .json)
+
+  local mod_date=$(date -r "$json_file" '+%Y-%m-%d' 2>/dev/null || stat -c '%Y' "$json_file" | xargs -I{} date -d @{} '+%Y-%m-%d')
+  local mod_time=$(date -r "$json_file" '+%H%M' 2>/dev/null || echo "0000")
+  local session_slug=${basename_f:0:20}
+  local output_file="$WIKI_DIR/${mod_date}-${mod_time}-gemini-${session_slug}.md"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local size=$(du -h "$json_file" | cut -f1)
+    echo "Would digest gemini session: $basename_f ($size) -> $(basename "$output_file")"
+    return
+  fi
+
+  log "Digesting gemini session $basename_f"
+
+  python3 - "$json_file" "$output_file" "$mod_date" << 'GEMINI_PYEOF'
+import json, os, sys, re
+
+json_file = sys.argv[1]
+output_file = sys.argv[2]
+mod_date = sys.argv[3]
+
+with open(json_file, 'r') as f:
+    data = json.load(f)
+
+session_id = data.get('sessionId', 'unknown')
+start_time = data.get('startTime', '')
+messages_raw = data.get('messages', [])
+
+user_msgs = []
+model_msgs = []
+tools_used = set()
+files_edited = set()
+files_read = set()
+
+for msg in messages_raw:
+    msg_type = msg.get('type', '')
+    content = msg.get('content', [])
+
+    text_parts = []
+    for block in (content if isinstance(content, list) else []):
+        if isinstance(block, dict):
+            if block.get('type') == 'text' or 'text' in block:
+                text_parts.append(str(block.get('text', '')))
+            if block.get('type') == 'functionCall':
+                fn_name = block.get('name', block.get('functionCall', {}).get('name', 'unknown'))
+                tools_used.add(fn_name)
+                args = block.get('args', block.get('functionCall', {}).get('args', {}))
+                if isinstance(args, dict):
+                    cmd = args.get('command', '')
+                    fp = args.get('file_path', args.get('path', ''))
+                    if fp:
+                        if 'write' in fn_name.lower() or 'edit' in fn_name.lower():
+                            files_edited.add(fp)
+                        else:
+                            files_read.add(fp)
+
+    text = ' '.join(text_parts).strip()
+    if not text or len(text) < 10:
+        continue
+
+    preview = text[:500] + ('...' if len(text) > 500 else '')
+    if msg_type == 'user':
+        user_msgs.append(preview)
+    else:
+        model_msgs.append(preview)
+
+total_msgs = len(user_msgs) + len(model_msgs)
+
+out = []
+out.append('---')
+out.append(f'title: "Session Digest - {mod_date} (gemini)"')
+out.append('type: "session-digest"')
+out.append('source_agent: "gemini"')
+out.append(f'session_id: "{session_id}"')
+out.append(f'date: "{mod_date}"')
+out.append(f'tools_used: {len(tools_used)}')
+out.append(f'files_edited: {len(files_edited)}')
+out.append(f'messages: {total_msgs}')
+out.append('---')
+out.append('')
+out.append(f'# Session Digest - {mod_date} (gemini)')
+out.append('')
+out.append(f'**Agent:** gemini')
+out.append(f'**Session:** `{session_id[:12]}...`')
+out.append(f'**Date:** {mod_date}')
+out.append(f'**Start:** {start_time}')
+out.append(f'**Messages:** {total_msgs} exchanges')
+out.append(f'**Tools:** {len(tools_used)} unique tools used')
+out.append('')
+
+out.append('## Conversation Flow')
+out.append('')
+# Interleave user/model messages
+all_msgs = []
+for i, m in enumerate(user_msgs):
+    all_msgs.append(('user', m, i))
+for i, m in enumerate(model_msgs):
+    all_msgs.append(('model', m, i))
+all_msgs.sort(key=lambda x: x[2])
+for role, text, _ in all_msgs[:40]:
+    prefix = '**Human:**' if role == 'user' else '**Gemini:**'
+    clean = re.sub(r'<[^>]+>', '', text).strip()
+    if clean:
+        out.append(f'{prefix} {clean}')
+        out.append('')
+
+if files_edited:
+    out.append('## Files Modified')
+    out.append('')
+    for f in sorted(files_edited):
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    out.append('')
+
+if files_read:
+    out.append('## Files Read')
+    out.append('')
+    for f in sorted(list(files_read)[:30]):
+        short = f.replace(os.environ.get('BRAIN_DIR', '') + '/', '')
+        out.append(f'- `{short}`')
+    out.append('')
+
+if tools_used:
+    out.append('## Tools Used')
+    out.append('')
+    out.append(', '.join(sorted(tools_used)))
+    out.append('')
+
+with open(output_file, 'w') as f:
+    f.write('\n'.join(out))
+
+print(f"Gemini digest: {session_id[:12]}, {total_msgs} messages, {len(tools_used)} tools -> {output_file}")
+GEMINI_PYEOF
+
+  echo "gemini-$basename_f" >> "$PROCESSED_FILE"
+  log "Digested gemini session -> $output_file"
+}
+
+# ── Main routing ─────────────────────────────────────────────────────
+
+if [[ "$MODE" == "codex-run" ]]; then
+  RUN_DIR="$CODEX_RUNS_DIR/$CODEX_RUN"
+  if [[ ! -d "$RUN_DIR" ]]; then
+    echo "Codex run not found: $RUN_DIR" >&2
+    exit 1
+  fi
+  digest_codex_run "$RUN_DIR"
+  "$(dirname "${BASH_SOURCE[0]}")/brain-wiki" rebuild-index > /dev/null 2>&1 || true
+  exit 0
+fi
+
+if [[ "$MODE" == "codex-rollout" ]]; then
+  if [[ ! -f "$CODEX_ROLLOUT" ]]; then
+    echo "Codex rollout file not found: $CODEX_ROLLOUT" >&2
+    exit 1
+  fi
+  digest_codex_rollout "$CODEX_ROLLOUT"
+  "$(dirname "${BASH_SOURCE[0]}")/brain-wiki" rebuild-index > /dev/null 2>&1 || true
+  exit 0
+fi
+
+if [[ "$MODE" == "gemini-session" ]]; then
+  if [[ ! -f "$GEMINI_SESSION" ]]; then
+    echo "Gemini session file not found: $GEMINI_SESSION" >&2
+    exit 1
+  fi
+  digest_gemini_session "$GEMINI_SESSION"
+  "$(dirname "${BASH_SOURCE[0]}")/brain-wiki" rebuild-index > /dev/null 2>&1 || true
+  exit 0
+fi
+
+# Default: Claude session digestion
+SESSIONS=$(get_sessions)
+
+if [[ -z "$SESSIONS" ]]; then
+  echo "No sessions to digest."
+  exit 0
+fi
+
+COUNT=0
+echo "$SESSIONS" | while IFS= read -r session_file; do
+  [[ -z "$session_file" ]] && continue
+  [[ ! -f "$session_file" ]] && { log "SKIP: $session_file not found"; continue; }
+  digest_session "$session_file"
+  COUNT=$((COUNT + 1))
+done
+
+log "Session digest complete"
+
+# Auto-rebuild wiki index after writing session entries
+"$(dirname "${BASH_SOURCE[0]}")/brain-wiki" rebuild-index > /dev/null 2>&1 || true
