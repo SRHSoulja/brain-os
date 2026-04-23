@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# brain-claude — Operator-facing Claude seat launcher (canonical entrypoint)
+set -euo pipefail
+
+# Resolve through symlinks so ~/bin wrappers can locate canonical scripts/bin.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+
+exec "$_SELF_DIR/brain-session" --agent claude "$@"

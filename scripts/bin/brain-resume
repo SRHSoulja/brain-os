@@ -47,9 +47,19 @@ NOW_DISPLAY=$(date +"%Y-%m-%d at %I:%M %p %Z")
 
 # Record session start for brain-timer — only on true new sessions.
 # Mid-session callers (task-complete, meditate) must not reset this.
-if $NEW_SESSION || [[ ! -f "$HOME/.brain-session-start" ]]; then
-  date +%s > "$HOME/.brain-session-start"
+SESSION_START_FILE="${BRAIN_SESSION_START_FILE:-$HOME/.brain-session-start}"
+if [[ "$SESSION_START_FILE" == "$HOME/.brain-session-start" ]]; then
+  # Some runtimes expose HOME as read-only; fall back to a repo-local marker.
+  if { [[ ! -f "$SESSION_START_FILE" ]] && [[ ! -w "$HOME" ]]; } || \
+     { [[ -f "$SESSION_START_FILE" ]] && [[ ! -w "$SESSION_START_FILE" ]]; }; then
+    SESSION_START_FILE="$BRAIN/brain/ops/.brain-session-start"
+  fi
 fi
+mkdir -p "$(dirname "$SESSION_START_FILE")"
+if $NEW_SESSION || [[ ! -f "$SESSION_START_FILE" ]]; then
+  date +%s > "$SESSION_START_FILE"
+fi
+export BRAIN_SESSION_START_FILE="$SESSION_START_FILE"
 
 # Reset chain depth (escalation policy — new session = fresh chain)
 # Skip reset when called from brain-task-complete (preserves mid-chain count)

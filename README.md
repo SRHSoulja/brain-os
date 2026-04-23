@@ -44,24 +44,16 @@ editor brain/goals/goals.md
 
 ### Start your first session
 
-**Claude Code:**
+Canonical operator entry commands:
+
 ```bash
 cd ~/brain
-claude
-# Bootstrap runs automatically on session start
+brain-claude
+brain-codex
+brain-gemini
 ```
 
-**Codex:**
-```bash
-cd ~/brain
-brain-codex-enter
-```
-
-**Gemini:**
-```bash
-cd ~/brain
-brain-agent-bootstrap --agent gemini
-```
+Each launcher performs bootstrap fail-closed and enters a ready interactive session.
 
 ## First task
 
@@ -80,7 +72,7 @@ brain-task-confirm <TASK-ID>
 | `brain-task "description"` | Create a new task |
 | `brain-state-check` | Full system health check |
 | `brain-checkpoint "reason"` | Save a recovery point |
-| `brain-meditate` | Close a Claude Code session cleanly |
+| `brain-meditate` | Canonical close command for all seats |
 | `brain-task-claim <ID> <agent>` | Claim a task for execution |
 | `brain-task-complete <ID> --by <agent> --output "..."` | Complete a task |
 | `brain-resume` | Rebuild state after compaction or idle |
@@ -90,9 +82,16 @@ brain-task-confirm <TASK-ID>
 
 This brain is designed to be shared across agents. Each seat has its own bootstrap and close sequence, but they share the same task queue, governance model, and state files.
 
-- **Claude Code** — uses SessionStart hook for automatic bootstrap; `brain-meditate` to close
-- **Codex** — `brain-codex-enter` to open, `brain-meditate --agent codex` to close
-- **Gemini** — `brain-agent-bootstrap --agent gemini` to open, `brain-meditate --agent gemini` to close
+- **Canonical entry:** `brain-claude`, `brain-codex`, `brain-gemini`
+- **Canonical close:** `brain-meditate` (all seats)
+- **Post-close neutral state:**
+  - `brain/ops/.brain-active-seat.json`: `assistant=none`, `mode=standby`
+  - `brain/ops/.laptop-heartbeat.json`: `assistant=none`, `status=idle`, `remote_dm_lane=disabled`
+- **Internal plumbing (not primary operator entry):**
+  - `brain-session`
+  - `brain-codex-enter`
+  - `brain-agent-bootstrap`
+  - `brain-resume`
 
 ## Project layout
 

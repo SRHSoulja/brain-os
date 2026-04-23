@@ -2,6 +2,9 @@
 
 > This file is a session-start stub. The full operator contract is in `brain/MANUAL.md`.
 
+Canonical operator launcher: `brain-gemini`
+Canonical close command: `brain-meditate`
+
 ## Session start sequence
 
 1. Read `brain/persona/persona.md` — who you are working for and how to behave

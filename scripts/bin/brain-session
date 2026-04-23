@@ -1,22 +1,39 @@
 #!/bin/bash
 # brain-session — Auto-restarting agent wrapper
-# Usage: brain-session [--agent <claude|gemini|codex>]
+# Usage: brain-session [--agent <claude|gemini|codex>] [--auto-restart]
 #
 # Launches the specified AI agent. When a session ends (exit or meditate),
-# automatically relaunches with a fresh session. Ctrl+C twice to fully stop.
+# optionally relaunches with a fresh session when --auto-restart is set.
 
-BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
+# Resolve canonical repo root via this script path so operator launchers are
+# robust even when shell env exports an incorrect BRAIN_DIR.
+_SELF_SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$_SELF_SOURCE" ]]; do
+  _SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+  _SELF_SOURCE="$(readlink "$_SELF_SOURCE")"
+  [[ "$_SELF_SOURCE" != /* ]] && _SELF_SOURCE="$_SELF_DIR/$_SELF_SOURCE"
+done
+_SELF_DIR="$(cd -P "$(dirname "$_SELF_SOURCE")" && pwd)"
+BRAIN_DIR="$(cd "$_SELF_DIR/../.." && pwd)"
+export BRAIN_DIR
+
 AGENT="claude"
+AUTO_RESTART="${BRAIN_SESSION_AUTO_RESTART:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent) AGENT="$2"; shift 2 ;;
+    --auto-restart) AUTO_RESTART=1; shift ;;
     *) break ;;
   esac
 done
 
 echo "=== Brain Session Manager: $AGENT ==="
-echo "Sessions auto-restart on exit. Ctrl+C twice to stop."
+if [[ "$AUTO_RESTART" == "1" ]]; then
+  echo "Auto-restart: enabled"
+else
+  echo "Auto-restart: disabled (single-launch mode)"
+fi
 echo ""
 
 while true; do
@@ -24,10 +41,24 @@ while true; do
   rm -f "$BRAIN_DIR/brain/ops/.session-ve-handoff"
   rm -f "$BRAIN_DIR/brain/ops/.session-restart"
 
-  # Unified bootstrap for all agents
-  "$HOME/bin/brain-agent-bootstrap" --agent "$AGENT" --mode interactive >/dev/null 2>&1 || true
+  # Launcher bootstrap (fail-closed): do not enter an agent shell unless
+  # seat bootstrap succeeded for this launch path.
+  BOOTSTRAP_OK=1
+  if [[ "$AGENT" == "codex" ]]; then
+    "$HOME/bin/brain-codex-enter" --mode interactive >/dev/null
+    BOOTSTRAP_OK=$?
+  else
+    "$HOME/bin/brain-agent-bootstrap" --agent "$AGENT" --mode interactive >/dev/null
+    BOOTSTRAP_OK=$?
+  fi
+  if [[ "$BOOTSTRAP_OK" -ne 0 ]]; then
+    echo "[brain-session] bootstrap failed for agent=$AGENT (exit=$BOOTSTRAP_OK)."
+    echo "[brain-session] launcher is fail-closed; agent session not started."
+    exit "$BOOTSTRAP_OK"
+  fi
 
   export BRAIN_SESSION_PID=$$
+  export BRAIN_BOOTSTRAP_DONE=1
   
   if [[ "$AGENT" == "claude" ]]; then
     # Claude uses native binary via PATH
@@ -74,9 +105,18 @@ while true; do
     fi
   fi
 
-  # Normal exit — ask before restarting
+  # Normal exit
   echo ""
   echo "Session ended (exit code: $EXIT_CODE)"
+  if [[ "$AUTO_RESTART" != "1" ]]; then
+    echo "Auto-restart disabled. Exiting."
+    break
+  fi
+  # Non-interactive sessions must never loop.
+  if [[ ! -t 0 ]]; then
+    echo "No interactive TTY detected. Exiting without restart."
+    break
+  fi
   read -t 5 -p "Restart? [Y/n] (auto-restart in 5s): " choice
   case "${choice:-y}" in
     [nN]*) echo "Goodbye."; break ;;

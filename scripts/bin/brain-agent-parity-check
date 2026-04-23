@@ -10,11 +10,14 @@ JSON_MODE=false
 ERRORS=()
 WARNINGS=()
 
-check_alias() {
-  local agent="$1"
+check_launcher_script() {
+  local name="$1"
   local expected="$2"
-  if ! grep -q "alias ${agent}='${expected}'" ~/.bashrc; then
-    ERRORS+=("ALIAS_DRIFT|${agent}|Alias missing or incorrect in ~/.bashrc (expected: ${expected})")
+  local repo_path="${BRAIN_DIR:-$HOME/brain}/scripts/bin/${name}"
+  if [[ ! -x "$repo_path" ]]; then
+    ERRORS+=("LAUNCHER_MISSING|${name}|Launcher script missing or non-executable at ${repo_path}")
+  elif ! grep -q -e "$expected" "$repo_path"; then
+    ERRORS+=("LAUNCHER_DRIFT|${name}|Launcher script missing expected delegation: ${expected}")
   fi
 }
 
@@ -107,14 +110,23 @@ check_symlink_exec() {
   fi
 }
 
-# 1. Check .bashrc aliases — raw CLI names must NOT be aliased; brain-* names must exist
-check_alias "brain-claude" "brain-session --agent claude"
-check_alias "brain-codex" "brain-session --agent codex"
-check_alias "brain-gemini" "brain-session --agent gemini"
+# 1. Check canonical operator launchers (repo-owned scripts)
+check_launcher_script "brain-claude" "brain-session.*--agent claude"
+check_launcher_script "brain-codex" "brain-session.*--agent codex"
+check_launcher_script "brain-gemini" "brain-session.*--agent gemini"
 
-# 2. Check brain-session bootstrap call
-if ! grep -q "brain-agent-bootstrap" $HOME/bin/brain-session; then
-  ERRORS+=("SESSION_DRIFT|brain-session|brain-session is missing universal bootstrap call")
+# 2. Check brain-session launcher bootstrap contract
+if ! grep -q "brain-agent-bootstrap" "$HOME/bin/brain-session"; then
+  ERRORS+=("SESSION_DRIFT|brain-session|brain-session is missing launcher bootstrap call for claude/gemini")
+fi
+if ! grep -q "brain-codex-enter" "$HOME/bin/brain-session"; then
+  ERRORS+=("SESSION_DRIFT|brain-session|brain-session is missing codex launcher entry call")
+fi
+if grep -q "brain-agent-bootstrap.*|| true" "$HOME/bin/brain-session"; then
+  ERRORS+=("SESSION_DRIFT|brain-session|brain-session bootstrap is fail-open (found '|| true')")
+fi
+if ! grep -q "BRAIN_BOOTSTRAP_DONE=1" "$HOME/bin/brain-session"; then
+  ERRORS+=("SESSION_DRIFT|brain-session|brain-session is missing BRAIN_BOOTSTRAP_DONE guard export")
 fi
 
 # 3. Check wrappers

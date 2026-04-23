@@ -576,8 +576,9 @@ Every seat, at session start, in this order:
      (verdict CONFLICT, unexplained gate FAIL) or the operator asks for detail
      it omits (full queued-message list, full inbox item list, etc.).
      See [[feedback_resume_brief_from_tail]].
-   - **Codex / Gemini:** brief comes from the bootstrap/brain-resume stdout
-     tail after running `brain-codex-enter` / `brain-resume`. Same "do NOT
+   - **Codex / Gemini:** brief comes from the launcher/bootstrap stdout
+     tail after running `brain-codex` / `brain-gemini` (or direct
+     `brain-resume` refresh). Same "do NOT
      read session-resume.md by default" rule applies.
    In all cases the brief contains: verdict, gates, health, task counts,
    freshness, drift, proof, and suggested action.
@@ -605,14 +606,18 @@ Section 7 names the per-seat invocation that triggers this gate.
 
 | Seat | Close command |
 |------|--------------|
-| Claude Code | `brain-meditate` (interactive reflection + shared closeout) |
-| Codex | `brain-meditate --agent codex --summary "..."` |
-| Gemini | `brain-meditate --agent gemini --summary "..."` |
+| Claude Code | `brain-meditate` |
+| Codex | `brain-meditate` |
+| Gemini | `brain-meditate` |
 
 `brain-meditate` is the universal session-close orchestrator for every seat
 (claude-code, codex, gemini). It runs the close pipeline in order with
 fail-closed behavior on required stages. `brain-wrap-up` is a deprecation
 stub that forwards to `brain-meditate` for backward compatibility.
+
+**Expected post-close neutral state (all seats):**
+- `brain/ops/.brain-active-seat.json`: `assistant=none`, `mode=standby`
+- `brain/ops/.laptop-heartbeat.json`: `assistant=none`, `status=idle`, `remote_dm_lane=disabled`
 
 | # | Stage | Behavior |
 |---|---|---|
@@ -643,7 +648,7 @@ Flags (for non-Claude seats invoking `brain-meditate` directly):
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent <name>` | required | Seat identifier (`gemini`, `codex`, `claude-code`, ...). Forwarded to `brain-session-end`. |
+| `--agent <name>` | optional | Seat identifier (`gemini`, `codex`, `claude-code`, ...). Auto-detected from `BRAIN_AGENT` when omitted. |
 | `--summary "text"` | empty | Forwarded to `brain-session-end` and written to the wiki session entry. |
 | `--with-content-brief` | false | Opt-in. Runs `brain-content-brief` between closeout-gate and session-end. |
 | `--skip-memory` | false | Skip `brain-memory-flush` and `brain-memory-compile`. |
@@ -733,6 +738,7 @@ shared rules here.**
 `applies_to: claude-code`
 
 - **Seat id:** `claude-code`
+- **Operator launcher (canonical):** `brain-claude`
 - **Entry.** Claude Code SessionStart hook runs
   `scripts/hooks/agent-autonomous-hook SessionStart claude-code`, which
   delegates to `brain-agent-bootstrap --agent claude-code` (seat claim,
@@ -768,19 +774,21 @@ shared rules here.**
 `applies_to: codex`
 
 - **Seat id:** `codex`
+- **Operator launcher (canonical):** `brain-codex`
 - **Session hook parity:** **Vendor-locked — no native SessionStart hook.**
   Codex has no automatic hook mechanism equivalent to Claude's
-  `SessionStart` or Gemini's `SessionStart` hooks. `brain-codex-enter`
-  manually calls `brain-agent-bootstrap --agent codex` at entry — this is
-  the only bootstrap path. Cannot be automated via hook without a Codex
-  native hook API.
-- **Entry.** `brain-codex-enter` claims `laptop/codex`, refreshes
-  heartbeat, and requests VE deactivation if VE Claude is active. For
-  resume only (no seat takeover), use `brain-codex-resume`.
-  Entry also runs `brain-codex-command-map-check` and emits
+  `SessionStart` or Gemini's `SessionStart` hooks. Operator entry goes through
+  `brain-codex` (repo launcher), which delegates to `brain-session --agent codex`
+  and internally executes `brain-codex-enter` bootstrap plumbing. Cannot be
+  automated via hook without a Codex native hook API.
+- **Entry.** `brain-codex` is the canonical operator command. Internal helper
+  `brain-codex-enter` claims `laptop/codex`, refreshes heartbeat, and requests
+  VE deactivation if VE Claude is active. For resume only (no seat takeover),
+  use `brain-codex-resume`. Codex entry path also runs
+  `brain-codex-command-map-check` and emits
   `command-map: PASS|FAIL` so mapped `~/bin` command drift is visible at
   startup.
-- **Session close.** `brain-meditate --agent codex --summary "<reason>"`.
+- **Session close.** `brain-meditate`.
   Canonical Codex close path per §6.3 (unified agent-agnostic orchestrator).
   Inherits the core-memory gate via `brain-closeout-gate`.
 - **Slash emulation.** Codex CLI has no native slash commands. When an
@@ -822,6 +830,7 @@ shared rules here.**
 `applies_to: gemini`
 
 - **Seat id:** `gemini`
+- **Operator launcher (canonical):** `brain-gemini`
 - **Session hook parity:** **Native `SessionStart` hook wired.**
   `.gemini/settings.json` in the brain repo runs
   `agent-autonomous-hook SessionStart gemini` at session start — same
@@ -832,11 +841,10 @@ shared rules here.**
   (`hookSpecificOutput.permissionDecision`) which is incompatible with
   Gemini's `decision: "deny"` format. A Gemini-native gate is a follow-up
   task.
-- **Entry.** `brain-agent-bootstrap --agent gemini`
-- **Session close.**
-  `brain-meditate --agent gemini --summary "<what you accomplished>"`
-  Canonical Gemini close path. **Do not** run `brain-meditate`; use
-  `brain-meditate --agent gemini`.
+- **Entry.** `brain-gemini` is the canonical operator command. Internal helper
+  `brain-agent-bootstrap --agent gemini` remains the bootstrap primitive.
+- **Session close.** `brain-meditate`.
+  Canonical Gemini close path per §6.3.
 - **Adaptive model routing (tiers):**
 
 | Tier | Model | Use for |
@@ -1535,7 +1543,8 @@ Concrete paths for the four workflows that matter most.
 ### 13.1 Start session
 
 1. Seat-specific bootstrap (§7). Claude auto-runs via hook; Codex runs
-   `brain-codex-enter`; Gemini runs `brain-agent-bootstrap --agent gemini`.
+   canonical launcher command: `brain-claude`, `brain-codex`, or
+   `brain-gemini`.
 2. Claude only: read `brain/index/claude-session-entry.md`
    (hard-enforced by brain-sessionstart-handoff-gate).
 3. Brief from the bootstrap/brain-resume stdout tail — do NOT Read
@@ -1585,8 +1594,8 @@ approval, operator signals end.
 | Seat | Command |
 |---|---|
 | Claude Code | `brain-meditate` |
-| Codex | `brain-meditate --agent codex --summary "..."` |
-| Gemini | `brain-meditate --agent gemini --summary "..."` |
+| Codex | `brain-meditate` |
+| Gemini | `brain-meditate` |
 
 All three paths call `brain-closeout-gate` as the HARD GATE. If closeout
 fails with exit 2, fix the flagged issue and re-run the close command. The
@@ -1852,8 +1861,9 @@ details in §7.
 | Dimension | Claude Code | Codex | Gemini |
 |---|---|---|---|
 | Seat id | `claude-code` | `codex` | `gemini` |
-| Bootstrap | `brain-agent-bootstrap` (via SessionStart hook) | `brain-agent-bootstrap` (via `brain-codex-enter`) | `brain-agent-bootstrap --agent gemini` |
-| Session close | `brain-meditate` | `brain-meditate --agent codex --summary "..."` | `brain-meditate --agent gemini --summary "..."` |
+| Operator launcher | `brain-claude` | `brain-codex` | `brain-gemini` |
+| Bootstrap primitive | `brain-agent-bootstrap` (via SessionStart hook) | `brain-agent-bootstrap` (via internal `brain-codex-enter`) | `brain-agent-bootstrap --agent gemini` |
+| Session close | `brain-meditate` | `brain-meditate` | `brain-meditate` |
 | Slash commands | Native | Emulated (§7.2 map) | Not used |
 | Discord reply | `mcp__plugin_discord_discord__reply` (MCP) | Discord bridge queue | Discord bridge queue |
 | Memory store | `~/.claude/projects/.../memory/` | No auto-memory | No auto-memory |

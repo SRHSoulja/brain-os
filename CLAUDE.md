@@ -3,6 +3,9 @@
 > This file is a session-start stub. The full operator contract is in `brain/MANUAL.md`.
 > Read `brain/MANUAL.md` sections tagged `applies_to: all` or `applies_to: claude-code` when you need them.
 
+Canonical operator launcher: `brain-claude`
+Canonical close command: `brain-meditate`
+
 ## Session start sequence
 
 1. Read `brain/persona/persona.md` — who you are working for and how to behave
