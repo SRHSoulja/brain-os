@@ -25,3 +25,10 @@ work/exports/
 .DS_Store
 *.swp
 *.tmp
+
+# Python bytecode cache (regenerated on import)
+__pycache__/
+*.pyc
+
+# Wiki page-id counter (mutable local state, written by brain-wiki / brain-wiki-assign-ids)
+brain/wiki/.page-id-counter
