@@ -644,7 +644,7 @@ Exit codes:
 | 3 | `state-check` DRIFT/CONFLICT. Pipeline aborted before any stage. |
 | 4 | A required stage broke mid-pipeline. Session-end NOT emitted. |
 
-Flags (for non-Claude seats invoking `brain-meditate` directly):
+Flags (all seats):
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -1653,7 +1653,7 @@ brain-closeout-gate --json | jq .issues
 | `CORE_MEMORY_TOOL_MISSING` | `command -v brain-core-memory-status`. Investigate broken install. Do not proceed until the tool resolves. |
 | `MEMORY_UNMAPPED` | For each listed memory: create the matching wiki page (§12.2) and update the MAP. Warn-level, not a hard block. |
 
-Re-run the close command (`brain-meditate` or `brain-meditate --agent <name>`).
+Re-run the close command (`brain-meditate`).
 The close pipeline is idempotent up to `session-end`.
 
 ### 14.4 brain-meditate exits 4 (required stage broke mid-pipeline)

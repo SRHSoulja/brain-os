@@ -25,7 +25,7 @@
 |---|---|
 | `brain-agent-bootstrap` | Bootstrap any agent seat (claude-code, codex, gemini) |
 | `brain-meditate` | Close a session cleanly (all seats) |
-| `brain-codex-enter` | Open a Codex seat |
+| `brain-codex-enter` | Internal bootstrap helper called by `brain-codex`; not a direct operator entry |
 | `brain-handoff` | Write a session handoff for continuity |
 
 ## Dispatch and review
