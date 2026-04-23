@@ -709,23 +709,10 @@ surfaces here, as a warning -- not a hard block.
 
 {sources: C-002, G-067, G-068, G-070--G-074, R-001--R-021, M-020, closeout-gate §4b}
 
-### 6.6 VE activation: repo-owned service refresh (enforced)
+### 6.6 Public runtime boundary
 
-`brain-ve-activate` restarts all PM2 processes whose `pm_exec_path` starts
-with `~/brain/brain/services/` immediately after `git pull`. This is
-enforced in the script, not operator habit.
-
-**Why:** services under `brain/services/` (canonical repo ownership introduced
-in VE canonicalization Phase 1) run from the brain working tree. A git
-pull updates source on disk but PM2 keeps the old process. Without restart, VE
-silently serves stale code after laptop-side commits.
-
-**Scope:** only `brain/services/` processes. Unrelated PM2 processes are not
-touched. If no matching services are running, the block logs and continues.
-
-See `brain/wiki/tools/brain-ve-activate.md` for full activation sequence.
-
-{sources: VE canonicalization audit 2026-04-14, TASK-2026-04-14-004}
+Public `brain-os` is single-seat/operator runtime only. VE/dual-seat/private
+transport flows are intentionally excluded from this repo.
 
 ## 7. Seat Deltas
 
@@ -748,8 +735,8 @@ shared rules here.**
 - **Session close.** `brain-meditate` (auto-detects agent via `$CLAUDECODE`
   or `$BRAIN_AGENT`; explicit `--agent claude-code` also valid). Runs the
   shared pipeline plus Claude-specific extras (post-seal hook for external
-  repo commits / Clip deploy / VE yield, brain-memory-maintain, brain-
-  next-focus). Inherits the core-memory gate via `brain-closeout-gate`.
+  repo commits, brain-memory-maintain, brain-next-focus). Inherits the
+  core-memory gate via `brain-closeout-gate`.
 - **Project memory store.**
   `~/.claude/projects/<your-brain-slug>/memory/`. Auto-loaded every
   conversation. Other seats do not use this store.
@@ -782,9 +769,8 @@ shared rules here.**
   and internally executes `brain-codex-enter` bootstrap plumbing. Cannot be
   automated via hook without a Codex native hook API.
 - **Entry.** `brain-codex` is the canonical operator command. Internal helper
-  `brain-codex-enter` claims `laptop/codex`, refreshes heartbeat, and requests
-  VE deactivation if VE Claude is active. For resume only (no seat takeover),
-  use `brain-codex-resume`. Codex entry path also runs
+  `brain-codex-enter` claims `laptop/codex`, refreshes heartbeat. For resume
+  only (no seat takeover), use `brain-codex-resume`. Codex entry path also runs
   `brain-codex-command-map-check` and emits
   `command-map: PASS|FAIL` so mapped `~/bin` command drift is visible at
   startup.
@@ -1097,9 +1083,9 @@ and capabilities) and **session** (every session, enforces governance and
 memory). Sub-agent selection across agents is deterministic based on task
 type and capability profiles, not arbitrary.
 
-Session exit has three modes: **full shutdown** (seal and stop), **VE
-handoff** (seal and transfer to VE), **agent swap** (seal, spawn next
-agent, verify handoff, terminate). Agent swap lets the operator or system
+Session exit has two modes: **full shutdown** (seal and stop), **agent
+swap** (seal, spawn next agent, verify handoff, terminate). Agent swap lets
+the operator or system
 pick the next agent (Claude Code, Codex, Gemini CLI) based on task
 requirements and rate limit headroom.
 
@@ -1821,13 +1807,8 @@ If the recorded assistant matches the running session, there is no
 mismatch; stop. If it does not match, proceed to fix.
 
 **Do not blindly re-run bootstrap.** The seat-entry bootstraps are **not**
-safe to re-run in all conditions:
-
-- `brain-codex-enter` makes an SSH call to a remote seat requesting
-  deactivation. Re-running can thrash remote-seat state when the mismatch is
-  purely a stale laptop seat record.
-- `brain-agent-bootstrap` and Claude's SessionStart hook run their own
-  claim sequences that may touch handoff, heartbeat, and registry state.
+safe to re-run in all conditions because they update seat claim, heartbeat,
+and session registry state.
 
 **Fix (narrow recovery -- stale-record case).** Use the direct seat-claim
 tool, which only rewrites `.brain-active-seat.json` and has no remote
@@ -1842,10 +1823,8 @@ brain-heartbeat 2>/dev/null || true
 only step needed when the mismatch is a stale record from a prior
 session that ended without clean release.
 
-**Fix (full recovery -- when remote state also needs reconciliation).**
-If VE heartbeat or handoff state is also stale, re-run the full seat
-bootstrap for the current seat. **Confirm with operator first** before
-invoking `brain-codex-enter` because of the VE deactivation SSH call.
+**Fix (full recovery).** Re-run the full seat bootstrap for the current seat
+when the stale-record fix above does not reconcile seat state.
 
 **Never hand-edit `.brain-active-seat.json`.** Always go through a tool.
 

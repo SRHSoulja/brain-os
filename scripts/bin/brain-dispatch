@@ -82,8 +82,6 @@ DISPATCH_REQUIRED_PATTERNS=(
   "brain-sync"
   "brain-push"
   "brain-export"
-  "brain-ve-activate"
-  "brain-ve-deactivate"
   "brain-blog-deploy"
   "brain-discord-bridge-reply"
   "brain-discord-bridge-done"

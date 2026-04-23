@@ -20,13 +20,12 @@
 #   6b.6 promptbox-archive             (archive executed terminal digests)
 #   6c. seal-state                  (DURABILITY: commit + push)
 #   6d. checkpoint                  (recovery point)
-#   6e. remote-handoff              (opt-in; --remote)
-#   6f. post-seal (Claude only)     (external repo commits, Clip deploy, VE yield)
+#   6f. post-seal (Claude only)     (external repo commits)
 #   6g. memory-maintain (Claude)    (soft-fail)
 #   6h. next-focus (Claude)         (advisory; soft-fail)
 #   7.  session-end                 (LAST: logs SESSION_END boundary marker)
 #
-# Usage: brain-meditate [--agent <name>] [--remote] [--dry-run] [--no-push]
+# Usage: brain-meditate [--agent <name>] [--dry-run] [--no-push]
 #                       [--skip-memory] [--json] [--with-content-brief]
 #                       [--summary "..."] ["reason"]
 #
@@ -54,7 +53,6 @@ SKIP_MEMORY=false
 DRY_RUN=false
 NO_PUSH=false
 JSON_OUT=false
-REMOTE_HANDOFF=false
 
 usage() {
   sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
@@ -70,7 +68,6 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --no-push) NO_PUSH=true; shift ;;
     --json) JSON_OUT=true; shift ;;
-    --remote) REMOTE_HANDOFF=true; shift ;;
     -h|--help) usage ;;
     --*) echo "Unknown arg: $1" >&2; usage ;;
     *) REASON="$1"; [[ -z "$SUMMARY" ]] && SUMMARY="$1"; shift ;;
@@ -150,7 +147,6 @@ if ! $JSON_OUT; then
   $DRY_RUN && echo "mode: DRY-RUN (no writes)"
   $SKIP_MEMORY && echo "skip: memory stages"
   $WITH_CONTENT_BRIEF && echo "opt-in: content-brief"
-  $REMOTE_HANDOFF && echo "handoff: remote-seat"
   echo ""
 fi
 
@@ -458,22 +454,6 @@ else
   fi
   if [[ -x "$TOOLS/brain-checkpoint" ]]; then
     "$TOOLS/brain-checkpoint" "$AGENT meditate" >/dev/null 2>&1 && record_stage "checkpoint" "PASS" "created" || record_stage "checkpoint" "WARN" "failed"
-  fi
-fi
-
-# ── 6e. Remote handoff (only with --remote flag) ──────────────────────
-if $REMOTE_HANDOFF; then
-  if $DRY_RUN; then
-    record_stage "remote-handoff" "SKIP" "dry-run"
-  else
-    touch "$BRAIN/brain/ops/.session-remote-handoff"
-    _VE_HOOK="$BRAIN/scripts/hooks/remote-handoff"
-    if [[ -x "$_VE_HOOK" ]]; then
-      record_stage "remote-handoff" "PASS" "hook triggered"
-      "$_VE_HOOK" 2>&1 | sed 's/^/  /' || record_stage "remote-handoff" "WARN" "hook failed"
-    else
-      record_stage "remote-handoff" "SKIP" "hook not found"
-    fi
   fi
 fi
 

@@ -38,7 +38,6 @@ echo ""
 
 while true; do
   # Clean up stale signal files from prior sessions
-  rm -f "$BRAIN_DIR/brain/ops/.session-ve-handoff"
   rm -f "$BRAIN_DIR/brain/ops/.session-restart"
 
   # Launcher bootstrap (fail-closed): do not enter an agent shell unless
@@ -76,33 +75,12 @@ while true; do
   
   EXIT_CODE=$?
 
-  # 1. Check if VE handoff — exit cleanly, no restart
-  if [[ -f "$BRAIN_DIR/brain/ops/.session-ve-handoff" ]]; then
-    rm "$BRAIN_DIR/brain/ops/.session-ve-handoff"
-    echo ""
-    echo "=== Session handed to VE. Laptop going quiet. ==="
-    echo ""
-    break
-  fi
-
-  # 2. Check if explicit restart signal (created by brain-meditate-restart)
+  # Check if explicit restart signal (created by brain-meditate-restart)
   if [[ -f "$BRAIN_DIR/brain/ops/.session-restart" ]]; then
     rm "$BRAIN_DIR/brain/ops/.session-restart"
     echo "Restart signal detected. Relaunching..."
     sleep 1
     continue
-  fi
-
-  # 3. Check if heartbeat says yielded — VE seat monitor will pick up
-  HB_FILE="$BRAIN_DIR/brain/ops/.laptop-heartbeat.json"
-  if [[ -f "$HB_FILE" ]]; then
-    HB_STATUS=$(python3 -c "import json; print(json.load(open('$HB_FILE')).get('status',''))" 2>/dev/null || echo "")
-    if [[ "$HB_STATUS" == "yielded" ]]; then
-      echo ""
-      echo "=== Heartbeat is 'yielded'. VE will take over. Laptop going quiet. ==="
-      echo ""
-      break
-    fi
   fi
 
   # Normal exit

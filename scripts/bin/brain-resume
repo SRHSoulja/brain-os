@@ -1,6 +1,6 @@
 #!/bin/bash
 # brain-resume — generate session continuity briefing for Claude Code
-# Usage: brain-resume [--new-session] [--quiet] [--ve-sync] [--close-refresh]
+# Usage: brain-resume [--new-session] [--quiet] [--close-refresh]
 #
 # Reads brain state and writes brain/index/session-resume.md
 # Run before starting a Claude Code session in ~/brain (or $BRAIN_DIR)
@@ -8,9 +8,6 @@
 # --new-session  Reset the session timer. Use only for true session starts
 #                (SessionStart hook). Mid-session callers (brain-task-complete,
 #                brain-meditate) omit this flag to preserve session timing.
-# --ve-sync      Run brain-ve-run brain-sync before generating state, so the
-#                local repo has VE's latest agent outputs and health data.
-#                Opt-in only. 30s timeout. Graceful fallback on failure.
 # --close-refresh  Regenerate only post-close consumer artifacts
 #                  (session-resume + derived/system-state). Skips startup-facing
 #                  derivatives (active-context.compact, digest-preamble,
@@ -19,12 +16,10 @@
 set -euo pipefail
 
 NEW_SESSION=false
-VE_SYNC=false
 CLOSE_REFRESH=false
 for arg in "$@"; do
   case "$arg" in
     --new-session) NEW_SESSION=true ;;
-    --ve-sync) VE_SYNC=true ;;
     --close-refresh) CLOSE_REFRESH=true ;;
   esac
 done
@@ -73,34 +68,8 @@ if [[ ! -d "$BRAIN" ]]; then
   exit 1
 fi
 
-# ── VE sync (opt-in: --ve-sync) ──────────────────────────────────
-# Pulls VE's latest agent outputs and health data before generating state.
-# 30s timeout. If VE is unreachable or sync fails, continue with local data.
-VE_SYNC_STATUS="skipped"
-if $VE_SYNC; then
-  VE_SYNC_STATUS="failed"
-  if timeout 30 "$TOOLS/bin/brain-ve-run" brain-sync >/dev/null 2>&1; then
-    # Pull the freshly-pushed data from remote
-    cd "$BRAIN"
-    if git pull --ff-only origin main >/dev/null 2>&1; then
-      VE_SYNC_STATUS="fresh"
-    else
-      VE_SYNC_STATUS="synced-no-pull"
-    fi
-  fi
-fi
-
-# ── 000a. Pick up VE memory staging (if VE saved memories during its session)
-VE_MEMORY_STAGING="$BRAIN/brain/ops/ve-memory-staging"
-LOCAL_MEMORY="$BRAIN/brain/memory"
-if [[ -d "$VE_MEMORY_STAGING" ]] && ls "$VE_MEMORY_STAGING"/*.md >/dev/null 2>&1; then
-  VE_MEM_COUNT=$(ls "$VE_MEMORY_STAGING"/*.md 2>/dev/null | wc -l)
-  mkdir -p "$LOCAL_MEMORY"
-  rsync -a "$VE_MEMORY_STAGING/" "$LOCAL_MEMORY/" 2>/dev/null
-  # Clean staging area after pickup
-  rm -f "$VE_MEMORY_STAGING"/*.md 2>/dev/null
-  cd "$BRAIN" && git add "$VE_MEMORY_STAGING/" 2>/dev/null && git commit -m "brain-resume: picked up $VE_MEM_COUNT VE memory files" --no-gpg-sign -q 2>/dev/null || true
-fi
+# Public repo isolation: VE/dual-seat sync paths are disabled.
+VE_SYNC_STATUS="disabled"
 
 # ── 000. Latest session handoff ───────────────────────────────────
 HANDOFF_DIR="$BRAIN/work/session-handoffs"
@@ -376,9 +345,8 @@ if [[ -f "$SWEEP_LOG" ]]; then
   fi
 fi
 
-# ── 3b-iv. VE overnight summary (Body-to-Brain handoff) ──────────
+# ── 3b-iv. Overnight summary ─────────────────────────────────────
 # Parse health-sweep.log for the last 24h to build a concise overnight report.
-# This gives the human a one-glance view of what VE did between sessions.
 VE_SUMMARY=""
 if [[ -f "$SWEEP_LOG" ]]; then
   VE_SUMMARY=$(python3 - "$SWEEP_LOG" "$BRAIN" <<'PYEOF'
@@ -437,7 +405,7 @@ if os.path.isdir(suggestions_dir):
     suggestion_count = len(glob.glob(os.path.join(suggestions_dir, "*.md")))
 
 # Rate file for SO-006 restarts
-rate_file = os.path.join(brain, "work/logs/.ve-restart-timestamps")
+rate_file = os.path.join(brain, "work/logs/.service-restart-timestamps")
 restarts_24h = 0
 if os.path.isfile(rate_file):
     cutoff_epoch = cutoff.timestamp()
@@ -1684,28 +1652,12 @@ if [[ -d "$_GATES" ]]; then
     [[ -n "$_g2_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  integrity: $_g2_report"
   fi
 
-  # Gate 3: VE transport
-  if [[ -x "$_GATES/brain-gate-ve-transport.sh" ]]; then
-    _g3_out=$(bash "$_GATES/brain-gate-ve-transport.sh" 2>/dev/null) || true
-    _gate_transport=$(echo "$_g3_out" | grep -oP '(?<=ve-transport-probe: ).*' || echo "ERROR")
-    _g3_report=$(echo "$_g3_out" | grep -oP '(?<=Wrote: ).*' || true)
-    [[ -n "$_g3_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  transport: $_g3_report"
-
-    # Gate 3b: If transport failed, run root-cause check
-    if [[ "$_gate_transport" == "FAIL" && -x "$_GATES/brain-gate-ve-transport-rootcause.sh" ]]; then
-      _g3b_out=$(bash "$_GATES/brain-gate-ve-transport-rootcause.sh" 2>/dev/null) || true
-      _gate_transport_rc=$(echo "$_g3b_out" | grep -oP '(?<=ve-transport-root-cause-check: )\w+' || echo "ERROR")
-      _g3b_report=$(echo "$_g3b_out" | grep -oP '(?<=Wrote: ).*' || true)
-      [[ -n "$_g3b_report" ]] && GATE_REPORT_PATHS="${GATE_REPORT_PATHS}\n  transport-rc: $_g3b_report"
-    fi
-  fi
+  # Public repo isolation: transport/VE gates are intentionally disabled.
 
   # Build summary line
   _gate_items=()
   [[ -n "$_gate_contract" ]] && _gate_items+=("contract=$_gate_contract")
   [[ -n "$_gate_integrity" ]] && _gate_items+=("integrity=$_gate_integrity")
-  [[ -n "$_gate_transport" ]] && _gate_items+=("transport=$_gate_transport")
-  [[ -n "$_gate_transport_rc" ]] && _gate_items+=("transport-rc=$_gate_transport_rc")
 
   # Memory integrity gate (optional, non-blocking)
   _gate_memory=""
@@ -1722,7 +1674,7 @@ if [[ -d "$_GATES" ]]; then
 
   # Check for any FAIL
   _gate_has_fail=false
-  for _gv in "$_gate_contract" "$_gate_integrity" "$_gate_transport"; do
+  for _gv in "$_gate_contract" "$_gate_integrity"; do
     [[ "$_gv" == FAIL* ]] && _gate_has_fail=true
   done
 fi
@@ -2027,8 +1979,6 @@ $(if [[ -n "$ASSESS_LINE" && "$ASSESS_LINE" != "ALL_NORMAL" ]]; then echo "- **A
 $(if [[ -n "$ADVISOR_EXPORT_WARN" ]]; then echo "- **Attention:** $ADVISOR_EXPORT_WARN"; fi)
 $(if [[ -n "$OUTCOMES_LINE" ]]; then echo "- **Outcomes:** $OUTCOMES_LINE"; fi)
 $(if [[ -n "$CODEX_VERIFY_LINE" ]]; then echo "- **Codex:** $CODEX_VERIFY_LINE"; fi)
-
-$(if [[ "$VE_SYNC_STATUS" == "failed" ]]; then echo "- **VE sync:** FAILED"; fi)
 
 $(if [[ -n "$GATE_SUMMARY" || $MEMORY_TOTAL -gt 0 ]]; then
 echo "## Gate Summary"
@@ -2723,7 +2673,7 @@ for sec in (
     "Memory Digest: Infrastructure Safety",
     "Memory Digest: Content & Publishing",
     "Memory Digest: Governance",
-    "Memory Digest: VE / Multi-Seat",
+    "Memory Digest: Multi-Seat",
 ):
     m = re.search(rf"# {re.escape(sec)}\n(.*?)(?=\n# Memory Digest:|\Z)", digest, re.DOTALL)
     if not m:
@@ -2753,7 +2703,7 @@ lines = [
     "",
     "## Startup Sequence (All Seats)",
     "",
-    "1. Bootstrap seat (`brain-codex-enter` / SessionStart hook / `brain-agent-bootstrap --agent gemini`).",
+    "1. Launch canonical operator command (`brain-claude` / `brain-codex` / `brain-gemini`).",
     "2. Use bootstrap summary source (`session-brief.md` for Claude, stdout tail for Codex/Gemini).",
     "3. Read this file (`brain/index/session-start-contract.compact.md`).",
     "4. Check Prepared Focus in the summary.",
@@ -2786,8 +2736,8 @@ lines.extend([
     "## Seat Overlay (Minimal)",
     "",
     "- Claude Code: read `brain/index/session-brief.md` (SessionStart output file).",
-    "- Codex: use `brain-codex-enter` stdout tail as brief source.",
-    "- Gemini: use `brain-agent-bootstrap --agent gemini` stdout tail as brief source.",
+    "- Codex: use `brain-codex` launcher/bootstrap stdout tail as brief source.",
+    "- Gemini: use `brain-gemini` launcher/bootstrap stdout tail as brief source.",
     "",
     "## On-Demand Lookup (Not Mandatory at startup)",
     "",
