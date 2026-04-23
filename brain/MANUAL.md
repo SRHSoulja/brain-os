@@ -639,7 +639,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | All required stages passed. `SESSION_END` logged. |
-| 1 | Bad usage (missing `--agent` or unknown flag). |
+| 1 | Bad usage (unknown flag). |
 | 2 | `closeout-gate` FAIL. Session-end NOT emitted. Fix issues and re-run. |
 | 3 | `state-check` DRIFT/CONFLICT. Pipeline aborted before any stage. |
 | 4 | A required stage broke mid-pipeline. Session-end NOT emitted. |
@@ -743,9 +743,8 @@ shared rules here.**
 - **Checkpointing.** Use `brain-checkpoint "reason"` explicitly across all
   seats. Do not rely on seat-specific compaction hooks.
 - **Slash commands (native).** `/brain-handoff`, `/brain-handoff-complete`,
-  `/brain-codex-advisor`, `/brain-codex-tunnel`, `/aeo-audit`, `/humanizer`,
-  `/webapp-testing`, `/find-bugs`, etc. Tool-trigger references in §9.7 use
-  these invocations.
+  `/aeo-audit`, `/humanizer`, `/webapp-testing`, `/find-bugs`, etc.
+  Tool-trigger references in §9.7 use these invocations.
 - **Discord Reply tool (Claude-specific mechanism).** Every response to a
   message whose origin is `<channel source="plugin:discord:discord">` must
   use the MCP tool `mcp__plugin_discord_discord__reply`. The shared
@@ -900,7 +899,7 @@ operator's words do.
 | Signal | Meaning | Action |
 |---|---|---|
 | `CONTINUE` | More work in queue. | **Batch mode:** auto-proceed to next task. **Single-task mode:** report completion and return control to operator. |
-| `CODEX` | Hand off to another seat for independent verification. | From Claude: prepare codex-advisor packet via `/brain-codex-advisor`. From Codex/Gemini: prepare a review-back packet. |
+| `CODEX` | Hand off to another seat for independent verification. | Prepare a handoff packet (task state, open questions, work artifacts) and start the receiving seat. |
 | `STOP` | Session should end. | State the reason and the recommended next action. Do not continue into another task. |
 
 **Post-task confirmation rule (enforced):**
@@ -1006,8 +1005,6 @@ customer content. Voice: warm, sharp, grounded, collaborative.
 | Research | Researcher agent | `researcher` agent | N/A or human. |
 | Pipeline status | Pipeline gate | `brain-publish-gate --status` | Same. |
 | Handoff prep | Handoff prompt prep | `/brain-handoff` | Handoff scripts directly. |
-| Codex bridge | Advisor packet | `/brain-codex-advisor` | N/A (Claude-side tunnel). |
-| Low-credit Codex tunnel | Send-only tunnel to Codex | `/brain-codex-tunnel` | N/A (Claude-side tunnel). |
 
 Docs index: `docs/ops/tools-*.md`.
 

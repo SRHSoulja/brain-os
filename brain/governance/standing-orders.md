@@ -119,7 +119,7 @@ These are not tasks. They are permanent permissions for specific, narrow, determ
 
 ## Execution environment constraint
 
-Standing orders execute via **WSL cron or WSL PM2** on an always-on remote seat (ethernet, auto-start). SO-001 through SO-007 fire 24/7 regardless of operator laptop state. The laptop is only required for human-supervised Claude Code sessions.
+Standing orders execute via **WSL cron or WSL PM2** on the operator's machine. SO-001 through SO-005 fire on the configured schedule. (SO-006 and SO-007 are private-instance infrastructure and are not present in this runtime.)
 
 ## Consuming systems
 
@@ -130,8 +130,8 @@ Standing orders execute via **WSL cron or WSL PM2** on an always-on remote seat 
 | SO-003 | brain-fix-frontmatter + brain-meditate hook | **Operationalized** — auto-fix runs at every meditate |
 | SO-004 | brain-resume unmatched-failure capture | **Operationalized** — creates low-confidence briefs for unmatched down services |
 | SO-005 | brain-resume PM2 check | **Operationalized** — checks expected services at every brain-resume |
-| SO-006 | brain-health-sweep --host=remote --heal | **Operationalized** — restarts crashed remote-seat core PM2 services (3x/24h limit) |
-| SO-007 | brain-remote-run (laptop) + brain-remote-relay (remote) | **Operationalized** — 4 whitelisted commands, 60s rate limit, SSH transport |
+| SO-006 | — | **Excluded** — private-instance infrastructure (see SO-006 note) |
+| SO-007 | — | **Excluded** — private-instance infrastructure (see SO-007 note) |
 
 ## Amendment process
 
