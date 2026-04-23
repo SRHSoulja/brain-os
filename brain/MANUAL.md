@@ -822,10 +822,9 @@ shared rules here.**
   shared dispatcher as Claude, different agent param. `AfterAgent` hook
   runs `brain-session-end-commit` (equivalent to Claude's `Stop` hook).
   **Note:** `BeforeTool` gate (`brain-sessionstart-handoff-gate`) is
-  NOT wired for Gemini — the gate uses Claude-specific deny format
-  (`hookSpecificOutput.permissionDecision`) which is incompatible with
-  Gemini's `decision: "deny"` format. A Gemini-native gate is a follow-up
-  task.
+  wired for Gemini using `--format gemini`, which emits the Gemini-native
+  `decision: "deny"` format. The agent-agnostic-gate (Edit/Write guard) is
+  also wired as a `BeforeTool` hook.
 - **Entry.** `brain-gemini` is the canonical operator command. Internal helper
   `brain-agent-bootstrap --agent gemini` remains the bootstrap primitive.
 - **Session close.** `brain-meditate`.

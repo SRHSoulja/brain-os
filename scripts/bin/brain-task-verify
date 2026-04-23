@@ -81,6 +81,32 @@ if [[ "$COORDINATION" == "combined" ]]; then
   TARGET_IDS="$TASK_ID $DEPENDS_ON"
 fi
 
+# 3b. Gemini attribution signature check
+if [[ "$AGENT" == "gemini" ]]; then
+  _DOC_PATTERNS="brain/wiki/.*\.md$|brain/governance/.*\.md$|docs/.*\.md$|brain/MANUAL\.md$|README\.md$|CLAUDE\.md$|AGENTS\.md$|GEMINI\.md$"
+  _changed_docs=$(
+    { git -C "$BRAIN" diff HEAD --name-only 2>/dev/null
+      git -C "$BRAIN" ls-files --others --exclude-standard 2>/dev/null
+    } | grep -E "$_DOC_PATTERNS" | sort -u || true
+  )
+  _missing_sig=()
+  while IFS= read -r _doc; do
+    [[ -z "$_doc" ]] && continue
+    _full="$BRAIN/$_doc"
+    [[ -f "$_full" ]] || continue
+    if ! grep -q "sovereign-agent-sig: gemini" "$_full"; then
+      _missing_sig+=("$_doc")
+    fi
+  done <<< "$_changed_docs"
+  if [[ ${#_missing_sig[@]} -gt 0 ]]; then
+    echo "GEMINI_SIGNATURE_MISSING: add <!-- sovereign-agent-sig: gemini --> to all modified documentation files"
+    for _f in "${_missing_sig[@]}"; do
+      echo "  missing: $_f"
+    done
+    exit 1
+  fi
+fi
+
 # 4. Summon verifier via repo-auditor profile
 echo "[verify] Summoning verifier for $TARGET_IDS (profile: repo-auditor)..."
 QUESTION="Please audit the completion of the following task(s): $TARGET_IDS. 
