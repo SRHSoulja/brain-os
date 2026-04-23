@@ -23,12 +23,14 @@
 #                                    deterministic end-gate for Codex)
 #   6c. seal-state                  (DURABILITY: commit + push)
 #   6d. checkpoint                  (recovery point)
-#   6f. post-seal (Claude only)     (external repo commits)
+#   6e. remote-handoff              (opt-in; --remote)
+#   6f. post-seal (Claude only)     (external repo commits, Clip deploy, VE yield)
 #   6g. memory-maintain (Claude)    (soft-fail)
 #   6h. next-focus (Claude)         (advisory; soft-fail)
+#   6i. agent finalization (!Claude) (seat return, telemetry; codex adds usage-snapshot+parity-gate)
 #   7.  session-end                 (LAST: logs SESSION_END boundary marker)
 #
-# Usage: brain-meditate [--agent <name>] [--dry-run] [--no-push]
+# Usage: brain-meditate [--agent <name>] [--remote] [--dry-run] [--no-push]
 #                       [--skip-memory] [--json] [--with-content-brief]
 #                       [--summary "..."] ["reason"]
 #
@@ -44,9 +46,16 @@
 
 set -uo pipefail
 
-BRAIN="${BRAIN_DIR:-$HOME/brain}"
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
 TOOLS="$HOME/bin"
 POST_SEAL="$BRAIN/scripts/hooks/post-seal"
+
+# Sub-agent dispatch guard: lifecycle commands belong to the operator-controlled
+# session, not to dispatched sub-agents. Refuse if BRAIN_DISPATCH_ACTIVE is set.
+if [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]]; then
+  echo "[brain-meditate] BLOCKED: lifecycle commands are not allowed in sub-agent dispatch context (BRAIN_DISPATCH_ACTIVE=1). The operator's session owns lifecycle." >&2
+  exit 64
+fi
 
 AGENT=""
 SUMMARY=""
@@ -56,6 +65,8 @@ SKIP_MEMORY=false
 DRY_RUN=false
 NO_PUSH=false
 JSON_OUT=false
+REMOTE_HANDOFF=false
+RETURN_HANDOFF=false
 
 usage() {
   sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
@@ -71,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --no-push) NO_PUSH=true; shift ;;
     --json) JSON_OUT=true; shift ;;
+    --remote|--ve) REMOTE_HANDOFF=true; shift ;;
+    --return) RETURN_HANDOFF=true; shift ;;
     -h|--help) usage ;;
     --*) echo "Unknown arg: $1" >&2; usage ;;
     *) REASON="$1"; [[ -z "$SUMMARY" ]] && SUMMARY="$1"; shift ;;
@@ -150,6 +163,7 @@ if ! $JSON_OUT; then
   $DRY_RUN && echo "mode: DRY-RUN (no writes)"
   $SKIP_MEMORY && echo "skip: memory stages"
   $WITH_CONTENT_BRIEF && echo "opt-in: content-brief"
+  $REMOTE_HANDOFF && echo "handoff: remote-seat"
   echo ""
 fi
 
@@ -361,7 +375,7 @@ if [[ -x "$TOOLS/brain-session-digest" ]]; then
         fi
         ;;
       gemini|gemini-cli)
-        # Glob across all Gemini project dirs (brain, gemini-lab, etc.)
+        # Glob across all Gemini project dirs (gmgn-brain, gemini-lab, etc.)
         _LATEST_SESSION=$(ls -t "$HOME"/.gemini/tmp/*/chats/session-*.json 2>/dev/null | head -1 || true)
         if [[ -n "$_LATEST_SESSION" ]]; then
           "$TOOLS/brain-session-digest" --gemini-session "$_LATEST_SESSION" >/dev/null 2>&1 || digest_rc=$?
@@ -381,8 +395,8 @@ else
 fi
 
 # ── 6b.4 prune old system reports (keep 7 days) ─────────────
-if [[ -d "$REPO/work/reports/system" ]]; then
-  find "$REPO/work/reports/system" -name "*.md" -mtime +7 -delete 2>/dev/null || true
+if [[ -d "$BRAIN/work/reports/system" ]]; then
+  find "$BRAIN/work/reports/system" -name "*.md" -mtime +7 -delete 2>/dev/null || true
 fi
 
 # ── 6b.5 terminal monitor cleanup ────────────────────────────
@@ -410,10 +424,10 @@ fi
 
 # ── 6b.7 stop-hook-sweep (parity: run the same commit helper that Claude's
 # Stop hook and Gemini's AfterAgent hook invoke). Codex has no native
-# session-end event surface, so meditate is Codex's only deterministic path
-# to this sweep. The helper is idempotent (60s debounce inside
-# brain-session-end-commit), so this runs safely for all seats. Skips
-# gracefully if the helper is absent in minimal installs.
+# session-end event surface (see brain/memory/project_codex_no_auto_hooks.md),
+# so meditate is Codex's only deterministic path to this sweep. For Claude and
+# Gemini the helper is idempotent (60s debounce inside brain-session-end-commit),
+# so this runs safely for all seats and keeps the sweep logic in one script.
 _STOP_HOOK="$BRAIN/scripts/hooks/brain-session-end-commit"
 if $DRY_RUN; then
   record_stage "stop-hook-sweep" "SKIP" "dry-run"
@@ -424,7 +438,7 @@ elif [[ -x "$_STOP_HOOK" ]]; then
     record_stage "stop-hook-sweep" "WARN" "brain-session-end-commit exit non-zero (non-fatal)"
   fi
 else
-  record_stage "stop-hook-sweep" "SKIP" "brain-session-end-commit not installed"
+  record_stage "stop-hook-sweep" "SKIP" "brain-session-end-commit not executable"
 fi
 
 # ── 6c. seal-state (DURABILITY) ─────────────────────────────
@@ -462,9 +476,16 @@ else
           finish 4
         fi
         if git push >/dev/null 2>&1; then
-          record_stage "push" "PASS" "brain pushed"
+          record_stage "push" "PASS" "gmgn-brain pushed"
         else
-          record_stage "push" "WARN" "push failed (likely auth/network)"
+          # Fetch to get current remote state, then diagnose failure
+          git fetch origin >/dev/null 2>&1 || true
+          BEHIND_NOW=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+          if [[ "$BEHIND_NOW" -gt 0 ]]; then
+            record_stage "push" "WARN" "push skipped — sibling session pushed first (remote $BEHIND_NOW ahead); local sealed"
+          else
+            record_stage "push" "WARN" "push failed (likely auth/network)"
+          fi
         fi
       fi
     else
@@ -476,6 +497,49 @@ else
   fi
   if [[ -x "$TOOLS/brain-checkpoint" ]]; then
     "$TOOLS/brain-checkpoint" "$AGENT meditate" >/dev/null 2>&1 && record_stage "checkpoint" "PASS" "created" || record_stage "checkpoint" "WARN" "failed"
+  fi
+fi
+
+# ── 6d.5 Wiki page lint advisory (soft-fail, never blocks) ────────────
+if [[ -x "$TOOLS/brain-wiki-page-lint" ]]; then
+  _lint_out=$("$TOOLS/brain-wiki-page-lint" --summary 2>&1 || true)
+  if echo "$_lint_out" | grep -q "Pages checked:"; then
+    _complete=$(echo "$_lint_out" | grep "^Complete:" | awk '{print $2}')
+    _total=$(echo "$_lint_out" | grep "^Pages checked:" | awk '{print $3}')
+    record_stage "wiki-lint" "INFO" "${_complete:-?}/${_total:-?} tool pages complete"
+  else
+    record_stage "wiki-lint" "WARN" "lint tool failed (non-blocking)"
+  fi
+fi
+
+# ── 6e. Remote handoff (only with --remote flag) ──────────────────────
+if $REMOTE_HANDOFF; then
+  if $DRY_RUN; then
+    record_stage "remote-handoff" "SKIP" "dry-run"
+  else
+    touch "$BRAIN/brain/ops/.session-remote-handoff"
+    _VE_HOOK="$BRAIN/scripts/hooks/remote-handoff"
+    if [[ -x "$_VE_HOOK" ]]; then
+      record_stage "remote-handoff" "PASS" "hook triggered"
+      "$_VE_HOOK" 2>&1 | sed 's/^/  /' || record_stage "remote-handoff" "WARN" "hook failed"
+    else
+      record_stage "remote-handoff" "SKIP" "hook not found"
+    fi
+  fi
+fi
+
+# ── 6e.5. Return handoff — VE → laptop (only with --return flag) ──────────────
+if $RETURN_HANDOFF; then
+  if $DRY_RUN; then
+    record_stage "return-handoff" "SKIP" "dry-run"
+  else
+    _RETURN_HOOK="$BRAIN/scripts/hooks/return-handoff"
+    if [[ -x "$_RETURN_HOOK" ]]; then
+      record_stage "return-handoff" "PASS" "hook triggered"
+      "$_RETURN_HOOK" 2>&1 | sed 's/^/  /' || record_stage "return-handoff" "WARN" "hook failed"
+    else
+      record_stage "return-handoff" "SKIP" "hook not found ($BRAIN/scripts/hooks/return-handoff)"
+    fi
   fi
 fi
 
@@ -492,6 +556,72 @@ if $IS_CLAUDE && ! $DRY_RUN; then
   "$TOOLS/brain-next-focus" >/dev/null 2>&1 \
     && record_stage "next-focus" "PASS" "focus advisory generated" \
     || record_stage "next-focus" "WARN" "next-focus soft-failed"
+fi
+
+# ── 6i. Agent-specific finalization (seat return + telemetry) ──
+# Runs for all non-dry-run closes. Codex keeps extra telemetry/parity steps;
+# every agent returns seat to the same neutral standby+idle end state.
+#
+# Post-close invariant:
+# System must be left in a neutral, agent-agnostic state.
+# No agent owns the seat after close; next session may be started by any agent.
+if ! $DRY_RUN; then
+  _neutralize_seat() {
+    if [[ -x "$TOOLS/brain-seat-claim" ]]; then
+      "$TOOLS/brain-seat-claim" --seat laptop --assistant none --mode standby >/dev/null 2>&1 \
+        && record_stage "seat-return" "PASS" "seat returned to neutral standby" \
+        || record_stage "seat-return" "WARN" "seat-claim failed (soft)"
+    else
+      record_stage "seat-return" "SKIP" "brain-seat-claim not found"
+    fi
+    if [[ -x "$TOOLS/brain-heartbeat" ]]; then
+      "$TOOLS/brain-heartbeat" >/dev/null 2>&1 || true
+    fi
+  }
+
+  case "$AGENT" in
+    codex)
+      # 1. Codex usage snapshot (token/rate telemetry)
+      if [[ -x "$TOOLS/brain-codex-usage-snapshot" ]]; then
+        "$TOOLS/brain-codex-usage-snapshot" --quiet >/dev/null 2>&1 \
+          && record_stage "codex-usage-snapshot" "PASS" "telemetry captured" \
+          || record_stage "codex-usage-snapshot" "WARN" "snapshot failed (soft)"
+      else
+        record_stage "codex-usage-snapshot" "SKIP" "tool not found"
+      fi
+
+      # 2. Codex progress checkpoint — close bookend
+      if [[ -x "$TOOLS/brain-codex-progress-checkpoint" ]]; then
+        "$TOOLS/brain-codex-progress-checkpoint" --stage closeout --reason "${SUMMARY:-brain-meditate close}" --quiet >/dev/null 2>&1 \
+          && record_stage "codex-progress-checkpoint" "PASS" "closeout checkpoint written" \
+          || record_stage "codex-progress-checkpoint" "WARN" "checkpoint failed (soft)"
+      else
+        record_stage "codex-progress-checkpoint" "SKIP" "tool not found"
+      fi
+
+      # 3. Operational parity gate — close mode (handoff + memory integrity)
+      if [[ -x "$TOOLS/brain-handoff-parity-gate" ]]; then
+        "$TOOLS/brain-handoff-parity-gate" close >/dev/null 2>&1 \
+          && record_stage "parity-gate" "PASS" "handoff+memory integrity OK" \
+          || record_stage "parity-gate" "WARN" "parity gate close failed (soft)"
+      else
+        record_stage "parity-gate" "SKIP" "tool not found"
+      fi
+
+      # 4. Return seat to neutral standby + refresh heartbeat
+      _neutralize_seat
+      ;;
+
+    gemini|gemini-cli)
+      # 1. Return seat to neutral standby + refresh heartbeat
+      _neutralize_seat
+      ;;
+
+    *)
+      # Claude/future agents: align with the same neutral idle invariant.
+      _neutralize_seat
+      ;;
+  esac
 fi
 
 # ── 7. session-end (LAST: boundary marker) ─────────────────────

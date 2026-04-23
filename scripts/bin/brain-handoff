@@ -11,7 +11,14 @@
 
 set -uo pipefail
 
-BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
+# Sub-agent dispatch guard: lifecycle commands belong to the operator-controlled
+# session, not to dispatched sub-agents.
+if [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]]; then
+  echo "[brain-handoff] BLOCKED: lifecycle commands are not allowed in sub-agent dispatch context (BRAIN_DISPATCH_ACTIVE=1)." >&2
+  exit 64
+fi
+
+BRAIN_DIR="${BRAIN_DIR:-$HOME/gmgn-brain}"
 OUTPUT_DIR="$BRAIN_DIR/work/session-handoffs"
 LOCK_FILE="/tmp/brain-handoff.lock"
 NOW=$(date +%Y-%m-%d-%H%M)

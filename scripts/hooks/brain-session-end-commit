@@ -3,51 +3,96 @@
 # Wired to Claude Code Stop hook. Lightweight, non-blocking, never fails noisily.
 
 set -euo pipefail
-BRAIN="${BRAIN_DIR:-$HOME/brain}"
+
+# Sub-agent dispatch guard: dispatched sub-agents must not commit. The
+# operator's session owns commits.
+if [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]]; then
+  exit 0
+fi
+
+BRAIN="${BRAIN_DIR:-$HOME/gmgn-brain}"
 cd "$BRAIN" || exit 0
 
-# Debounce: skip commit if a session-end commit ran within 60s.
+# Debounce: skip commit (not VE trigger) if a session-end commit ran within 60s.
 # Prevents burst commits when the user does rapid /clear restarts.
 _DEBOUNCE_FILE="/tmp/brain-session-end-commit-lock"
 _DEBOUNCE_SECS=60
+_SKIP_COMMIT=false
 if [[ -f "$_DEBOUNCE_FILE" ]]; then
   _LAST=$(cat "$_DEBOUNCE_FILE" 2>/dev/null || echo 0)
   _NOW=$(date +%s)
   if (( _NOW - _LAST < _DEBOUNCE_SECS )); then
-    exit 0
+    _SKIP_COMMIT=true
   fi
 fi
 
-# Nothing to do if tree is clean (ignoring runtime-generated noise paths)
-if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --short 2>/dev/null | grep -v '^?? brain/ops/promptbox\|^?? brain/ops/images')" ]]; then
-  exit 0
+if ! $_SKIP_COMMIT; then
+  # Nothing to do if tree is clean
+  if ! (git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --short 2>/dev/null | grep -v '^?? brain/ops/promptbox\|^?? brain/ops/images\|^?? work/logs/brain-gpt')" ]]); then
+
+    # Stage everything except noisy runtime paths
+    git add \
+      .claude/commands/ \
+      scripts/ \
+      brain/MANUAL.md \
+      brain/governance/ \
+      brain/index/ \
+      brain/core-knowledge/ \
+      brain/ops/execution-profiles.json \
+      brain/ops/advisor-mode.json \
+      brain/ops/events.jsonl \
+      brain/ops/events.log \
+      brain/ops/registry/ \
+      brain/ops/tasks/queue/ \
+      brain/ops/tasks/active/ \
+      brain/wiki/ \
+      ai/prompts/ \
+      work/logs/devlog/ \
+      work/logs/wins-log.md \
+      work/logs/wiki-impact.log \
+      work/logs/agent-last-state.json \
+      work/logs/agent-metrics.jsonl \
+      work/logs/next-focus-latest.json \
+      work/tests/ \
+      2>/dev/null || true
+
+    # Only commit if something is actually staged
+    if ! git diff --cached --quiet; then
+      git commit -m "$(cat <<'EOF'
+chore: session-end auto-commit (uncommitted work sealed on Stop)
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+EOF
+)" 2>&1 | tee -a /tmp/brain-session-end-commit.log || true
+      date +%s > "$_DEBOUNCE_FILE" 2>/dev/null || true
+    fi
+  fi
 fi
 
-# Stage framework + user-content paths; missing paths are silently skipped.
-# Operators extending the brain can add paths to this list in their own fork.
-git add \
-  .claude/commands/ \
-  scripts/ \
-  brain/MANUAL.md \
-  brain/governance/ \
-  brain/index/ \
-  brain/core-knowledge/ \
-  brain/ops/execution-profiles.json \
-  brain/ops/events.jsonl \
-  brain/ops/events.log \
-  brain/ops/registry/ \
-  brain/ops/tasks/queue/ \
-  brain/ops/tasks/active/ \
-  brain/persona/ \
-  brain/goals/ \
-  brain/wiki/ \
-  work/logs/devlog/ \
-  work/logs/wins-log.md \
-  2>/dev/null || true
+# VE handoff: if meditate --ve ran this session, the trigger file is touched
+# on the VE desktop so brain-ve-watcher pops a Windows Terminal tab there.
+# Release-before-acquire: we MUST NOT fire this SSH trigger while the laptop
+# claude is still alive, because the Discord gateway is a singleton per bot
+# token — simultaneous logins cause a gateway conflict and the laptop
+# (longer-connected) usually keeps winning, stranding the DMs here. When
+# .session-ve-handoff is present, the brain-session wrapper will handle the
+# SSH trigger itself AFTER claude exits (guaranteeing Discord released).
+# We only fire from this Stop hook when there's no loop-exit marker, i.e. a
+# handoff path that pre-dates the marker pair.
+# VE session lock: clear on every session end regardless of seat.
+# Written by brain-agent-bootstrap when seat=ve so laptop heartbeat
+# can detect an active VE session. Always safe to remove here.
+rm -f "$BRAIN/brain/ops/.ve-session.lock" 2>/dev/null || true
 
-# Only commit if something is actually staged
-if ! git diff --cached --quiet; then
-  git commit -m "chore: session-end auto-commit (uncommitted work sealed on Stop)" 2>&1 \
-    | tee -a /tmp/brain-session-end-commit.log >/dev/null || true
-  date +%s > "$_DEBOUNCE_FILE" 2>/dev/null || true
+_VE_MARKER="$BRAIN/brain/ops/.session-remote-handoff"
+_VE_LOOP_EXIT="$BRAIN/brain/ops/.session-ve-handoff"
+if [[ -f "$_VE_MARKER" && ! -f "$_VE_LOOP_EXIT" ]]; then
+    _VE_HOST="villain-remote"
+    _VE_TRIGGER="\$HOME/gmgn-brain/brain/ops/.ve-handoff-trigger"
+    ssh -o ConnectTimeout=5 "$_VE_HOST" \
+        "mkdir -p \$HOME/gmgn-brain/brain/ops && touch $_VE_TRIGGER" \
+        2>/dev/null \
+        && echo "[session-end] VE trigger touched on $_VE_HOST" \
+        || echo "[session-end] VE trigger failed (VE may be offline)"
+    rm -f "$_VE_MARKER"
 fi
