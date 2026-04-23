@@ -391,6 +391,11 @@ mandatory gating rules (Validate-then-Mutate) found in:
 
 ## 5. Handoff Contract
 
+> **Scope:** optional multi-seat orchestration add-on. A single-seat brain
+> can skip this entire section; the task lifecycle (§4) works standalone.
+> Read on if you orchestrate multiple Claude/Codex/Gemini seats against a
+> shared lane registry.
+
 The handoff system is brain-native. Handoff state lives at
 `$BRAIN_DIR/brain/ops/handoffs/` (default `~/brain/brain/ops/handoffs/`).
 The system generates deterministic artifacts from a lane registry so

@@ -4,11 +4,23 @@ A bootstrappable multi-agent operating system for Claude Code, Codex, and Gemini
 
 ## What's included
 
+### Core (required for every install)
+
 - **Task system** — create, claim, execute, complete tasks with proof-of-execution and immutable records
-- **Session lifecycle** — bootstrap, meditate, handoff, checkpoint across Claude Code, Codex, and Gemini seats
+- **Session lifecycle** — bootstrap, meditate, checkpoint across Claude Code, Codex, and Gemini seats
 - **Governance** — standing orders, capability profiles, dispatch routing, autonomous gate
-- **Services** — brain-commands, brain-monitor, brain-clippy (Ollama-powered AI assistant), brain-agent
-- **Dispatch** — route work to the right model/agent via execution profiles
+- **Dispatch** — route work to the right model/agent via `brain-subagent-dispatch` / `brain-review-dispatch`
+
+### Optional add-ons (enable if the workflow fits)
+
+- **Handoff system** — multi-seat lane orchestration at `brain/ops/handoffs/` (see MANUAL §5). Skip if you run a single-seat brain.
+- **Services** — `brain-commands`, `brain-monitor`, `brain-clippy` (Ollama-powered AI assistant, requires local Ollama), `brain-agent`. Each is independent; enable only what you use.
+- **Ollama integration** — local AI features for `brain-clippy` and `brain-agent`.
+
+### Compatibility / deprecated (retained for transition only)
+
+- **Codex-handoff CLI** (`codex-handoff`, `codex-claude-handoff`, `codex-state-pack`) — legacy sidecar flow, superseded by `brain-review-dispatch`. Headers carry `[DEPRECATED]`; defaults point at brain-native paths.
+- **Legacy codex-lab handoff store** — accessible via `CODEX_LAB_PATH` / `HANDOFF_ROOT` env overrides only. Not a default; for users migrating from the pre-retirement layout.
 
 ## 5-minute setup
 
