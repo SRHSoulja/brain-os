@@ -325,6 +325,7 @@ def compile_pack(filepath):
             if pt.get("notes"):
                 lines.append(f"    Lesson: {pt['notes'][:100]}")
     lines.append("Rules: Follow Brain safety rules (VERDICT_GATE, atomic writes, locking). Do not modify files outside task scope without asking.")
+    lines.append("Tool resolution: before invoking a tool by description, search brain/wiki/tools/MAP.md + the tool registry + completed task titles. One exact match → use it; multiple → ask. (Resolve Before Assuming.)")
     lines.append(f"When done: {completion_command}")
     execution_instructions = "\n".join(lines)
 

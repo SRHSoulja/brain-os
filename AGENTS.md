@@ -18,6 +18,9 @@ Canonical close command: `brain-meditate`
 - **No implicit execution:** No background processes without explicit operator invocation.
 - **Ask before building:** Stop and confirm when asked to "find better solutions" or similar.
 - **Prefer reversible actions.** Flag destructive operations before running them.
+- **Session close is not optional.** Codex has no Stop/SessionEnd hook — always close with `brain-meditate --agent codex`. That's how Codex gets the same session-end commit sweep Claude and Gemini receive automatically.
+- **Edit/Write hook coverage is ADVISORY on Codex.** Codex hooks only fire on Bash; file-write gates cannot physically block non-Bash writes. Follow the rules yourself.
+- **Cross-seat hard rules apply.** Discord Reply Gate, 1M-model authorization, and Resolve-Before-Assuming tool lookup are the same across Claude/Codex/Gemini. See `brain/governance/multi_ai_rules.md §9`.
 
 ## Key paths
 

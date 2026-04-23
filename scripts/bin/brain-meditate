@@ -18,6 +18,9 @@
 #   6b. session-digest              (agent-aware session capture)
 #   6b.5 terminal-monitor cleanup
 #   6b.6 promptbox-archive             (archive executed terminal digests)
+#   6b.7 stop-hook-sweep            (run brain-session-end-commit for parity;
+#                                    idempotent via 60s debounce for Claude/Gemini,
+#                                    deterministic end-gate for Codex)
 #   6c. seal-state                  (DURABILITY: commit + push)
 #   6d. checkpoint                  (recovery point)
 #   6f. post-seal (Claude only)     (external repo commits)
@@ -403,6 +406,25 @@ if [[ -x "$TOOLS/brain-promptbox-archive" ]]; then
   fi
 else
   record_stage "promptbox-archive" "SKIP" "tool not found"
+fi
+
+# ── 6b.7 stop-hook-sweep (parity: run the same commit helper that Claude's
+# Stop hook and Gemini's AfterAgent hook invoke). Codex has no native
+# session-end event surface, so meditate is Codex's only deterministic path
+# to this sweep. The helper is idempotent (60s debounce inside
+# brain-session-end-commit), so this runs safely for all seats. Skips
+# gracefully if the helper is absent in minimal installs.
+_STOP_HOOK="$BRAIN/scripts/hooks/brain-session-end-commit"
+if $DRY_RUN; then
+  record_stage "stop-hook-sweep" "SKIP" "dry-run"
+elif [[ -x "$_STOP_HOOK" ]]; then
+  if "$_STOP_HOOK" >/dev/null 2>&1; then
+    record_stage "stop-hook-sweep" "PASS" "brain-session-end-commit ran (debounced if recent)"
+  else
+    record_stage "stop-hook-sweep" "WARN" "brain-session-end-commit exit non-zero (non-fatal)"
+  fi
+else
+  record_stage "stop-hook-sweep" "SKIP" "brain-session-end-commit not installed"
 fi
 
 # ── 6c. seal-state (DURABILITY) ─────────────────────────────

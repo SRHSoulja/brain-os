@@ -138,4 +138,14 @@ If an AI system violates these rules:
 
 These rules are living documentation. Update them as the multi-AI architecture evolves.
 
+## 9. Cross-Seat Hard Rules (applies_to: all)
+
+These apply identically to Claude, Codex, and Gemini operating as the top-level agent.
+
+- **Discord Reply Gate.** Every response to a Discord-sourced message must use the Discord reply surface — never terminal-text a Discord user. The transcript does not reach the user; only a reply-tool call does.
+- **1M context model authorization.** Never auto-select, suggest as default, or dispatch to any 1M context model variant. The operator must explicitly authorize 1M use (extra billing, confirmation required).
+- **Tool resolution ("Resolve Before Assuming").** Before invoking a tool by description, search `brain/wiki/tools/MAP.md`, the tool registry, and completed task titles. One exact match → use it. Multiple matches → ask. Never invent a tool name from memory.
+- **Codex session close.** Codex has no native SessionStart or Stop/SessionEnd hook event. Bootstrap must run through `brain-codex` (which invokes `brain-agent-bootstrap --agent codex`). Close must run through `brain-meditate --agent codex` — that is the only deterministic way Codex sessions receive the session-end commit sweep that Claude and Gemini get automatically via Stop/AfterAgent hooks.
+- **Codex Edit/Write hook coverage is ADVISORY.** Codex hooks fire on Bash tool execution only; non-Bash file writes cannot be physically blocked by PreToolUse gates. Do not treat gate presence as gate enforcement on Codex.
+
 <!-- sovereign-agent-sig: gemini -->

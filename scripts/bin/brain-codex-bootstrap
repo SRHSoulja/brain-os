@@ -17,6 +17,23 @@ OPS="$BRAIN/brain/ops/tasks"
 echo "=== Codex Bootstrap ==="
 echo "Date: $(date -Iseconds)"
 
+# Codex has no native SessionStart hook event, so seat claim / SESSION_START /
+# heartbeat / verdict must run here — this is Codex's functional equivalent
+# of the Claude/Gemini SessionStart hook. Skips cleanly if the launcher
+# already bootstrapped (BRAIN_BOOTSTRAP_DONE=1).
+if [[ "${BRAIN_BOOTSTRAP_DONE:-0}" != "1" ]]; then
+  echo "[0/4] Agent bootstrap (seat claim + SESSION_START + heartbeat)"
+  if command -v brain-agent-bootstrap >/dev/null 2>&1; then
+    brain-agent-bootstrap --agent codex --quiet >/dev/null 2>&1 || \
+      echo "  [warn] brain-agent-bootstrap failed (non-fatal)"
+  elif [[ -x "$BRAIN/scripts/bin/brain-agent-bootstrap" ]]; then
+    "$BRAIN/scripts/bin/brain-agent-bootstrap" --agent codex --quiet >/dev/null 2>&1 || \
+      echo "  [warn] brain-agent-bootstrap failed (non-fatal)"
+  else
+    echo "  [warn] brain-agent-bootstrap not found — seat claim skipped"
+  fi
+fi
+
 echo "[1/4] Refresh session surfaces"
 if command -v brain-resume >/dev/null 2>&1; then
   brain-resume >/dev/null || true

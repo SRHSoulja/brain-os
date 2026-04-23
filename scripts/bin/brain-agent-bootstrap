@@ -372,6 +372,19 @@ if [[ "$AGENT" == "gemini" ]]; then
   _log ""
 fi
 
+# ── Codex Partial Coverage Banner ────────────────────────────────────
+# Codex's hook surface only fires on Bash tool execution. Edit/Write and
+# WebFetch PreToolUse gates are therefore ADVISORY ONLY on Codex — they
+# cannot physically block non-Bash file writes. Surfaced here so the seat
+# operator cannot mistake gate presence for gate enforcement. Uses echo >&2
+# to ensure disclosure appears even under --quiet.
+if [[ "$AGENT" == "codex" ]]; then
+  echo "Codex Hook Coverage:" >&2
+  echo "  [warn] Edit/Write and WebFetch PreToolUse gates are ADVISORY ONLY" >&2
+  echo "  (Codex hooks fire on Bash only; non-Bash writes are not blocked)." >&2
+  echo "  See brain/governance/multi_ai_rules.md Cross-Seat Hard Rules." >&2
+fi
+
 # ── Timing summary ──────────────────────────────────────────────────
 
 TOTAL_MS=$(_ms_since "$BOOTSTRAP_START")
