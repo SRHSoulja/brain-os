@@ -195,14 +195,19 @@ fi
 
 # ── Repo states ─────────────────────────────────────────────────────
 REPO_STATES=""
-for repo_entry in \
-  "$HOME/gmgn-brain|gmgn-brain" \
-  "$HOME/gmgn-brain/scripts|tools" \
-  "$HOME/2026Projects/clip-the-intern|clip-the-intern" \
-  "$HOME/2026Projects/xbot|xbot" \
-  "$HOME/2026Projects/strikes|strikes" \
-  "$HOME/2026Projects/arcbot|arcbot" \
-; do
+# Default: status-check the brain repo and its scripts dir.
+# Operators with additional repos can extend this list via the
+# BRAIN_CHECKPOINT_REPOS env var (newline-separated "path|name" entries).
+_REPOS=(
+  "$HOME/gmgn-brain|gmgn-brain"
+  "$HOME/gmgn-brain/scripts|tools"
+)
+if [[ -n "${BRAIN_CHECKPOINT_REPOS:-}" ]]; then
+  while IFS= read -r _entry; do
+    [[ -n "$_entry" ]] && _REPOS+=("$_entry")
+  done <<< "$BRAIN_CHECKPOINT_REPOS"
+fi
+for repo_entry in "${_REPOS[@]}"; do
   rpath="${repo_entry%%|*}"
   rname="${repo_entry##*|}"
   REPO_STATES+="$(repo_status "$rpath" "$rname")

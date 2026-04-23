@@ -1217,6 +1217,23 @@ Stance profiles (`auditor-skeptic`, `adversarial-critic`, `systems-architect`, `
 See `brain/wiki/tools/skill-registry.md` for full skill/bundle list and chaining SOP.
 See `brain/wiki/tools/brain-subagent-dispatch.md` for full dispatch usage.
 
+**Sub-agents are stateless executors.** A dispatched sub-agent has no
+session ownership and no lifecycle authority. Lifecycle commands —
+`brain-meditate`, `brain-checkpoint`, `brain-handoff`, and the
+`brain-session-end-commit` Stop hook — refuse to run when
+`BRAIN_DISPATCH_ACTIVE=1` is set in the environment, which dispatch
+wrappers export. The operator's session owns lifecycle; sub-agents
+return a result and stop.
+
+**Profile-scoped tool/context isolation (framework concept).** Execution
+profiles can declare a minimal tool surface for the sub-agent — which
+MCP servers are reachable, which CLI extensions to load, which working
+directory to neutralize project-scoped hooks, and a runtime policy file
+that excludes denied tools from the agent's tool registry entirely (both
+a security and a context-cost win). The mechanism is generic; specific
+profile contents are operator-defined and live outside the public
+framework.
+
 ### 9.14 1M context model authorization (applies_to: all)
 
 Models with `"context_window": 1000000` (1M variants, e.g. `claude-opus-4-6-1m`,

@@ -87,12 +87,17 @@ rm -f "$BRAIN/brain/ops/.ve-session.lock" 2>/dev/null || true
 _VE_MARKER="$BRAIN/brain/ops/.session-remote-handoff"
 _VE_LOOP_EXIT="$BRAIN/brain/ops/.session-ve-handoff"
 if [[ -f "$_VE_MARKER" && ! -f "$_VE_LOOP_EXIT" ]]; then
-    _VE_HOST="villain-remote"
-    _VE_TRIGGER="\$HOME/gmgn-brain/brain/ops/.ve-handoff-trigger"
-    ssh -o ConnectTimeout=5 "$_VE_HOST" \
-        "mkdir -p \$HOME/gmgn-brain/brain/ops && touch $_VE_TRIGGER" \
-        2>/dev/null \
-        && echo "[session-end] VE trigger touched on $_VE_HOST" \
-        || echo "[session-end] VE trigger failed (VE may be offline)"
+    # VE (Villain Edition) handoff is a multi-machine workflow. Set
+    # BRAIN_VE_HOST to the SSH alias of the remote machine that should
+    # receive the handoff trigger. Unset → no remote handoff (safe default).
+    _VE_HOST="${BRAIN_VE_HOST:-}"
+    if [[ -n "$_VE_HOST" ]]; then
+        _VE_TRIGGER="\$HOME/gmgn-brain/brain/ops/.ve-handoff-trigger"
+        ssh -o ConnectTimeout=5 "$_VE_HOST" \
+            "mkdir -p \$HOME/gmgn-brain/brain/ops && touch $_VE_TRIGGER" \
+            2>/dev/null \
+            && echo "[session-end] VE trigger touched on $_VE_HOST" \
+            || echo "[session-end] VE trigger failed (VE may be offline)"
+    fi
     rm -f "$_VE_MARKER"
 fi
