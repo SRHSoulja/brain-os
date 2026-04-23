@@ -68,7 +68,7 @@ def classify_tags(basename, fm, body):
     if 'memory' in text or 'memor' in text: tags.append('memory')
     if 'task' in text: tags.append('task-system')
     if any(w in text for w in ['gate', 'block', 'enforce']): tags.append('enforcement')
-    if any(w in text for w in ['ve ', 'villain', 'dual-seat']): tags.append('ve')
+    if 'dual-seat' in text: tags.append('multi-seat')
     if any(w in text for w in ['codex', 'gemini', 'multi-agent']): tags.append('multi-agent')
     if any(w in text for w in ['content', 'publish', 'blog']): tags.append('content')
     if any(w in text for w in ['safety', 'credential', 'never delete']): tags.append('safety')

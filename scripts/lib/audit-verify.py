@@ -241,7 +241,8 @@ def main():
             pass
 
     if needs_verification:
-        audits_dir = os.path.join(os.environ.get("HOME", ""), "codex-lab", "audits")
+        codex_lab = os.environ.get("CODEX_LAB_PATH") or os.path.join(os.environ.get("HOME", ""), "codex-lab")
+        audits_dir = os.path.join(codex_lab, "audits")
         dispatch_reviews_dir = os.path.join(brain, "work", "outputs", "reviews")
         verification_found = False
         verification_sources = []

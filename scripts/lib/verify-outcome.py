@@ -54,11 +54,6 @@ def extract_urls(text):
     # Full URLs
     for m in re.finditer(r'(https?://[^\s,\)]+)', text):
         urls.append(m.group(1).rstrip('.'))
-    # Domain/path patterns
-    for m in re.finditer(r'(gmgnrepeat\.com/[^\s,\)]*)', text):
-        url = m.group(1).rstrip('.')
-        if not url.startswith('http'):
-            urls.append(f'https://{url}')
     # Endpoint paths like /health, /api/
     for m in re.finditer(r'(/(?:health|api|status)\S*)\s', text):
         urls.append(m.group(1))

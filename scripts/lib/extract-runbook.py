@@ -265,7 +265,7 @@ def generate_runbook(data):
         elif summary_text:
             # Extract URLs from summary as deployment targets
             import re as _re
-            urls = _re.findall(r'((?:gmgnrepeat\.com|https?://)\S+)', summary_text)
+            urls = _re.findall(r'(https?://\S+)', summary_text)
             if urls:
                 lines.append(f"2. Target: {urls[0]}")
         if criteria_met:
