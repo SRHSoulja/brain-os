@@ -13,7 +13,7 @@ TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 . "$TOOLS/lib/brain-paths.sh"
 _require_local
 OPS_DIR="$_OPS_TASKS_DIR"
-HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${BRAIN_DIR:-$HOME/brain}/brain/ops/handoffs/handoff-lanes.json}"
 . "$TOOLS/lib/frontmatter.sh"
 
 # ── Parse arguments ───────────────────────────────────────────────

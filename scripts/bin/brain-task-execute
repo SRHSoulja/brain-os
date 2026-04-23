@@ -388,7 +388,7 @@ if $NEEDS_CLAIM; then
   echo "[2/5] Claiming $TASK_ID..."
   QUEUE_FILE="$OPS_DIR/queue/${TASK_ID}.md"
   ACTIVE_TARGET="$OPS_DIR/active/${TASK_ID}.md"
-  HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+  HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${BRAIN_DIR:-$HOME/brain}/brain/ops/handoffs/handoff-lanes.json}"
   SRC_LANE_ID=$(fm_get "$QUEUE_FILE" "handoff_lane_id")
 
   # ── One-active-task-per-agent enforcement ──────────────────────

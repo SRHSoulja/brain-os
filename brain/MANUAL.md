@@ -391,31 +391,37 @@ mandatory gating rules (Validate-then-Mutate) found in:
 
 ## 5. Handoff Contract
 
-The handoff system lives in `${CODEX_LAB_PATH:-~/codex-lab}/` (outside this repo).
-It generates deterministic artifacts from a lane registry so seats can
-execute pending lanes only, filter by priority, and seed tasks without
-opening run state.
+The handoff system is brain-native. Handoff state lives at
+`$BRAIN_DIR/brain/ops/handoffs/` (default `~/brain/brain/ops/handoffs/`).
+The system generates deterministic artifacts from a lane registry so
+seats can execute pending lanes only, filter by priority, and seed tasks
+without opening run state.
+
+**Legacy bridge (compatibility-only):** scripts honor `HANDOFF_REGISTRY`,
+`HANDOFF_ROOT`, and `CODEX_LAB_PATH` env overrides for reading from a
+legacy `~/codex-lab/handoffs/` location. These are opt-in only; defaults
+point at the brain-native store.
 
 **Name disambiguation.** `/brain-handoff` as a slash command (and its Codex
 emulation) invokes the handoff **system**. `brain-handoff` as a bin tool at
-`~/bin/brain-handoff` is a separate legacy session-notes
-tool and is **not** the orchestration entrypoint. When this manual says
-"handoff system" or "`/brain-handoff`", it means the `${CODEX_LAB_PATH:-~/codex-lab}/`
-orchestration path.
+`~/bin/brain-handoff` is a separate legacy session-notes tool and is
+**not** the orchestration entrypoint. When this manual says "handoff
+system" or "`/brain-handoff`", it means the brain-native orchestration
+path rooted at `brain/ops/handoffs/`.
 
 ### 5.1 Runtime paths
 
 | Path | Purpose |
 |---|---|
-| `${CODEX_LAB_PATH:-~/codex-lab}/handoffs/handoff-lanes.json` | Lane registry (canonical). |
-| `${CODEX_LAB_PATH:-~/codex-lab}/handoffs/active-next-handoff.md` | **Execution source.** Generated execution ledger. |
-| `${CODEX_LAB_PATH:-~/codex-lab}/handoffs/active-next-handoff-prompt.txt` | Generated prompt. |
-| `${CODEX_LAB_PATH:-~/codex-lab}/handoffs/structured-handoff.md` | **Operator decision guide.** Distinct from the execution source above; use this for picking what to run under time or credit constraints, not for execution itself. |
+| `$BRAIN_DIR/brain/ops/handoffs/handoff-lanes.json` | Lane registry (canonical, brain-native). |
+| `$BRAIN_DIR/brain/ops/handoffs/active-next-handoff.md` | **Execution source.** Generated execution ledger. |
+| `$BRAIN_DIR/brain/ops/handoffs/active-next-handoff-prompt.txt` | Generated prompt. |
+| `$BRAIN_DIR/brain/ops/handoffs/structured-handoff.md` | **Operator decision guide.** Distinct from the execution source above; use this for picking what to run under time or credit constraints, not for execution itself. |
 | `~/bin/brain-handoff-run-all` | Run-all helper. |
 | `~/bin/brain-handoff-seed` | Seed helper. |
 | `~/bin/brain-handoff-validate` | Refresh + validate. |
 | `~/bin/brain-handoff-parity-gate` | Operational parity gate (start/close). |
-| `${CODEX_LAB_PATH:-~/codex-lab}/experiments/brain-handoff-safety-gate.sh` | Pre-run safety gate. |
+| `~/codex-lab/handoffs/*` | **Legacy, compatibility-only.** Read via `CODEX_LAB_PATH` / `HANDOFF_ROOT` env overrides. No live writes. |
 
 ### 5.2 Modes
 

@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# codex-handoff — Create, inspect, and manage Codex↔Claude handoff packets in the handoff inbox
+# codex-handoff — [DEPRECATED] Codex↔Claude handoff packet manager; superseded by brain-review-dispatch. Retained compatibility-only.
 set -euo pipefail
 exec python3 "${BRAIN_DIR:-$HOME/brain}/scripts/lib/codex/codex_handoff.py" "$@"

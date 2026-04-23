@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# codex-claude-handoff — Generate a Claude implementation prompt from the current Codex handoff state
+# codex-claude-handoff — [DEPRECATED] Codex→Claude implementation prompt generator; superseded by brain-review-dispatch. Retained compatibility-only.
 set -euo pipefail
 exec python3 "${BRAIN_DIR:-$HOME/brain}/scripts/lib/codex/codex_claude_handoff.py" "$@"

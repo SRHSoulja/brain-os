@@ -17,7 +17,7 @@ TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
 OPS_DIR="$BRAIN/brain/ops/tasks"
 . "$TOOLS/lib/frontmatter.sh"
 
-HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${CODEX_LAB_PATH:-$HOME/codex-lab}/handoffs/handoff-lanes.json}"
+HANDOFF_REGISTRY="${HANDOFF_REGISTRY:-${BRAIN_DIR:-$HOME/brain}/brain/ops/handoffs/handoff-lanes.json}"
 MAX_PRIORITY="${BRAIN_NEXT_TASK_MAX_PRIORITY:-}"
 declare -a ONLY_PRIORITIES=()
 if [[ -n "${BRAIN_NEXT_TASK_PRIORITIES:-}" ]]; then
