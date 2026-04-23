@@ -107,42 +107,13 @@ These are not tasks. They are permanent permissions for specific, narrow, determ
 
 ## SO-006: Restart VE core PM2 services on crash detection
 
-**Trigger:** brain-health-sweep (with `--host=remote`) detects that brain-agent, brain-monitor, or brain-dashboard fail their HTTP health probe
-
-**Action:** Execute `pm2 restart <service>` for each failed service, then verify PM2 reports the process as `online` (HTTP health is checked on the next sweep cycle, since services like brain-agent take 20s+ to warm up)
-
-**Scope:** Only the three core VE PM2 services: brain-agent (port 8798), brain-monitor (port 8799), brain-dashboard (port 8800). Ollama is Windows-side and cannot be restarted from WSL -- it is reported but not acted on. The reverse-tunnel service is excluded (autossh manages its own reconnection).
-
-**Stop condition:** The same service has been restarted 3+ times in 24 hours (fix not holding -- escalate to human via Discord alert). Verification failure after restart is logged but does not block subsequent services. Rate state tracked in `work/logs/.ve-restart-timestamps`.
-
-**Write surfaces:** work/logs/.ve-restart-timestamps (rate tracking), work/logs/health-sweep.log (via --log), events.log (via existing remedy logging)
-
-**Why this is safe:** PM2 restart is the standard recovery for Node.js service crashes. These services are stateless HTTP servers -- restart has no data loss risk. The 3x/24h rate limit prevents blind retry loops. Ollama (the only stateful service on VE) is explicitly excluded. The restart runs on the same machine where the services live, so there is no remote execution risk. Each restart is verified by re-probing the health endpoint.
+**Public isolation:** VE/dual-seat PM2 recovery is private-instance infrastructure and is intentionally excluded from public `brain-os`.
 
 ---
 
 ## SO-007: Brain-to-Body remote command relay
 
-**Trigger:** `brain-ve-run <command-name>` called from a laptop Brain tool or human operator during a Claude Code session
-
-**Action:** Execute the fixed command string mapped to `<command-name>` on a remote seat via SSH. The relay script (`brain-remote-relay`) validates the name against a hardcoded whitelist, enforces a 60-second per-command rate limit, and executes the resolved command.
-
-**Scope:** Only the following commands are authorized:
-
-| Name | Resolves to | Effect |
-|------|-------------|--------|
-| `brain-sync` | `brain-sync` | Pull repos, commit agent outputs, auto-deploy |
-| `health-sweep` | `brain-health-sweep --host=remote --heal --log` | Health check with SO-001/SO-006 healing |
-| `spotcheck` | `brain-spotcheck` | Clip knowledge quality check |
-| `export-deploy` | `brain-export --deploy` | Rebuild and deploy knowledge JSON to production |
-
-**Explicitly excluded:** Task execution, PM2 control, arbitrary shell commands, any command not in the table above. No argument passthrough -- the command name is the only input. Adding a new command requires modifying `brain-remote-relay` source code AND updating this table.
-
-**Stop condition:** Rate limit rejection (same command within 60s). SSH connection failure (tunnel down). Invalid or unrecognized command name.
-
-**Write surfaces:** `~/.brain-remote-relay/` on the remote seat (rate timestamp files only). All other writes are performed by the whitelisted commands themselves within their own documented surfaces.
-
-**Why this is safe:** The whitelist is hardcoded (not a config file that could be injected). No arguments are passed through — the relay resolves a fixed name to a fixed string. The rate limit prevents accidental loops. SSH key auth is the only access path. Each whitelisted command is already safe to run at any time (idempotent or additive). The relay cannot be expanded without a source code change, which requires a human-approved commit.
+**Public isolation:** Remote-seat relay flows are private-instance transport mechanics and are intentionally excluded from public `brain-os`.
 
 ---
 

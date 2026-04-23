@@ -14,7 +14,7 @@ TOOLS="${TOOLS:-${BRAIN_DIR:-$HOME/brain}/scripts}"
 # Class mappings (deterministic)
 _READONLY_LOW_RISK="brain-resume brain-state-check brain-search brain-wiki brain-core-memory-status brain-token-budget-check brain-token-report brain-context brain-clip-drift brain-spotcheck brain-proof-status brain-discord-bridge-status brain-discord-bridge-next brain-closeout-gate brain-codex-resume"
 _STATE_WRITE_CONTROLLED="brain-task-admit brain-task-execute brain-task-complete brain-task-quick brain-checkpoint brain-memory-promote-core brain-core-memory-capture brain-core-memory-resolve brain-seat-claim brain-heartbeat brain-content-brief brain-discord-bridge-enqueue brain-discord-bridge-done brain-discord-bridge-reply brain-proof-start brain-proof-log brain-proof-verify brain-codex-meditate"
-_EXEC_EXTERNAL="brain-ve-activate brain-ve-deactivate brain-sync brain-export"
+_EXEC_EXTERNAL="brain-sync brain-export"
 _CONTROL_CRITICAL="brain-meditate brain-cron-update safe-rm"
 
 APPROVAL_CLASS=""
