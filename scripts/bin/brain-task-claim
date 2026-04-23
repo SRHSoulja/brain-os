@@ -58,6 +58,51 @@ if [[ -n "$_EARLY_ESTIMATE" ]] && ! [[ "$_EARLY_ESTIMATE" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# ── Session contract gate (agent-agnostic) ─────────────────────────
+# Enforces: sentinel present, matches live session, contract unchanged,
+# sentinel agent matches claimant.
+_SENTINEL="$BRAIN/brain/ops/.session-contract-ack.json"
+_SESSION_FILE="$BRAIN/brain/ops/.active-session.json"
+if [[ ! -f "$_SENTINEL" ]]; then
+  echo "SESSION_CONTRACT_GATE: missing $_SENTINEL — start a managed session (brain-claude / brain-codex / brain-gemini)." >&2
+  exit 1
+fi
+if [[ ! -f "$_SESSION_FILE" ]]; then
+  echo "SESSION_CONTRACT_GATE: no active session (.active-session.json missing)." >&2
+  exit 1
+fi
+_GATE=$(python3 - "$_SENTINEL" "$_SESSION_FILE" "$AGENT" "$BRAIN" <<'PYEOF'
+import json, sys, hashlib, os
+sent_p, sess_p, agent_arg, brain = sys.argv[1:5]
+try:
+    s = json.load(open(sent_p))
+    a = json.load(open(sess_p))
+except Exception as e:
+    print(f"FAIL read: {e}"); sys.exit(0)
+if s.get("session_id") != a.get("session_id"):
+    print(f"FAIL session_id mismatch: sentinel={s.get('session_id')} active={a.get('session_id')}"); sys.exit(0)
+if s.get("agent") != a.get("agent"):
+    print(f"FAIL agent mismatch: sentinel={s.get('agent')} active={a.get('agent')}"); sys.exit(0)
+if agent_arg and s.get("agent") and agent_arg != s["agent"]:
+    print(f"FAIL claimant mismatch: --by={agent_arg} sentinel={s.get('agent')}"); sys.exit(0)
+files = s.get("contract_files") or ["brain/MANUAL.md", "brain/index/session-start-contract.compact.md"]
+h = hashlib.sha256()
+for rel in files:
+    p = os.path.join(brain, rel)
+    if not os.path.isfile(p):
+        print(f"FAIL contract file missing: {rel}"); sys.exit(0)
+    h.update(open(p,'rb').read())
+if h.hexdigest() != s.get("contract_hash"):
+    print(f"FAIL contract drift: expected={s.get('contract_hash')} actual={h.hexdigest()}"); sys.exit(0)
+print("OK")
+PYEOF
+)
+if [[ "$_GATE" != "OK" ]]; then
+  echo "SESSION_CONTRACT_GATE: $_GATE" >&2
+  echo "  Re-bootstrap the session (brain-claude / brain-codex / brain-gemini) and retry." >&2
+  exit 1
+fi
+
 # ── Early existence check (before gate, to fail fast) ─────────────
 TASK_FILE="$OPS_DIR/queue/${TASK_ID}.md"
 if [[ ! -f "$TASK_FILE" ]]; then
@@ -246,6 +291,29 @@ fi
 # ── ATOMIC RENAME + SOURCE DELETE ─────────────────────────────────
 mv "$ACTIVE_TMP" "$ACTIVE_TARGET"
 ACTIVE_TMP=""  # prevent cleanup from deleting renamed file
+
+# ── Inject Execution Brief ────────────────────────────────────────
+# Agent-facing checklist appended to the active task file. The agent
+# reads this as part of normal task comprehension; no vendor hook
+# required. brain-task-verify enforces the corresponding Attestation.
+{
+  echo ""
+  echo "## Execution Brief"
+  echo ""
+  echo "_Injected by brain-task-claim. Agent-facing checklist; do not edit by hand._"
+  echo ""
+  echo "- session_id: $(python3 -c "import json; print(json.load(open('$_SENTINEL')).get('session_id',''))" 2>/dev/null)"
+  echo "- agent: $AGENT"
+  echo "- seat: $(python3 -c "import json; print(json.load(open('$_SENTINEL')).get('seat',''))" 2>/dev/null)"
+  echo "- contract_hash: $(python3 -c "import json; print(json.load(open('$_SENTINEL')).get('contract_hash',''))" 2>/dev/null)"
+  echo "- claimed_at: $CLAIMED_AT"
+  echo ""
+  echo "**Required before calling brain-task-verify:**"
+  echo ""
+  echo "1. Run: brain-task-attest $TASK_ID --files \"<comma-list>\" --checks \"<cmd1;;cmd2>\" --markers \"<m1,m2>\""
+  echo "2. Ensure every declared check exits 0 (verify will re-run them)."
+  echo "3. Ensure every file you changed is listed in --files (verify compares against git diff)."
+} >> "$ACTIVE_TARGET"
 
 # Verify destination exists before removing source
 if [[ ! -f "$ACTIVE_TARGET" ]]; then

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# brain-task-attest — Append structured Attestation block to an active task.
+# Usage: brain-task-attest <TASK-ID> --files "<f1,f2,...>" --checks "<cmd1;;cmd2;;...>" [--markers "<m1,m2,...>"]
+#   --files   : comma-separated paths (relative to BRAIN) the task modified
+#   --checks  : ';;' (two semicolons) separated shell commands verify will re-run
+#   --markers : optional comma-separated success markers the agent expected to emit
+#
+# Fails closed if task is not in active/, sentinel/session missing, or a prior
+# Attestation block already exists. Single atomic write.
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${BRAIN_DIR:-$HOME/brain}/scripts"
+. "$TOOLS/lib/brain-paths.sh"
+_require_local
+OPS_DIR="$_OPS_TASKS_DIR"
+
+TASK_ID=""; FILES=""; CHECKS=""; MARKERS=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --files)   FILES="$2"; shift 2 ;;
+    --checks)  CHECKS="$2"; shift 2 ;;
+    --markers) MARKERS="$2"; shift 2 ;;
+    -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+    *)  [[ -z "$TASK_ID" ]] && TASK_ID="$1" || { echo "Unexpected arg: $1" >&2; exit 1; }; shift ;;
+  esac
+done
+
+[[ -z "$TASK_ID" || -z "$FILES" || -z "$CHECKS" ]] && {
+  echo "Usage: brain-task-attest <TASK-ID> --files <list> --checks <cmd1;;cmd2> [--markers <list>]" >&2
+  exit 1
+}
+
+ACTIVE="$OPS_DIR/active/${TASK_ID}.md"
+[[ -f "$ACTIVE" ]] || { echo "Error: $TASK_ID not in active/" >&2; exit 1; }
+
+SENT="$BRAIN/brain/ops/.session-contract-ack.json"
+SESS="$BRAIN/brain/ops/.active-session.json"
+[[ -f "$SENT" && -f "$SESS" ]] || { echo "Error: session sentinel or active-session missing" >&2; exit 1; }
+
+if grep -q '^## Attestation' "$ACTIVE"; then
+  echo "Error: $TASK_ID already has an Attestation block. Remove it manually if re-attesting." >&2
+  exit 1
+fi
+
+SID=$(python3 -c "import json; print(json.load(open('$SENT')).get('session_id',''))")
+AGENT=$(python3 -c "import json; print(json.load(open('$SENT')).get('agent',''))")
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+PAYLOAD=$(python3 - "$SID" "$AGENT" "$NOW" "$FILES" "$CHECKS" "$MARKERS" <<'PYEOF'
+import json, sys
+sid, agent, ts, files, checks, markers = sys.argv[1:7]
+data = {
+  "session_id": sid,
+  "attested_by": agent,
+  "attested_at": ts,
+  "files_changed": [x.strip() for x in files.split(",") if x.strip()],
+  "checks_declared": [x.strip() for x in checks.split(";;") if x.strip()],
+  "markers": [x.strip() for x in markers.split(",") if x.strip()] if markers else [],
+}
+print(json.dumps(data, indent=2))
+PYEOF
+)
+
+TMP=$(mktemp "${ACTIVE}.XXXXXX")
+{
+  cat "$ACTIVE"
+  echo ""
+  echo "## Attestation"
+  echo ""
+  echo "_Written by brain-task-attest. Do not edit by hand._"
+  echo ""
+  echo '```json'
+  echo "$PAYLOAD"
+  echo '```'
+} > "$TMP"
+mv "$TMP" "$ACTIVE"
+
+echo "attested: $TASK_ID by $AGENT ($(echo "$FILES" | tr ',' ' ' | wc -w) files, $(echo "$CHECKS" | awk -F';;' '{print NF}') checks)"

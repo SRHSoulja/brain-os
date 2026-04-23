@@ -107,6 +107,81 @@ if [[ "$AGENT" == "gemini" ]]; then
   fi
 fi
 
+# 3c. Attestation gate (agent-agnostic, fail-closed) ────────────────
+ATT_JSON=$(python3 - "$COMPLETED_FILE" <<'PYEOF'
+import re, json, sys
+path = sys.argv[1]
+txt = open(path).read()
+m = re.search(r'##\s+Attestation\b.*?```json\s*(\{.*?\})\s*```', txt, flags=re.DOTALL|re.IGNORECASE)
+if not m:
+    print(""); sys.exit(0)
+try:
+    print(json.dumps(json.loads(m.group(1))))
+except Exception:
+    print(""); sys.exit(0)
+PYEOF
+)
+if [[ -z "$ATT_JSON" ]]; then
+  echo "VERIFY_ATTESTATION_MISSING: no well-formed Attestation block in $TASK_ID. Run brain-task-attest before verify." >&2
+  exit 1
+fi
+
+ATT_BY=$(echo "$ATT_JSON"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('attested_by',''))")
+ATT_FILES=$(echo "$ATT_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).get('files_changed',[])))")
+ATT_CHECKS=$(echo "$ATT_JSON" | python3 -c "import json,sys; print('\t'.join(json.load(sys.stdin).get('checks_declared',[])))")
+
+# 3c.i — Claimant/attestor identity match
+FM_OWNER=$(python3 -c "
+import sys, yaml
+txt=open('$COMPLETED_FILE').read()
+print(yaml.safe_load(txt.split('---')[1]).get('owner','') if '---' in txt else '')
+" 2>/dev/null || echo "")
+if [[ -n "$FM_OWNER" && "$ATT_BY" != "$FM_OWNER" ]]; then
+  echo "VERIFY_IDENTITY_MISMATCH: attested_by=$ATT_BY owner=$FM_OWNER" >&2
+  exit 1
+fi
+
+# 3c.ii — Re-run every declared check. All must exit 0.
+if [[ -n "$ATT_CHECKS" ]]; then
+  _fail=0
+  while IFS= read -r _cmd; do
+    [[ -z "$_cmd" ]] && continue
+    if ! ( cd "$BRAIN" && bash -c "$_cmd" ) >/dev/null 2>&1; then
+      echo "VERIFY_CHECK_FAILED: $_cmd" >&2
+      _fail=1
+    fi
+  done < <(printf '%s\n' "$ATT_CHECKS" | tr '\t' '\n')
+  if [[ "$_fail" -ne 0 ]]; then
+    echo "Audit gate BLOCKED for $TASK_ID: one or more declared checks failed." >&2
+    exit 1
+  fi
+fi
+
+# 3c.iii — git diff must be subset of attested files_changed.
+if [[ -n "$ATT_FILES" ]]; then
+  _diff_base=$(git -C "$BRAIN" log -n 1 --format=%H -- "$COMPLETED_FILE" 2>/dev/null || echo "")
+  if [[ -n "$_diff_base" ]]; then
+    # Exclude task-system bookkeeping files authored by brain-task-complete
+    # (the task's own .md and .completion.json) — they are system-authored,
+    # not agent-authored, and can never appear in Attestation.files_changed.
+    _changed=$(git -C "$BRAIN" diff-tree --no-commit-id --name-only -r "$_diff_base" 2>/dev/null \
+      | grep -v "^brain/ops/tasks/completed/${TASK_ID}\.md$" \
+      | grep -v "^brain/ops/tasks/completed/${TASK_ID}\.completion\.json$" \
+      || true)
+    _extra=$(
+      comm -23 \
+        <(printf '%s\n' "$_changed" | sort -u) \
+        <(printf '%s\n' "$ATT_FILES" | sort -u)
+    )
+    _extra_trim=$(printf '%s\n' "$_extra" | grep -v '^$' || true)
+    if [[ -n "$_extra_trim" ]]; then
+      echo "VERIFY_FILES_UNATTESTED: files touched in commit but not in Attestation.files_changed:" >&2
+      echo "$_extra_trim" | sed 's/^/  /' >&2
+      exit 1
+    fi
+  fi
+fi
+
 # 4. Summon verifier via repo-auditor profile
 echo "[verify] Summoning verifier for $TARGET_IDS (profile: repo-auditor)..."
 QUESTION="Please audit the completion of the following task(s): $TARGET_IDS. 

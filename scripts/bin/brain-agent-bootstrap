@@ -235,6 +235,39 @@ fi
 _record_step "session_start" "$S3"
 _log ""
 
+# ── Session contract sentinel ───────────────────────────────────────
+# Written after session-start so .active-session.json is populated.
+# brain-task-claim / brain-task-verify read this to enforce agent-agnostic
+# session + contract binding. Non-fatal: sentinel write failure logs a
+# warning; claim/verify will fail-closed on missing sentinel.
+_SENTINEL="$BRAIN/brain/ops/.session-contract-ack.json"
+_CONTRACT_FILES=(
+  "$BRAIN/brain/MANUAL.md"
+  "$BRAIN/brain/index/session-start-contract.compact.md"
+)
+_CONTRACT_HASH=""
+if [[ -f "${_CONTRACT_FILES[0]}" && -f "${_CONTRACT_FILES[1]}" ]]; then
+  _CONTRACT_HASH=$(cat "${_CONTRACT_FILES[0]}" "${_CONTRACT_FILES[1]}" | sha256sum | awk '{print $1}')
+fi
+_SESS_ID=$(python3 -c "import json; print(json.load(open('$BRAIN/brain/ops/.active-session.json')).get('session_id',''))" 2>/dev/null || echo "")
+_SENT_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+if [[ -n "$_SESS_ID" && -n "$_CONTRACT_HASH" ]]; then
+  cat > "$_SENTINEL" <<EOF
+{
+  "session_id": "$_SESS_ID",
+  "agent": "$AGENT",
+  "seat": "$SEAT",
+  "contract_hash": "$_CONTRACT_HASH",
+  "contract_files": ["brain/MANUAL.md", "brain/index/session-start-contract.compact.md"],
+  "ts": "$_SENT_TS"
+}
+EOF
+  _log "  sentinel: .session-contract-ack.json (agent=$AGENT)"
+else
+  _log "  [warn] sentinel skipped: session_id=$_SESS_ID contract_hash=${_CONTRACT_HASH:-<missing>}"
+fi
+_log ""
+
 # ── Step 4: Heartbeat ───────────────────────────────────────────────
 
 S4=$(_step_start)
