@@ -2,7 +2,7 @@
 """devlog-to-post.py — Convert a brain devlog markdown file to a blog post PHP artifact.
 
 Reads markdown with YAML frontmatter, converts body to HTML, outputs a PHP
-array file matching the gmgnrepeat.com blog engine format.
+array file matching a generic blog engine format.
 
 Usage:
     python3 devlog-to-post.py <devlog.md> <output_dir>

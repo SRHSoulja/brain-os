@@ -1,5 +1,5 @@
 #!/bin/bash
-# brain-context — Query-aware context assembly for the GM GN Repeat brain
+# brain-context — Query-aware context assembly for the brain
 # Usage:
 #   brain-context "query"                  Preview best context for a query
 #   brain-context --build-search-index     Build deployable search index for Clip

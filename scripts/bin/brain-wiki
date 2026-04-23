@@ -1,5 +1,5 @@
 #!/bin/bash
-# brain-wiki — Knowledge wiki for the GM GN Repeat brain
+# brain-wiki — Knowledge wiki for the brain
 # A unified, searchable, cross-referenced knowledge base that consolidates
 # information from sessions, Discord, devlogs, memories, nodes, and decisions.
 #
@@ -1153,7 +1153,7 @@ case "$CMD" in
     wiki_graph
     ;;
   help|*)
-    echo "brain-wiki -- Knowledge wiki for the GM GN Repeat brain"
+    echo "brain-wiki -- Knowledge wiki for the brain"
     echo ""
     echo "Commands:"
     echo "  search \"query\"        Search all wiki pages"

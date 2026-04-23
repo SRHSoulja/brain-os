@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# brain-session-end-commit — auto-commit uncommitted brain changes on session stop
+# Wired to Claude Code Stop hook. Lightweight, non-blocking, never fails noisily.
+
+set -euo pipefail
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+cd "$BRAIN" || exit 0
+
+# Debounce: skip commit if a session-end commit ran within 60s.
+# Prevents burst commits when the user does rapid /clear restarts.
+_DEBOUNCE_FILE="/tmp/brain-session-end-commit-lock"
+_DEBOUNCE_SECS=60
+if [[ -f "$_DEBOUNCE_FILE" ]]; then
+  _LAST=$(cat "$_DEBOUNCE_FILE" 2>/dev/null || echo 0)
+  _NOW=$(date +%s)
+  if (( _NOW - _LAST < _DEBOUNCE_SECS )); then
+    exit 0
+  fi
+fi
+
+# Nothing to do if tree is clean (ignoring runtime-generated noise paths)
+if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --short 2>/dev/null | grep -v '^?? brain/ops/promptbox\|^?? brain/ops/images')" ]]; then
+  exit 0
+fi
+
+# Stage framework + user-content paths; missing paths are silently skipped.
+# Operators extending the brain can add paths to this list in their own fork.
+git add \
+  .claude/commands/ \
+  scripts/ \
+  brain/MANUAL.md \
+  brain/governance/ \
+  brain/index/ \
+  brain/core-knowledge/ \
+  brain/ops/execution-profiles.json \
+  brain/ops/events.jsonl \
+  brain/ops/events.log \
+  brain/ops/registry/ \
+  brain/ops/tasks/queue/ \
+  brain/ops/tasks/active/ \
+  brain/persona/ \
+  brain/goals/ \
+  brain/wiki/ \
+  work/logs/devlog/ \
+  work/logs/wins-log.md \
+  2>/dev/null || true
+
+# Only commit if something is actually staged
+if ! git diff --cached --quiet; then
+  git commit -m "chore: session-end auto-commit (uncommitted work sealed on Stop)" 2>&1 \
+    | tee -a /tmp/brain-session-end-commit.log >/dev/null || true
+  date +%s > "$_DEBOUNCE_FILE" 2>/dev/null || true
+fi

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# brain-hook-parity-check -- Enforce agent-agnostic hook contract.
+# Output format: LEVEL|CODE|MESSAGE
+
+set -euo pipefail
+
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+SETTINGS="$BRAIN/.claude/settings.local.json"
+EXPECTED_CMD="\$HOME/brain/scripts/hooks/agent-autonomous-hook SessionStart claude-code"
+STOP_EXPECTED_CMD="\$HOME/brain/scripts/hooks/brain-session-end-commit"
+# Approved hook keys: SessionStart (required), Stop (session-end auto-commit),
+# PreToolUse (agent-agnostic guards).
+APPROVED_KEYS="SessionStart Stop PreToolUse"
+
+if [[ ! -f "$SETTINGS" ]]; then
+  echo "DRIFT|HOOK_SETTINGS_MISSING|.claude/settings.local.json missing (run brain-bootstrap-new-user to copy the example)"
+  exit 0
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "STALE|HOOK_PARITY_UNCHECKED|jq missing; cannot verify hook parity"
+  exit 0
+fi
+
+# Verify all present keys are in the approved list
+while IFS= read -r key; do
+  [[ -z "$key" ]] && continue
+  if [[ " $APPROVED_KEYS " != *" $key "* ]]; then
+    echo "DRIFT|HOOK_PARITY_EXTRA_EVENTS|Unapproved hook key: $key (allowed: $APPROVED_KEYS)"
+    exit 0
+  fi
+done < <(jq -r '.hooks | keys_unsorted[]?' "$SETTINGS" 2>/dev/null || true)
+
+# SessionStart must be present
+session_start_present=$(jq -r 'if .hooks | has("SessionStart") then "yes" else "no" end' "$SETTINGS" 2>/dev/null || echo "no")
+if [[ "$session_start_present" != "yes" ]]; then
+  echo "DRIFT|HOOK_PARITY_MISSING|SessionStart hook required but not found"
+  exit 0
+fi
+
+count=$(jq -r '.hooks.SessionStart | length' "$SETTINGS" 2>/dev/null || echo "0")
+if [[ "$count" != "1" ]]; then
+  echo "DRIFT|HOOK_PARITY_MULTIPLE|Expected one SessionStart matcher; found $count"
+  exit 0
+fi
+
+cmd=$(jq -r '.hooks.SessionStart[0].hooks[0].command // ""' "$SETTINGS" 2>/dev/null || true)
+if [[ "$cmd" != "$EXPECTED_CMD" ]]; then
+  echo "DRIFT|HOOK_PARITY_COMMAND|SessionStart hook does not use autonomous hook entrypoint (expected: $EXPECTED_CMD)"
+  exit 0
+fi
+
+echo "OK|HOOK_PARITY|Autonomous hook contract enforced"

@@ -4,7 +4,7 @@ type: "governance"
 status: "active"
 version: "1"
 date: "2026-03-18"
-owner: "Arson"
+owner: "operator"
 ---
 
 # Standing Orders

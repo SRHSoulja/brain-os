@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# agent-autonomous-hook -- Single agent-agnostic hook entrypoint.
+# Usage: agent-autonomous-hook <event> [agent]
+
+set -euo pipefail
+
+EVENT="${1:-}"
+AGENT="${2:-${BRAIN_AGENT:-claude-code}}"
+
+BRAIN="${BRAIN_DIR:-$HOME/brain}"
+TOOLS="${TOOLS:-$BRAIN/scripts}"
+
+case "$EVENT" in
+  SessionStart)
+    # Skip bootstrap when called from within a brain-subagent-dispatch subprocess.
+    # Dispatched subprocesses must not re-claim the seat or overwrite the head seat.
+    [[ "${BRAIN_DISPATCH_ACTIVE:-0}" == "1" ]] && exit 0
+    # Skip duplicate bootstrap when launcher already completed it.
+    if [[ "${BRAIN_BOOTSTRAP_DONE:-0}" != "1" ]]; then
+      "$TOOLS/bin/brain-agent-bootstrap" --agent "$AGENT" --quiet >/dev/null 2>&1 || true
+    fi
+    # Arm session-entry gate for every seat whose hook surface can enforce
+    # PreToolUse / BeforeTool. Claude and Gemini both have matching pretool
+    # adapters wired to this gate, so REQ_FILE must exist for either to
+    # actually block. Codex has no enforcing PreToolUse Read path, so the
+    # init is a no-op there but harmless; it also preserves parity of the
+    # "seat bootstrap armed the gate" signal across seats.
+    "$TOOLS/bin/brain-sessionstart-handoff-gate" init 2>/dev/null || true
+    _BRIEF_FILE="$BRAIN/brain/index/session-brief.md"
+    if [[ -f "$_BRIEF_FILE" ]]; then
+      echo '{"systemMessage":"SESSION_START_GATE: Bootstrap completed. Read brain/index/session-brief.md for the operational brief (written fresh this run). Do NOT re-run brain-resume or Read session-resume.md — session-brief.md is the authoritative compact brief. Only open session-resume.md on anomaly the brief flags. Do NOT Read task files or queue contents before presenting the briefing and receiving explicit human authorization."}'
+    else
+      echo '{"systemMessage":"SESSION_START_GATE: Bootstrap completed. brain/index/session-brief.md missing — run brain-resume to regenerate. Do NOT Read session-resume.md by default."}'
+    fi
+    ;;
+  *)
+    # Intentionally no-op for unsupported events. Hook behavior must stay minimal.
+    ;;
+esac

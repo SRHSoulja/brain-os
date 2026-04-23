@@ -1299,7 +1299,7 @@ elif [[ $OPS_QUEUED_COUNT -gt 0 ]]; then
 elif [[ $QUEUED_COUNT -gt 0 ]]; then
   SUGGESTED_ACTION="Read $QUEUED_COUNT queued message(s) — these are urgent. Run \`brain-message list\` then \`brain-message clear\`."
 elif [[ $CORRECTIONS_COUNT -gt 0 ]]; then
-  SUGGESTED_ACTION="$CORRECTIONS_COUNT Clip correction(s) from Arson — review and update brain knowledge if needed."
+  SUGGESTED_ACTION="$CORRECTIONS_COUNT Clip correction(s) from the operator — review and update brain knowledge if needed."
 elif [[ $FIRED_COUNT -gt 0 ]]; then
   SUGGESTED_ACTION="$FIRED_COUNT reminder(s) have fired — check them below."
 elif [[ $PENDING_COUNT -gt 0 ]]; then
@@ -1959,7 +1959,7 @@ $(if [[ -n "$INSIGHTS_SECTION" ]]; then echo "- **Insights:** ${_INSIGHT_COUNT:-
 ## Inbox Status
 
 - **Inbox:** $INBOX_COUNT items | **Deletions:** $PENDING_COUNT | **Questions:** $OPEN_Q_COUNT | **Messages:** $QUEUED_COUNT
-$(if [[ $CORRECTIONS_COUNT -gt 0 ]]; then echo "- **Corrections:** $CORRECTIONS_COUNT from Arson"; fi)
+$(if [[ $CORRECTIONS_COUNT -gt 0 ]]; then echo "- **Corrections:** $CORRECTIONS_COUNT from the operator"; fi)
 $(if [[ $FIRED_COUNT -gt 0 ]]; then echo "- **Reminders:** $FIRED_COUNT fired"; fi)
 $(if [[ -n "$SPOTCHECK_SCORE" ]]; then
 echo "- **Clip Spotcheck:** $SPOTCHECK_SCORE ($SPOTCHECK_FAILS failure(s)) — $SPOTCHECK_DATE"
@@ -2773,7 +2773,7 @@ if [[ -n "$VERDICT_STATUS" ]]; then
 fi
 [[ -n "$LATEST_HANDOFF" ]] && echo "HANDOFF: $LATEST_HANDOFF"
 [[ -n "$LATEST_CHECKPOINT" ]] && echo "CHECKPOINT: $LATEST_CHECKPOINT ($CHECKPOINT_CHANGES changed, $CHECKPOINT_AHEAD ahead)"
-[[ $CORRECTIONS_COUNT -gt 0 ]] && echo "CLIP CORRECTIONS: $CORRECTIONS_COUNT new correction(s) from Arson — review and update brain"
+[[ $CORRECTIONS_COUNT -gt 0 ]] && echo "CLIP CORRECTIONS: $CORRECTIONS_COUNT new correction(s) from the operator — review and update brain"
 [[ $P1_COUNT -gt 0 ]] && echo "P1 BLOCKING: $P1_COUNT item(s) — check priority-queue.md"
 [[ $P2_COUNT -gt 0 ]] && echo "P2 IMPORTANT: $P2_COUNT item(s) — check priority-queue.md"
 [[ $QUEUED_COUNT -gt 0 ]] && echo "URGENT: $QUEUED_COUNT queued message(s) — run brain-message list"

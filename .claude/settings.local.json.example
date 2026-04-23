@@ -1,0 +1,31 @@
+{
+  "_description": "Local hook wiring for SessionStart and Stop. Copied to settings.local.json by scripts/bin/brain-bootstrap-new-user on first run. Safe to edit per-user; do NOT commit the real settings.local.json.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "_brain_managed": true,
+        "_brain_hook": "agent-autonomous-hook-session-start",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/brain/scripts/hooks/agent-autonomous-hook SessionStart claude-code",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "_brain_managed": true,
+        "_brain_hook": "session-end-commit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/brain/scripts/hooks/brain-session-end-commit",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

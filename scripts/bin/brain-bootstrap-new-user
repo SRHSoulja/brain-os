@@ -124,6 +124,7 @@ fi
 _log "Ensuring required directories..."
 
 dirs=(
+  "brain/index"
   "brain/ops/tasks/queue"
   "brain/ops/tasks/active"
   "brain/ops/tasks/completed"
@@ -154,6 +155,17 @@ GEMINI_TEMPLATE="$BRAIN_DIR/.gemini/settings.json"
 if [[ -f "$SETTINGS_TEMPLATE" && ! -f "$HOME/.claude/projects/$(echo "$BRAIN_DIR" | tr '/' '-'|sed 's/^-//')/settings.json" ]]; then
   _log "  NOTE: Copy .claude/settings.json to your Claude Code project settings when ready."
   _log "        Template is at: $SETTINGS_TEMPLATE"
+fi
+
+# SessionStart + Stop hook wiring — activated by copying the example file.
+# settings.local.json is gitignored by Claude Code convention; it is per-user.
+CLAUDE_LOCAL_EXAMPLE="$BRAIN_DIR/.claude/settings.local.json.example"
+CLAUDE_LOCAL_TARGET="$BRAIN_DIR/.claude/settings.local.json"
+if [[ -f "$CLAUDE_LOCAL_EXAMPLE" && ! -f "$CLAUDE_LOCAL_TARGET" ]]; then
+  _dry "cp \"$CLAUDE_LOCAL_EXAMPLE\" \"$CLAUDE_LOCAL_TARGET\""
+  _log "  wired: SessionStart + Stop hooks (copied settings.local.json.example → settings.local.json)"
+elif [[ -f "$CLAUDE_LOCAL_TARGET" ]]; then
+  _log "  .claude/settings.local.json already present — leaving as-is"
 fi
 
 if [[ -f "$CODEX_TEMPLATE" ]]; then

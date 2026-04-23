@@ -12,18 +12,6 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "_brain_managed": true,
-        "_brain_hook": "reddit-fetch-guard",
-        "matcher": "WebFetch",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/brain/scripts/hooks/adapters/claude-pretooluse.sh reddit-fetch-guard",
-            "timeout": 5
-          }
-        ]
       }
     ]
   }

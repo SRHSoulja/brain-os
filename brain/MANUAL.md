@@ -18,7 +18,10 @@ supersedes_after_phase_4:
 
 # Brain Operator Manual
 
-> Single canonical operator manual for the GM GN Repeat Knowledge Brain.
+> Single canonical operator manual for the Brain Operating System (brain-os).
+> This file is the authority for the framework; tenant identity, goals, and
+> mission live in `brain/persona/persona.md` and `brain/goals/goals.md` and
+> are user-editable. This manual stays generic.
 > This file is the authority. Seat-specific files (CLAUDE.md, AGENTS.md,
 > GEMINI.md, .claude/commands/brain-handoff.md, brain/wiki/tools/brain-handoff.md)
 > will be thinned to pointer files in Phase 4. Memory policy at
@@ -32,15 +35,17 @@ supersedes_after_phase_4:
 >
 > **Terminology.** "Agent" = the running assistant (Claude Code, Codex,
 > Gemini). "Seat" = the runtime slot an agent holds on the laptop.
-> "Operator" = Arson. "Brain" = this repository and its supporting bin
-> tools at `~/bin/`.
+> "Operator" = the human running this brain (identity defined in
+> `brain/persona/persona.md`). "Brain" = this repository and its supporting
+> bin tools at `~/bin/`.
 
 ## 0. Orientation
 
-GM GN Repeat exists to make modern technology understandable and useful by
-building real tools, teaching practical skills, and sharing discoveries in
-public. The Brain is the repository and tooling that keep that work coherent
-across multiple agent sessions.
+The Brain is a repository and tooling layer that keeps work coherent across
+multiple agent sessions. It has no inherent mission — the operator defines
+identity in `brain/persona/persona.md` and current goals in
+`brain/goals/goals.md`. This manual describes how the framework operates
+regardless of what the operator is building.
 
 Every agent seat (Claude Code, Codex, Gemini) operates on the same repository
 under the same rules. Only the invocation mechanics differ: slash commands

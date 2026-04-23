@@ -7,7 +7,7 @@ last_updated: "2026-04-09"
 
 # Multi-AI Governance Rules
 
-These rules govern how multiple AI systems interact with the GM GN Repeat brain repository.
+These rules govern how multiple AI systems interact with this brain repository.
 
 ## 1. Truth Protection
 
