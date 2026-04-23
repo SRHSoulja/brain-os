@@ -18,7 +18,7 @@ done
 _SCOPE="${PPID:-$$}"
 REQ_FILE="${TMPDIR:-/tmp}/brain-handoff-required-${_SCOPE}"
 CLEARED_FILE="${TMPDIR:-/tmp}/brain-handoff-cleared-${_SCOPE}"
-HANDOFF_PATH="${BRAIN_DIR:-$HOME/brain}/brain/index/claude-session-entry.md"
+HANDOFF_PATH="${BRAIN_DIR:-$HOME/brain}/brain/index/session-entry-contract.md"
 
 emit_deny() {
   local reason="$1"

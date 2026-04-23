@@ -169,7 +169,7 @@ task contract narrows the allowed surfaces.
 | `${CODEX_LAB_PATH:-~/codex-lab}/system-reports/` | Generated system snapshots (gate outputs, preflights). |
 | `${CODEX_LAB_PATH:-~/codex-lab}/handoffs/` | Handoff lane registry and prompts (see §5). |
 | `${CODEX_LAB_PATH:-~/codex-lab}/CODEX_COMMANDS.md` | Codex-native command index. |
-| `brain/index/claude-session-entry.md` | Claude session entry gate target (hard-enforced read on SessionStart). |
+| `brain/index/session-entry-contract.md` | Claude session entry gate target (hard-enforced read on SessionStart). |
 
 {sources: C-003, C-004, G-007--G-018, G-057, G-058, G-059, G-060, G-061, M-001, M-013, M-018, W-002}
 
@@ -1527,7 +1527,7 @@ Concrete paths for the four workflows that matter most.
 1. Seat-specific bootstrap (§7). Claude auto-runs via hook; Codex runs
    canonical launcher command: `brain-claude`, `brain-codex`, or
    `brain-gemini`.
-2. Claude only: read `brain/index/claude-session-entry.md`
+2. Claude only: read `brain/index/session-entry-contract.md`
    (hard-enforced by brain-sessionstart-handoff-gate).
 3. Brief from the bootstrap/brain-resume stdout tail — do NOT Read
    `brain/index/session-resume.md` by default. See §6.2 and
@@ -1749,7 +1749,7 @@ partially or fully lost.
    - `brain/ops/tasks/active/` — verify the checkpoint's `active_task` is still
      claimed; task state can change between checkpoint and restore
 
-4. **Do not** re-read `brain/index/claude-session-entry.md` on restore. That
+4. **Do not** re-read `brain/index/session-entry-contract.md` on restore. That
    surface is gated to SessionStart only. Restore is a mid-session recovery,
    not a new session.
 
@@ -1767,7 +1767,7 @@ automatically at true session open. `/clear` does not re-trigger
 SessionStart. This restore sequence is the complete authority read for
 post-`/clear` recovery — it does not conflict with SessionStart because
 it explicitly excludes the SessionStart-only surface
-(`brain/index/claude-session-entry.md`) and uses `session-resume.md` (the
+(`brain/index/session-entry-contract.md`) and uses `session-resume.md` (the
 SessionStart output) as a live re-read rather than duplicating the
 bootstrap.
 
