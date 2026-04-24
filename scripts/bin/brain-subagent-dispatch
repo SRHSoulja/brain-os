@@ -336,12 +336,18 @@ if [[ -n "$PROFILE" && -z "$TARGET" ]]; then
   if [[ ! -f "$_PROFILES" ]]; then
     echo "[dispatch] WARN: --profile $PROFILE given but execution-profiles.json not found — falling back to auto-selection" >&2
   else
-    _PROFILE_TARGET=$(python3 - "$PROFILE" "$_PROFILES" "$_REGISTRY" <<'PYPROFILE'
+    _PROFILE_TARGET=$(python3 - "$PROFILE" "$_PROFILES" "$_REGISTRY" "$CURRENT_AGENT" <<'PYPROFILE'
 import json, subprocess, sys, time
 
-profile_id   = sys.argv[1]
-profiles_path = sys.argv[2]
-registry_path = sys.argv[3]
+profile_id     = sys.argv[1]
+profiles_path  = sys.argv[2]
+registry_path  = sys.argv[3]
+current_agent  = sys.argv[4] if len(sys.argv) > 4 else ""
+
+# Normalize seat id to match preferred_runtimes naming (hyphenated).
+_SEAT_NORM = {"claude_code": "claude-code", "claude": "claude-code",
+              "codex": "codex", "gemini": "gemini", "gemini-cli": "gemini"}
+current_agent = _SEAT_NORM.get(current_agent, current_agent)
 
 HEALTH_CACHE = "/tmp/brain-capability-health.json"
 HEALTH_TTL   = 300
@@ -387,12 +393,23 @@ if not profile:
     print(f"unknown-profile:{profile_id} known={known}", file=sys.stderr)
     sys.exit(1)
 
-for runtime in profile.get("preferred_runtimes", []):
+# Seat-vs-dispatch anti-contention:
+# A dispatch routed to the same agent that currently holds the seat forces
+# that agent to verify its own work and fights itself for seat locks. Skip
+# the current seat on the first pass; if no non-seat preferred_runtime is
+# healthy, refuse to fall back to the seated agent — the caller should
+# auto-select or surface the block rather than silently produce an empty
+# same-seat dispatch artifact.
+preferred = profile.get("preferred_runtimes", [])
+for runtime in preferred:
+    if current_agent and runtime == current_agent:
+        continue
     if is_healthy(runtime):
         print(runtime)
         sys.exit(0)
 
-# No healthy preferred runtime — signal caller to fall through to auto-select
+# Hard rule: never fall back to the seated agent.
+print(f"[dispatch] BLOCK: no non-seat preferred runtime healthy (seat={current_agent}, profile={profile_id}) — refusing seat-match fallback", file=sys.stderr)
 sys.exit(2)
 PYPROFILE
     ) || _PROFILE_EXIT=$?
@@ -498,7 +515,7 @@ except:
 fi
 
 # ── Route-selection log ──────────────────────────────────────────
-echo "[dispatch] route: target=$TARGET method=$ROUTE_METHOD reason=\"$ROUTE_REASON\" op=$OPERATION"
+echo "[dispatch] route: target=$TARGET method=$ROUTE_METHOD reason=\"$ROUTE_REASON\" op=$OPERATION" >&2
 
 # ── Ollama: advisory-op guard (early, runs before dry-run) ───────
 # Planning/architecture/task_generation must never route to Ollama.
@@ -513,15 +530,26 @@ if [[ "$TARGET" == "ollama" ]]; then
   done
 fi
 
-# ── Head-seat contention detection ───────────────────────────────
-# If the head seat is gemini and we are dispatching to gemini, warn/block
-# per brain/governance/gemini-seat-guidance.md.
+# ── Head-seat contention: HARD REROUTE for repo-auditor, BLOCK otherwise ──
+# Same-seat dispatch (gemini dispatching to gemini) deadlocks on seat locks
+# and produces empty/discarded artifacts. For `repo-auditor` (the standard
+# off-seat verification profile) we hard-reroute to codex so verification
+# still completes; for every other profile we block rather than silently
+# pick a different agent without explicit profile input.
 if [[ "$CURRENT_AGENT" == "gemini" && "$TARGET" == "gemini" ]]; then
-  echo "[dispatch] BLOCK: head-seat contention detected (gemini-to-gemini)" >&2
-  echo "[dispatch] Refer to: brain/governance/gemini-seat-guidance.md" >&2
-  TS_CONTENTION=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  echo "$TS_CONTENTION SUBAGENT_DISPATCH_BLOCKED reason=head_seat_contention target=gemini agent=gemini" >> "$BRAIN/brain/ops/events.log"
-  exit 1
+  TS_REROUTE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  if [[ "$PROFILE" == "repo-auditor" ]]; then
+    echo "[dispatch] REROUTE: gemini→gemini blocked — repo-auditor hard-rule forces codex (off-seat verifier)" >&2
+    TARGET="codex"
+    ROUTE_METHOD="reroute"
+    ROUTE_REASON="hard-rule: gemini seat + repo-auditor → codex"
+    echo "$TS_REROUTE SUBAGENT_DISPATCH_REROUTE from=gemini to=codex reason=head_seat_contention profile=repo-auditor" >> "$BRAIN/brain/ops/events.log"
+  else
+    echo "[dispatch] BLOCK: head-seat contention detected (gemini-to-gemini, profile=${PROFILE:-none})" >&2
+    echo "[dispatch] Refer to: brain/governance/gemini-seat-guidance.md" >&2
+    echo "$TS_REROUTE SUBAGENT_DISPATCH_BLOCKED reason=head_seat_contention target=gemini agent=gemini profile=${PROFILE:-none}" >> "$BRAIN/brain/ops/events.log"
+    exit 1
+  fi
 fi
 
 # ── Recursive dispatch detection via chain env var ───────────────
@@ -603,6 +631,17 @@ print(p.get('timeout_seconds', '') if p else '')
     TIMEOUT="$_PROFILE_TIMEOUT"
     echo "[dispatch] profile timeout: ${TIMEOUT}s (profile=$PROFILE)" >&2
   fi
+fi
+
+# Per-profile max_output_chars: hard truncation cap on dispatch result payload.
+MAX_OUTPUT_CHARS=0
+if [[ -n "$PROFILE" && -f "$_PROFILES" ]]; then
+  MAX_OUTPUT_CHARS=$(python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+p = next((p for p in data.get('profiles', []) if p['profile_id'] == sys.argv[2]), None)
+print(p.get('max_output_chars', 0) if p else 0)
+" "$_PROFILES" "$PROFILE" 2>/dev/null || echo 0)
 fi
 
 if [[ -n "$PREAMBLE_CONTENT" ]]; then
@@ -796,6 +835,42 @@ $SKILL_ADDENDA
 "
 fi
 
+# ── Profile isolation fields (gemini branch consumes) ────────────────
+# Resolved here (before dry-run) so dry-run can surface them. Fields honored:
+# allowed_extensions, allowed_mcp_servers, policy_file, neutral_cwd,
+# lifecycle_blocked, approval_mode. Absent field = no restriction (except
+# lifecycle_blocked, which defaults to true to preserve prior behavior of
+# unconditionally setting BRAIN_DISPATCH_ACTIVE=1).
+ISOLATION_EXT=""
+ISOLATION_MCP=""
+ISOLATION_POLICY=""
+ISOLATION_CWD=""
+ISOLATION_APPROVAL=""
+LIFECYCLE_BLOCKED_FIELD="true"
+if [[ -n "$PROFILE" ]]; then
+  _iso_ext=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field allowed_extensions 2>/dev/null || true)
+  _iso_mcp=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field allowed_mcp_servers 2>/dev/null || true)
+  _iso_pol=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field policy_file 2>/dev/null || true)
+  _iso_cwd=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field neutral_cwd 2>/dev/null || true)
+  _iso_am=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field approval_mode 2>/dev/null || true)
+  _iso_lb=$("$TOOLS/brain-profile-meta" --profile "$PROFILE" --field lifecycle_blocked 2>/dev/null || true)
+  [[ -n "$_iso_ext" ]] && ISOLATION_EXT=$(printf '%s' "$_iso_ext" | jq -r 'if type=="array" then join(",") else . end' 2>/dev/null || true)
+  [[ -n "$_iso_mcp" ]] && ISOLATION_MCP=$(printf '%s' "$_iso_mcp" | jq -r 'if type=="array" then join(",") else . end' 2>/dev/null || true)
+  if [[ -n "$_iso_pol" ]]; then
+    if [[ "$_iso_pol" = /* ]]; then ISOLATION_POLICY="$_iso_pol"; else ISOLATION_POLICY="$BRAIN/$_iso_pol"; fi
+    if [[ ! -f "$ISOLATION_POLICY" ]]; then
+      echo "[dispatch] WARN: policy_file not found at $ISOLATION_POLICY (profile=$PROFILE) — isolation weakened" >&2
+      ISOLATION_POLICY=""
+    fi
+  fi
+  [[ -n "$_iso_cwd" && -d "$_iso_cwd" ]] && ISOLATION_CWD="$_iso_cwd"
+  [[ -n "$_iso_am"  ]] && ISOLATION_APPROVAL="$_iso_am"
+  # Normalize Python-style True/False from brain-profile-meta to lowercase.
+  if [[ -n "$_iso_lb" ]]; then
+    LIFECYCLE_BLOCKED_FIELD=$(printf '%s' "$_iso_lb" | tr '[:upper:]' '[:lower:]')
+  fi
+fi
+
 # ── Dry run ──────────────────────────────────────────────────────────
 
 if $DRY_RUN; then
@@ -811,6 +886,15 @@ if $DRY_RUN; then
   echo "Operation:    $OPERATION"
   echo "Prompt tokens: ~$PROMPT_TOKENS"
   echo "Timeout: ${TIMEOUT}s"
+  if [[ "$TARGET" == "gemini" && ( -n "$ISOLATION_EXT$ISOLATION_MCP$ISOLATION_POLICY$ISOLATION_CWD$ISOLATION_APPROVAL" || "$LIFECYCLE_BLOCKED_FIELD" == "false" ) ]]; then
+    echo "Isolation:"
+    [[ -n "$ISOLATION_EXT"     ]] && echo "  allowed_extensions:  $ISOLATION_EXT"
+    [[ -n "$ISOLATION_MCP"     ]] && echo "  allowed_mcp_servers: $ISOLATION_MCP"
+    [[ -n "$ISOLATION_POLICY"  ]] && echo "  policy_file:         $ISOLATION_POLICY"
+    [[ -n "$ISOLATION_CWD"     ]] && echo "  neutral_cwd:         $ISOLATION_CWD"
+    echo "  approval_mode:       ${ISOLATION_APPROVAL:-plan (default)}"
+    echo "  lifecycle_blocked:   $LIFECYCLE_BLOCKED_FIELD"
+  fi
   echo "---"
   echo "$PROMPT"
   exit 0
@@ -840,8 +924,9 @@ fi
 
 # ── Dispatch to target CLI ───────────────────────────────────────────
 
-# Signal subagent mode to wrappers to skip bootstrap/seat-claim
-export BRAIN_DISPATCH_ACTIVE=1
+# Signal subagent mode to wrappers to skip bootstrap/seat-claim.
+# Default-on; profile may opt out via lifecycle_blocked: false.
+[[ "$LIFECYCLE_BLOCKED_FIELD" != "false" ]] && export BRAIN_DISPATCH_ACTIVE=1
 
 # Extend chain before spawning so the subprocess can detect loops
 export BRAIN_DISPATCH_CHAIN="${_DISPATCH_CHAIN:+${_DISPATCH_CHAIN}:}${TARGET}"
@@ -871,11 +956,22 @@ case "$TARGET" in
     ;;
   gemini)
     # GEMINI_NO_WRAP=1: bypass gemini-wrapper's --yolo injection; dispatch is non-interactive.
-    # --approval-mode=plan: never ask for approval (read-only)
-    if [[ -n "$RESOLVED_MODEL" ]]; then
-      GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini --model "$RESOLVED_MODEL" -p "$PROMPT" --approval-mode=plan > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+    # Isolation fields (allowed_extensions, allowed_mcp_servers, policy_file,
+    # neutral_cwd, approval_mode) are sourced from the execution profile;
+    # approval_mode defaults to 'plan' (read-only) when the profile does not
+    # override it. Profiles that call MCPs needing auto-approval must set
+    # approval_mode: yolo.
+    gargs=()
+    [[ -n "$RESOLVED_MODEL"    ]] && gargs+=( --model "$RESOLVED_MODEL" )
+    [[ -n "$ISOLATION_EXT"     ]] && gargs+=( -e "$ISOLATION_EXT" )
+    [[ -n "$ISOLATION_MCP"     ]] && gargs+=( --allowed-mcp-server-names "$ISOLATION_MCP" )
+    [[ -n "$ISOLATION_POLICY"  ]] && gargs+=( --policy "$ISOLATION_POLICY" )
+    gargs+=( "--approval-mode=${ISOLATION_APPROVAL:-plan}" )
+    gargs+=( -p "$PROMPT" )
+    if [[ -n "$ISOLATION_CWD" ]]; then
+      ( cd "$ISOLATION_CWD" && GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini "${gargs[@]}" ) > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
     else
-      GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini -p "$PROMPT" --approval-mode=plan > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
+      GEMINI_NO_WRAP=1 timeout "$TIMEOUT" gemini "${gargs[@]}" > "$RESULT_FILE" 2>&1 || DISPATCH_RC=$?
     fi
     ;;
   ollama)
@@ -958,6 +1054,19 @@ fi
 RESULT=$(cat "$RESULT_FILE")
 rm -f "$RESULT_FILE"
 
+# ── Output truncation (max_output_chars from profile) ────────────────
+OUTPUT_TRUNCATED=false
+RESULT_CHARS_PRE_TRUNCATION=0
+if [[ "$MAX_OUTPUT_CHARS" -gt 0 ]]; then
+  _RESULT_LEN=${#RESULT}
+  if (( _RESULT_LEN > MAX_OUTPUT_CHARS )); then
+    RESULT_CHARS_PRE_TRUNCATION=$_RESULT_LEN
+    RESULT="${RESULT:0:$MAX_OUTPUT_CHARS}"$'\n'"[dispatch] OUTPUT TRUNCATED: ${_RESULT_LEN} chars exceeded profile limit of ${MAX_OUTPUT_CHARS} (profile=$PROFILE)"
+    OUTPUT_TRUNCATED=true
+    echo "[dispatch] WARN: output truncated ${_RESULT_LEN} → ${MAX_OUTPUT_CHARS} chars (profile=$PROFILE)" >&2
+  fi
+fi
+
 # ── Log dispatch event ───────────────────────────────────────────────
 
 TS_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -996,8 +1105,12 @@ RESULT_TOKENS=$((RESULT_TOKENS / 4))
 python3 -c "
 import json, sys
 
-timed_out = '$TIMED_OUT' == 'true'
-salvaged  = sys.argv[2] if timed_out else ''
+timed_out       = '$TIMED_OUT' == 'true'
+output_trunc    = '$OUTPUT_TRUNCATED' == 'true'
+salvaged        = sys.argv[2] if timed_out else ''
+max_out_chars   = int('$MAX_OUTPUT_CHARS' or 0)
+pre_trunc_chars = int('$RESULT_CHARS_PRE_TRUNCATION' or 0)
+profile_timeout = int('${_PROFILE_TIMEOUT:-0}' or 0)
 
 result = {
     'agent': '$TARGET',
@@ -1006,10 +1119,15 @@ result = {
     'question': sys.argv[1],
     'duration_s': $DURATION,
     'timeout_s': $TIMEOUT,
+    'profile_timeout_s': profile_timeout,
     'timed_out': timed_out,
+    'max_output_chars': max_out_chars,
+    'output_truncated': output_trunc,
     'result_tokens': $RESULT_TOKENS,
     'result': sys.stdin.read(),
 }
+if output_trunc:
+    result['result_chars_pre_truncation'] = pre_trunc_chars
 if timed_out:
     result['partial'] = True
     result['salvaged_tail'] = salvaged
